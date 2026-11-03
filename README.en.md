@@ -47,6 +47,17 @@ Steps 2–4 go through the client's own network stack (`channel.call("network.fe
 
 > ⚠️ Step 2 is a legacy endpoint: `/api/song/enhance/player/url/v1` and `/weapi/...` both require eapi signing and answer `{"msg":"参数错误","code":400}`. NetEase may remove the legacy endpoint at any time; preload then silently degrades to 128k gapless — playback is unaffected.
 
+## Two extra fallbacks added after real-device testing
+
+- **Retry when the encrypted `musicurl` cannot be decoded**: on 3.x `audioplayer.load` carries an
+  encrypted token instead of a URL, so a few tracks make `<audio>` fail with
+  `MEDIA_ELEMENT_ERROR: Format error` (the UI shows "failed to load"). The plugin then re-attaches
+  an URL of its own (320k endpoint -> `outer/url`) once; the error is only reported if that fails too.
+- **Trial-clip detection**: for paywalled tracks the endpoint may answer with a short preview
+  (observed: 64.00s with bitrate `320006`, a non-standard value). Such results are discarded, the
+  preload is abandoned and the client plays the full track itself - no gapless for that track, but
+  playback no longer stops at the clip boundary.
+
 ## Known limitations
 
 - **Random/shuffle mode**: the client picks the next track ~80 ms before switching, so gapless can only be scheduled when the previous prediction was right. Use sequential / list-loop mode for reliable gapless.
