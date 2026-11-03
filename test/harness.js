@@ -3255,6 +3255,166 @@ async function main() {
     }
   }
 
+  section("89. ★★★ v1.5.0 拍点分析（无变速版 Automix 的地基）");
+  {
+    /**
+     * 合成一条「节拍轨」：在指定 BPM / 相位上放短促的打击脉冲。
+     * 用它的意义：节拍是**已知真值**，可以断言检测结果对不对（真机曲目没法当基准）。
+     */
+    function mkClick(opts) {
+      const sr = opts.sr || 8000;
+      const bpm = opts.bpm;
+      const secs = opts.secs || 20;
+      const phase = opts.phase || 0;
+      const n = Math.round(secs * sr);
+      const data = new Float32Array(n);
+      const beat = 60 / bpm;
+      for (let t = phase; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        // 30ms 的衰减脉冲（模拟鼓点）
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      // 铺一点很轻的低频（更接近真实曲目，不至于只剩脉冲）
+      for (let i = 0; i < n; i++) data[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+      return {
+        duration: secs,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData() {
+          return data;
+        },
+      };
+    }
+
+    // ---- (a) BPM 检测：120 / 90 / 150 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      ok(!!api && typeof api.beat === "function", "★★ 暴露了 gaplessPlayer.beat()（诊断/脚本用）");
+
+      const g120 = api.beat(mkClick({ bpm: 120 }), 0, 20);
+      ok(!!g120, "★★ 120 BPM 能算出网格");
+      ok(Math.abs(g120.bpm - 120) < 3, "★★ 120 BPM 检测准（实际 " + (g120 ? g120.bpm.toFixed(1) : "?") + "）");
+      ok(g120 && g120.conf > 0.3, "★★ 置信度够高（" + (g120 ? g120.conf.toFixed(2) : "?") + "）");
+
+      const beat120 = 60 / 120;
+      const off = g120 ? Math.abs(g120.anchorSec % beat120) : 1;
+      ok(Math.min(off, beat120 - off) < 0.06, "★★ 锚点落在拍点上（误差 " + (off * 1000).toFixed(0) + "ms 内）");
+
+      const g90 = api.beat(mkClick({ bpm: 90 }), 0, 20);
+      ok(g90 && Math.abs(g90.bpm - 90) < 3, "★★ 90 BPM（实际 " + (g90 ? g90.bpm.toFixed(1) : "?") + "）");
+
+      const g150 = api.beat(mkClick({ bpm: 150 }), 0, 20);
+      ok(g150 && Math.abs(g150.bpm - 150) < 4, "★★ 150 BPM（实际 " + (g150 ? g150.bpm.toFixed(1) : "?") + "）");
+
+      const gOff = api.beat(mkClick({ bpm: 120, phase: 0.25 }), 0, 20);
+      const relOff = gOff ? (gOff.anchorSec - 0.25) % beat120 : 9;
+      ok(
+        gOff && (Math.abs(relOff) < 0.06 || Math.abs(relOff - beat120) < 0.06),
+        "★★ 相位 0.25s 的拍点也能对上（误差 " + (gOff ? (relOff * 1000).toFixed(0) : "?") + "ms）"
+      );
+    }
+
+    // ---- (b) 没有节拍（静音）→ 不该硬报一个 BPM ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const n = 8000 * 20;
+      const flat = {
+        duration: 20,
+        sampleRate: 8000,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => new Float32Array(n),
+      };
+      const g = e.win.gaplessPlayer.beat(flat, 0, 20);
+      ok(g === null || g.conf < 0.2, "★★ 静音 → 不给网格/置信度极低（" + (g ? "conf=" + g.conf.toFixed(2) : "null") + "）");
+
+      // ★ 噪声：有能量但**没有节拍**。这才是「置信度不可信」的真正考验 ——
+      //   数字静音的 onset 全是 0 会提前返回 null，测不出置信度公式的对错。
+      let seed = 12345;
+      const rnd = () => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed / 0x7fffffff - 0.5;
+      };
+      const noise = new Float32Array(n);
+      for (let i = 0; i < n; i++) noise[i] = rnd() * 0.4;
+      const gn = e.win.gaplessPlayer.beat(
+        { duration: 20, sampleRate: 8000, numberOfChannels: 1, length: n, getChannelData: () => noise },
+        0,
+        20
+      );
+      ok(
+        gn === null || gn.conf < 0.45,
+        "★★ 白噪声（无节拍）→ 置信度必须低，不许当「有拍」（" + (gn ? "conf=" + gn.conf.toFixed(2) : "null") + "）"
+      );
+      // 噪声偶尔也能凑出个「还行」的自相关峰（可能落到 smart 档，只影响 ≤半拍的起点位移，无害）；
+      // 但绝不该判成 full —— full 要求置信 ≥0.45，这条同时也守住「置信度不能造假」。
+      const pn = gn ? e.win.gaplessPlayer.mixPlan(gn, gn) : { tier: "plain" };
+      eq(
+        pn.tier === "full",
+        false,
+        "★★ 噪声网格不能判成 full（tier=" + (pn && pn.tier) + "，conf=" + (gn ? gn.conf.toFixed(2) : "null") + "）"
+      );
+    }
+
+    // ---- (c) 判定档位：偏差小的才做拍点对齐 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      const mk = (bpm, conf) => ({ bpm: bpm, beatSec: 60 / bpm, anchorSec: 0, conf: conf });
+
+      const p1 = api.mixPlan(mk(120, 0.8), mk(120, 0.8));
+      eq(p1.tier, "full", "★★ 120 vs 120、置信高 → full");
+      eq(Math.round(p1.dev * 1000) / 1000, 0, "★★ 偏差 0");
+
+      const p2 = api.mixPlan(mk(120, 0.8), mk(123, 0.8));
+      eq(p2.tier, "full", "★★ 120 vs 123（差 2.4%）→ 仍算同步，full");
+
+      const p3 = api.mixPlan(mk(120, 0.8), mk(150, 0.8));
+      eq(p3.tier, "plain", "★★ 120 vs 150（差 20%）→ plain，不硬对齐");
+
+      const p4 = api.mixPlan(mk(120, 0.15), mk(120, 0.8));
+      eq(p4.tier, "plain", "★★ 置信太低（0.15）→ plain");
+
+      const p5 = api.mixPlan(mk(120, 0.8), mk(60, 0.8));
+      eq(p5.tier, "full", "★★ 八度折算：120 vs 60 视为同步 → full");
+
+      const p6 = api.mixPlan(null, mk(120, 0.8));
+      eq(p6.tier, "plain", "★★ 缺一侧网格 → plain");
+
+      const snap = api.snapToBeat(mk(120, 0.8), 0.7); // 拍点 0 / 0.5 / 1.0 …
+      ok(
+        Math.abs(snap.pos - 0.5) < 0.02 || Math.abs(snap.pos - 1.0) < 0.02,
+        "★★ 0.7s 被吸到最近拍（" + snap.pos.toFixed(3) + "）"
+      );
+    }
+
+    // ---- (d) 接到调度上：解码后就分析、调度时有判定、不崩 ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkClick({ bpm: 120, secs: 200 }) } });
+      e.win.__gpXfade = 3; // 开交叉才会走到拍点对齐
+      ok(countLog(e, "｜ 头窗") + countLog(e, "｜ 尾窗") >= 1, "★★ 解码后就分析了拍点（头/尾窗口）");
+      setLeft(e, 3.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[automix] A=") >= 1, "★★ 调度时打出 automix 判定");
+      ok(countLog(e, "120.0bpm") >= 1, "★★ 判定里能看到 A 的 120 BPM");
+      ok(countLog(e, "拍点对齐") >= 1, "★★ 交叉起点被吸到了拍点上（" + (e.logs().match(/拍点对齐[^｜|]*/) || ["?"])[0].trim() + "）");
+      const lp = e.win.gaplessPlayer.lastPlan();
+      ok(!!lp && typeof lp.tier === "string", "★★ lastPlan() 能取到（" + (lp ? lp.tier : "?") + "）");
+    }
+  }
+
   /* ---------- 汇总 ---------- */
   console.log("\n====================");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");

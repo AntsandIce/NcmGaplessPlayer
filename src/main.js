@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.4.0";
+  var VERSION = "1.5.0";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -411,6 +411,8 @@
     xfade: 0, // 交叉时长（秒）；0 = 关。显式设置过才会被 xfadeExplicit 标记
     xfadeExplicit: false, // ★ v1.4.0：用户显式设过时长 → 不被风格/智能默认覆盖
     style: null, // ★ v1.4.0：用户选的过渡风格（clean/light/dj）；null = 智能默认
+    beatCache: {}, // ★ v1.5.0：trackId|head/tail → 拍点网格
+    lastPlan: null, // ★ v1.5.0：最近一次 automix 判定（排查用）
     stats: { plays: 0, hitPreload: 0, hitRecent: 0 }, // ★ v1.4.0：状态行用
     srcGain: null, // 当前缓冲 source 自己的增益（淡出用；不动总线 S.gain）
     srcFilter: null, // ★ v1.3.2：同一路的「高通」（交叉时做扫频淡出，平时 20Hz = 直通）
@@ -1987,6 +1989,13 @@
         slot.status = "ready";
         slot.buffer = ab;
         slot.trim = noteTrim(trackId, ginfo, ab); // ★ v1.2.0：首尾裁剪（试听校验之后才裁，别影响判定）
+        // ★ v1.5.0：预载时就把拍点算好 —— 轮到它当 B 时调度就在眼前，来不及现算
+        if (autoMixEnabled()) {
+          try {
+            beatHead(trackId, ab);
+            beatTail(trackId, ab);
+          } catch (e) {}
+        }
         S.preloadState = "ready";
         log(
           "[preload] ★★ 预载就绪（" + (why || "?") + "）｜ track=" + trackId + " ｜ " + ab.duration.toFixed(1) + "s ｜ " +
@@ -2277,6 +2286,48 @@
       }
     }
     if (fadeSec < 0.5) fadeSec = 0;
+
+    // ★ v1.5.0：无变速版 Automix —— 用拍点把「交叉起点」吸到 A 的拍上。
+    //   交叉起点对应 A 的可听位置 `S.duration - fadeSec`；把它吸到最近一拍，
+    //   位移量反向加到交叉时长上（终点不动 = A 的结束时刻不变，只是淡出变长/变短一点）。
+    var mixNote = "";
+    try {
+      if (fadeSec > 0 && autoMixEnabled()) {
+        var gA2 = beatTail(S.curTrackId, S.buffer);
+        var gB2 = beatHead(nid, buf);
+        var plan = mixPlan(gA2, gB2);
+        if (plan.tier !== "plain" && gA2) {
+          // 拍点网格跑在「缓冲时间轴」上 → 先把可听位置换算过去（加 trim.start）
+          var trA = S.trim || zeroTrim();
+          var bufPos = S.duration - fadeSec + trA.start;
+          var sn = snapToBeat(gA2, bufPos);
+          if (sn.delta) {
+            var newFade = fadeSec - sn.delta;
+            if (newFade >= 0.5 && newFade <= left - 0.05 && newFade <= bdur - 0.05) {
+              mixNote =
+                " ｜ 拍点对齐 " + (sn.delta * 1000).toFixed(0) + "ms（交叉 " + fadeSec.toFixed(2) +
+                "→" + newFade.toFixed(2) + "s）";
+              fadeSec = newFade;
+              bStart = endCtxTime - fadeSec;
+            }
+          }
+        }
+        S.lastPlan = {
+          aBpm: gA2 ? gA2.bpm : 0,
+          bBpm: gB2 ? gB2.bpm : 0,
+          tier: plan.tier,
+          dev: plan.dev,
+          conf: plan.conf,
+        };
+        log(
+          "[automix] A=" + (gA2 ? gA2.bpm.toFixed(1) + "bpm/置信" + gA2.conf.toFixed(2) : "无") +
+            " B=" + (gB2 ? gB2.bpm.toFixed(1) + "bpm/置信" + gB2.conf.toFixed(2) : "无") +
+            " → " + plan.tier + "（八度折算后偏差 " + (plan.dev * 100).toFixed(1) + "%）" + mixNote
+        );
+      }
+    } catch (e) {
+      log("[automix] ★ 拍点对齐失败（不影响播放）｜ " + (e && e.message));
+    }
 
     // ★ 手写建 source —— **不能复用 `startSource()`**：它第 3 行无条件 `stopSource()`，会把正在播的 A 停掉。
     var src = S.ctx.createBufferSource();
@@ -3398,6 +3449,13 @@
     S.loadedTrackId = S.curTrackId; // ★ 标记「这一首已经就绪」
     // ★ v1.2.1：留一份「刚刚播过」的引用（最多 2 首）——
     //   真机上「切走再切回来」会重新下载 + 解码一整首，而缓冲其实刚在手里。
+    // ★ v1.5.0：算拍点（分析的是刚解码好的 buffer，只算头/尾两段 20s 窗口，带缓存）
+    if (autoMixEnabled()) {
+      try {
+        beatHead(S.curTrackId, ab);
+        beatTail(S.curTrackId, ab);
+      } catch (e) {}
+    }
     recentPut(S.curTrackId, ab);
     // ★ v0.2.9：不再有「开机续播」—— 记忆只记「哪首歌」，不记「播到哪儿」。
     log(
@@ -3641,6 +3699,303 @@
     } catch (e) {
       log("[intro] ★ 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
     }
+  }
+
+  /* ==================== v1.5.0 · 拍点分析（无变速版 Automix 的地基）==================== */
+
+  /**
+   * 目标：只用**思路**（教科书做法），自己算一首歌的「BPM + 拍点锚点 + 置信度」。
+   *
+   * 流程（不依赖 ML/onnx，也不需要额外下载 —— 分析的是我们**已经解码好的 AudioBuffer**）：
+   *   ① 单声道 + 抽取到 ~11kHz（只为了 onset 包络，音质无所谓）
+   *   ② 一阶高通压掉低频漂移 → 按 ~11.6ms 一帧取能量包络
+   *   ③ 正向差分 + 去局部均值 = onset 通量（打击感越强，脉冲越明显）
+   *   ④ 通量自相关在「40~220 BPM」的滞后区间里找峰 → 基频周期
+   *   ⑤ 梳状评分（周期的整数倍处也该有峰）把倍/半速折回 80~180 BPM
+   *   ⑥ 在周期上扫相位，拍点处通量最集中的那个相位 = 锚点
+   *   ⑦ 置信度 = (最佳相位均值 - 全局均值) / (两者之和)，落在 [0,1]
+   *
+   * 成本控制：每次只分析 **20 秒窗口**（开头一段给 B 的入点，结尾一段给 A 的接缝），
+   *   分析对象是已经躺在内存里的 buffer，只在「加载/预载就绪」时算一次并缓存。
+   */
+
+  var BEAT_DECIM_HZ = 11025; // 抽取后的标称采样率
+  var BEAT_HOP_SEC = 0.0116; // 一帧 ~11.6ms
+  var BEAT_WIN_SEC = 20; // 每次分析的窗口
+  var BEAT_MIN_SEC = 6; // 窗口不足这么长就不算（算不准）
+
+  function autoMixEnabled() {
+    try {
+      if (typeof window !== "undefined" && window && window.__gpAutoMix === false) return false;
+    } catch (e) {}
+    return true;
+  }
+
+  function beatCache() {
+    return S.beatCache || (S.beatCache = {});
+  }
+
+  /**
+   * 分析一段音频的拍点。
+   * @param ab   AudioBuffer（要能 getChannelData）
+   * @param from 秒（窗口起点）
+   * @param len  秒（窗口长度）
+   * @returns {bpm, beatSec, anchorSec（绝对曲目时间）, conf, frames, windowSec} 或 null
+   */
+  function analyzeBeats(ab, from, len) {
+    if (!ab || typeof ab.getChannelData !== "function") return null;
+    var sr = Number(ab.sampleRate) || 44100;
+    var ch = Number(ab.numberOfChannels) || 1;
+    var dur = Number(ab.duration) || 0;
+    if (!(dur > 0)) return null;
+
+    var start = Math.max(0, Math.min(dur - 1, from));
+    var span = Math.min(len, dur - start);
+    if (span < BEAT_MIN_SEC) return null;
+
+    var fromSample = Math.floor(start * sr);
+    var toSample = Math.min(Math.floor(ab.length), Math.floor((start + span) * sr));
+    var count = toSample - fromSample;
+    if (count < sr * BEAT_MIN_SEC) return null;
+
+    // ① 单声道 + 抽取
+    var step = Math.max(1, Math.round(sr / BEAT_DECIM_HZ));
+    var srEff = sr / step;
+    var n = Math.floor(count / step);
+    var mono = new Float32Array(n);
+    var data = [];
+    for (var c = 0; c < ch; c++) {
+      try {
+        var d = ab.getChannelData(c);
+        if (!d || typeof d.length !== "number") return null;
+        data.push(d);
+      } catch (e) {
+        return null;
+      }
+    }
+    for (var i = 0; i < n; i++) {
+      var sum = 0;
+      var base = fromSample + i * step;
+      for (var c2 = 0; c2 < ch; c2++) sum += data[c2][base] || 0;
+      mono[i] = sum / ch;
+    }
+
+    // ② 一阶高通（~200Hz，突出瞬态；不做它的话低频会把包络糊住）
+    var a = Math.max(0, Math.min(0.999, 1 - (2 * Math.PI * 200) / srEff));
+    var px = 0;
+    var py = 0;
+    for (var k = 0; k < n; k++) {
+      var x = mono[k];
+      var y = a * (py + x - px);
+      px = x;
+      py = y;
+      mono[k] = y;
+    }
+
+    // ③ 能量包络 → onset 通量
+    var hop = Math.max(8, Math.round(srEff * BEAT_HOP_SEC));
+    var frames = Math.floor(n / hop);
+    if (frames < 32) return null;
+    var env = new Float32Array(frames);
+    for (var f = 0; f < frames; f++) {
+      var off = f * hop;
+      var acc = 0;
+      for (var m = 0; m < hop; m++) {
+        var v = mono[off + m];
+        acc += v * v;
+      }
+      env[f] = Math.sqrt(acc / hop);
+    }
+    var flux = new Float32Array(frames);
+    for (var f2 = 1; f2 < frames; f2++) {
+      var dd = env[f2] - env[f2 - 1];
+      flux[f2] = dd > 0 ? dd : 0;
+    }
+    // 去局部均值（窗口 ~0.6s）：避免「整体渐强」被误当成节拍
+    var w = Math.max(3, Math.round(0.6 / BEAT_HOP_SEC));
+    var base2 = new Float32Array(frames);
+    for (var f3 = 0; f3 < frames; f3++) {
+      var lo = Math.max(0, f3 - w);
+      var hi = Math.min(frames - 1, f3 + w);
+      var s = 0;
+      for (var q = lo; q <= hi; q++) s += flux[q];
+      base2[f3] = s / (hi - lo + 1);
+    }
+    var onset = new Float32Array(frames);
+    var onsetSum = 0;
+    for (var f4 = 0; f4 < frames; f4++) {
+      var r = flux[f4] - base2[f4];
+      onset[f4] = r > 0 ? r : 0;
+      onsetSum += onset[f4];
+    }
+    var meanOnset = onsetSum / frames;
+    if (!(meanOnset > 0)) return null;
+
+    // ④ 自相关找周期（40~220 BPM）
+    var hopSec = hop / srEff;
+    var minLag = Math.max(2, Math.round(60 / 220 / hopSec));
+    var maxLag = Math.min(frames - 2, Math.round(60 / 40 / hopSec));
+    if (maxLag <= minLag) return null;
+    var ac = new Float32Array(maxLag + 1);
+    for (var lag = minLag; lag <= maxLag; lag++) {
+      var s2 = 0;
+      for (var t = 0; t + lag < frames; t++) s2 += onset[t] * onset[t + lag];
+      ac[lag] = s2 / (frames - lag);
+    }
+
+    // ⑤ 梳状评分：真正的基本周期，其整数倍处也应有峰（压掉倍/半速误判）
+    function comb(lag) {
+      var sc = 0;
+      var wsum = 0;
+      for (var mul = 1; mul <= 4; mul++) {
+        var L = Math.round(lag * mul);
+        if (L >= minLag && L <= maxLag) {
+          sc += ac[L] / mul;
+          wsum += 1 / mul;
+        }
+      }
+      return wsum > 0 ? sc / wsum : 0;
+    }
+    var bestLag = 0;
+    var bestScore = -1;
+    for (var lg = minLag; lg <= maxLag; lg++) {
+      var sc2 = comb(lg);
+      if (sc2 > bestScore) {
+        bestScore = sc2;
+        bestLag = lg;
+      }
+    }
+    if (!(bestLag > 0)) return null;
+
+    // 折回 80~180 BPM（人耳对这段最敏感，也避免把 1/2、1/3 倍当基频）
+    var bpm = 60 / (bestLag * hopSec);
+    while (bpm > 180 && bestLag * 2 <= maxLag) {
+      bestLag *= 2;
+      bpm = 60 / (bestLag * hopSec);
+    }
+    while (bpm < 80 && Math.round(bestLag / 2) >= minLag) {
+      bestLag = Math.round(bestLag / 2);
+      bpm = 60 / (bestLag * hopSec);
+    }
+
+    // ⑥ 相位：拍点处 onset 最集中的那个相位
+    var period = bestLag;
+    var bestPhase = 0;
+    var bestPhaseScore = -1;
+    for (var ph = 0; ph < period; ph++) {
+      var s3 = 0;
+      var cnt = 0;
+      for (var idx = ph; idx < frames; idx += period) {
+        s3 += onset[idx];
+        cnt++;
+      }
+      var avg2 = cnt ? s3 / cnt : 0;
+      if (avg2 > bestPhaseScore) {
+        bestPhaseScore = avg2;
+        bestPhase = ph;
+      }
+    }
+
+    // ⑦ 置信度：拍点均值相对全局均值的对比度
+    var conf = (bestPhaseScore - meanOnset) / (bestPhaseScore + meanOnset + 1e-9);
+    if (!isFinite(conf) || conf < 0) conf = 0;
+    if (conf > 1) conf = 1;
+
+    return {
+      bpm: bpm,
+      beatSec: 60 / bpm,
+      anchorSec: start + bestPhase * hopSec, // 绝对曲目时间
+      conf: conf,
+      frames: frames,
+      windowSec: span,
+    };
+  }
+
+  /**
+   * 取某首歌「靠近某个时间点」的拍点网格（带缓存）。
+   * 我们只关心两个位置：**开头**（B 的入点）和**结尾**（A 的接缝），所以只算两段 20s 窗口。
+   */
+  function beatGridNear(trackId, ab, nearSec) {
+    if (trackId === null || trackId === undefined || !ab) return null;
+    var dur = Number(ab.duration) || 0;
+    if (!(dur > BEAT_MIN_SEC)) return null;
+    var atEnd = nearSec > dur / 2;
+    var key = trackId + (atEnd ? "|tail" : "|head");
+    var cache = beatCache();
+    if (Object.prototype.hasOwnProperty.call(cache, key)) return cache[key];
+
+    var from = atEnd ? Math.max(0, dur - BEAT_WIN_SEC - 2) : 0;
+    var grid = null;
+    try {
+      grid = analyzeBeats(ab, from, Math.min(BEAT_WIN_SEC, dur - from));
+    } catch (e) {
+      log("[beat] ★ 分析抛错 ｜ track=" + trackId + " ｜ " + (e && e.message));
+      grid = null;
+    }
+    if (grid && atEnd && grid.bpm > 0) {
+      // 把锚点折算到「结尾附近最近的一拍」，接缝直接取用
+      var beat = grid.beatSec;
+      var t = Math.max(0, dur - 0.2);
+      grid.endBeatSec = grid.anchorSec + Math.round((t - grid.anchorSec) / beat) * beat;
+    }
+    cache[key] = grid;
+    if (grid) {
+      log(
+        "[beat] track=" + trackId + " ｜ " + (atEnd ? "尾窗" : "头窗") + " ｜ bpm=" + grid.bpm.toFixed(1) +
+          " ｜ 锚点=" + grid.anchorSec.toFixed(2) + "s ｜ 置信=" + grid.conf.toFixed(2) +
+          (grid.endBeatSec !== undefined ? " ｜ 末拍=" + grid.endBeatSec.toFixed(2) + "s" : "")
+      );
+    } else {
+      log("[beat] track=" + trackId + " ｜ " + (atEnd ? "尾窗" : "头窗") + " ｜ 算不出（太短/太安静/没 buffer）");
+    }
+    return grid;
+  }
+
+  /** 头窗网格（B 的入点用） */
+  function beatHead(trackId, ab) {
+    return beatGridNear(trackId, ab, 0);
+  }
+
+  /** 尾窗网格（A 的接缝用） */
+  function beatTail(trackId, ab) {
+    return beatGridNear(trackId, ab, Number(ab && ab.duration) || 0);
+  }
+
+  /**
+   * 由两个网格定档位。**无变速版**：档位只决定要不要做拍点对齐，不改速度。
+   * 思路：把 BPM 用 0.5/1/2 倍折算到最接近 A 的那个，比偏差；
+   * 偏差 >6% 说明两首拍点本来就不同步，硬对齐没意义 → 退回普通交叉。
+   */
+  function mixPlan(gA, gB) {
+    if (!gA || !gB || !(gA.bpm > 0) || !(gB.bpm > 0)) {
+      return { tier: "plain", ratio: 1, dev: 1, conf: 0 };
+    }
+    var best = 1;
+    var bestDev = 1e9;
+    var fact = [0.5, 1, 2];
+    for (var i = 0; i < 3; i++) {
+      var sp = gA.bpm / (gB.bpm * fact[i]);
+      var dev = Math.abs(sp - 1);
+      if (dev < bestDev) {
+        bestDev = dev;
+        best = sp;
+      }
+    }
+    var conf = Math.min(gA.conf, gB.conf);
+    var tier = "plain";
+    if (conf >= 0.45 && bestDev <= 0.06) tier = "full";
+    else if (conf >= 0.2 && bestDev <= 0.06) tier = "smart";
+    return { tier: tier, ratio: best, dev: bestDev, conf: conf };
+  }
+
+  /** 把「曲目时间 pos」吸到最近的拍点上（偏移不超过半拍；偏移过大就不动） */
+  function snapToBeat(grid, pos) {
+    if (!grid || !(grid.bpm > 0)) return { pos: pos, delta: 0 };
+    var beat = grid.beatSec;
+    var nb = grid.anchorSec + Math.round((pos - grid.anchorSec) / beat) * beat;
+    var delta = nb - pos;
+    if (Math.abs(delta) > beat / 2) delta = 0;
+    return { pos: pos + delta, delta: delta };
   }
 
   /* ==================== v1.3.3 · autoplay 兜底（不带启动参数也不用点播放）==================== */
@@ -4382,6 +4737,7 @@
         ["关掉预约", "__gpSeamless", false],
         ["整条交回原生", "__gpNativeAll", false],
         ["automix 探针", "__gpProbe", false],
+        ["拍点对齐（Automix）", "__gpAutoMix", true],
       ].forEach(function (it) {
         var r = domMake("div", CSS_ROW);
         r.appendChild(domMake("span", CSS_LABEL, it[0]));
@@ -4541,6 +4897,15 @@
         version: VERSION,
         status: statusLine,
         xfade: effectiveXfade, // 现在是 {sec, curve, eq, source}，方便脚本/排查
+        // ★ v1.5.0：拍点相关的调试入口（面板/测试/排查都用它）
+        beat: function (ab, from, len) {
+          return analyzeBeats(ab, from, len);
+        },
+        mixPlan: mixPlan,
+        snapToBeat: snapToBeat,
+        lastPlan: function () {
+          return S.lastPlan;
+        },
         setStyle: applyStyle,
         setXfade: saveXfade,
         clearCache: clearCaches,

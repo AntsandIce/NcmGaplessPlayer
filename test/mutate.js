@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.4.0";',
+    find: 'var VERSION = "1.5.0";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -703,6 +703,34 @@ const MUTATIONS = [
     find: "      localStorage.setItem(STYLE_KEY, name);",
     replace: "      /* 变异：不记住 */",
     expect: "88",
+  },
+  {
+    name: "v1.5.0: 八度折算失效（120 vs 60 被当成不同步）",
+    file: "main.js",
+    find: "      var sp = gA.bpm / (gB.bpm * fact[i]);",
+    replace: "      var sp = gA.bpm / gB.bpm; // 变异：不折八度",
+    expect: "89",
+  },
+  {
+    name: "v1.5.0: 置信度造假（静音也当高置信，硬做拍点对齐）",
+    file: "main.js",
+    find: "    var conf = (bestPhaseScore - meanOnset) / (bestPhaseScore + meanOnset + 1e-9);",
+    replace: "    var conf = 0.9; // 变异：置信度造假",
+    expect: "89",
+  },
+  {
+    name: "v1.5.0: 低置信也判 full（明明不同步却硬对齐）",
+    file: "main.js",
+    find: "    if (conf >= 0.45 && bestDev <= 0.06) tier = \"full\";",
+    replace: "    if (true) tier = \"full\"; // 变异：不看置信",
+    expect: "89",
+  },
+  {
+    name: "v1.5.0: 拍点吸附不生效（算出来了但没用）",
+    file: "main.js",
+    find: "          if (sn.delta) {",
+    replace: "          if (false) { // 变异：不吸附",
+    expect: "89",
   },
 ];
 
