@@ -998,7 +998,13 @@
   }
 
   function isNcm3() {
-    try { return /^3\./.test(String((window.APP_CONF && APP_CONF.appver) || "")); } catch (e) { return false; }
+    try {
+      var conf = (typeof APP_CONF !== "undefined" && APP_CONF) ||
+        (typeof window !== "undefined" && window && window.APP_CONF) || null;
+      return /^3\./.test(String((conf && conf.appver) || ""));
+    } catch (e) {
+      return false;
+    }
   }
   function emitEnd() {
     // ★ 3.1.42 兼容补丁：3.x 客户端**自己也会判定播完并推进**，我们伪造的 onEnd 会和它叠加，
