@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.5.0";
+  var VERSION = "1.5.1";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -1592,8 +1592,13 @@
         };
         try {
           // ★ v1.2.0：补起的节点也必须带 B 自己的裁剪（否则这一段会把 B 的首部静音播出来）
+          // ★ v1.5.1：入点也要带上（B 可能跳过了一段前奏）
           var fixTrim = sc.trim || zeroTrim();
-          fix.start(S.ctx.currentTime + 0.005, fixTrim.start, sc.duration);
+          fix.start(
+            S.ctx.currentTime + 0.005,
+            sc.bufOffset !== undefined ? sc.bufOffset : fixTrim.start,
+            sc.playDur !== undefined ? sc.playDur : sc.duration
+          );
         } catch (e2) {}
         sc.src = fix;
         sc.startCtxTime = S.ctx.currentTime + 0.005;
@@ -1615,7 +1620,7 @@
       sc.fadeB = null;
       sc.eqA = null;
       S.startCtxTime = sc.startCtxTime;
-      S.startOffset = 0;
+      S.startOffset = sc.startOffset || 0; // ★ v1.5.1：B 可能从半拍/空白之后进场
       S.pausedAt = 0;
       S.paused = false;
       sc.phase = "live";
@@ -2329,6 +2334,24 @@
       log("[automix] ★ 拍点对齐失败（不影响播放）｜ " + (e && e.message));
     }
 
+    // ★ v1.5.1：B 的**入点** —— 用 B 自己的拍点选「从哪一拍进」，顺手跳过开头的空气声。
+    //   只在有交叉时才有意义（没交叉就是 A 播完 B 从 0 开始，跳过头就成"吃歌"了）。
+    var entry = { offset: btrim.start, skip: 0, reason: "未启用" };
+    if (fadeSec > 0 && autoMixEnabled()) {
+      try {
+        entry = pickBEntry(gB2, btrim, bdur, buf);
+      } catch (e) {
+        log("[automix] ★ 选入点失败（不影响播放）｜ " + (e && e.message));
+      }
+    }
+    var bPlayDur = Math.max(0.02, bdur - entry.skip);
+    if (entry.skip > 0.02) {
+      log(
+        "[automix] B 入点 → " + entry.reason + " ｜ 跳过 " + (entry.skip * 1000).toFixed(0) +
+          "ms ｜ 起点=" + entry.offset.toFixed(2) + "s（缓冲）"
+      );
+    }
+
     // ★ 手写建 source —— **不能复用 `startSource()`**：它第 3 行无条件 `stopSource()`，会把正在播的 A 停掉。
     var src = S.ctx.createBufferSource();
     src.buffer = buf;
@@ -2347,7 +2370,7 @@
       }
     }
     try {
-      src.start(bStart, btrim.start, bdur);
+      src.start(bStart, entry.offset, bPlayDur);
     } catch (e) {
       log("[sched] ★ start 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
       try {
@@ -2377,7 +2400,10 @@
       src: src,
       trackId: nid,
       buffer: buf,
-      duration: bdur,
+      duration: bdur, // 整首的可听时长（交接后 S.duration 用它，进度条才不会错）
+      startOffset: entry.skip, // ★ v1.5.1：B 的入点（交接后 S.startOffset 用它）
+      bufOffset: entry.offset, // ★ v1.5.1：缓冲时间轴上的起点（兜底节点重启时用）
+      playDur: bPlayDur, // ★ v1.5.1：从入点起还能播多久
       trim: btrim,
       gain: gB, // ★ v1.3.0：B 的增益节点（交接后成为 S.srcGain）
       filter: chainB.filter, // ★ v1.3.2：B 的高通（交接后成为 S.srcFilter）
@@ -2395,6 +2421,7 @@
         bStart.toFixed(3) + " ｜ 还剩 " + left.toFixed(2) + "s ｜ 结束 at=" + endCtxTime.toFixed(3) +
         " ｜ 模式=" + (mode || "seqStreak=" + S.seqStreak) +
         " ｜ 来源=" + (S.stream ? "流式" : "缓冲") +
+        (entry.skip > 0.02 ? " ｜ B入点=+" + (entry.skip * 1000).toFixed(0) + "ms" : "") +
         " ｜ B裁剪=首" + (btrim.start * 1000).toFixed(1) + "ms 尾" + (btrim.end * 1000).toFixed(1) + "ms" +
         (fadeSec > 0
           ? " ｜ 交叉=" + fadeSec.toFixed(2) + "s（曲线=" + xfadeCurveName() + (eqA ? "+扫频" : "") + "）"
@@ -3998,6 +4025,71 @@
     return { pos: pos + delta, delta: delta };
   }
 
+  /**
+   * ★ v1.5.1：给 B 选一个**入点**（都在「缓冲时间轴」上算）。
+   *
+   * 为什么需要：B 原来永远从 0 开始 —— 于是交叉可能落在 B 的**半拍中间**，
+   * 或者落在 B 开头那段留白/空气声里（很多歌前奏就有 1~2 秒）。这一步只做决策，不动任何 DSP：
+   *
+   *   ① 先看 B 开头有没有**真静音**（和 trim 用的是同一个检测，阈值 -80dBFS）：
+   *      有就优先跳到空白之后 —— 交叉期间听到空气声是最差的入点；
+   *   ② 再找 ≥ 该点的**第一个拍点**；起点本来就贴着拍（差 ≤60ms）时，不为对齐再吃一个整拍；
+   *   ③ 跳过量超过上限（6s 或 B 的一半）就放弃，老实从可听起点开始。
+   *
+   * @returns {offset（缓冲时间轴）, skip（跳过的秒数）, reason}
+   */
+  var BEAT_PICKUP_MAX = 6; // 最多跳过这么长的前奏
+  var BEAT_PICKUP_TOL = 0.06; // 起点已经「贴着拍」的容差
+
+  function pickBEntry(grid, btrim, bdur, ab) {
+    var start = (btrim && btrim.start) || 0;
+    var len = Number(bdur) || 0;
+    if (!grid || !(grid.bpm > 0) || !(len > 1)) {
+      return { offset: start, skip: 0, reason: "无拍点网格" };
+    }
+    var beat = grid.beatSec;
+    var cap = Math.min(BEAT_PICKUP_MAX, len * 0.5);
+
+    // ① 开头的空白。⚠️ 只跳「量得完」的空白：silenceHead 扫到上限就返回上限，
+    //   那种情况说明空白比上限还长 —— 硬跳会把自己扔进空白中间，宁可不跳。
+    var gap = 0;
+    var gapCapped = false;
+    try {
+      gap = silenceHead(ab, cap) || 0;
+      if (gap >= cap - 0.01) {
+        gap = 0;
+        gapCapped = true;
+      }
+    } catch (e) {
+      gap = 0;
+    }
+    var from = start + Math.max(0, gap - 0.05);
+
+    // ② 第一个 ≥ from 的拍点；如果 from 本来就贴着上一拍，就用 from（不为对齐吃一个整拍）
+    var k = Math.ceil((from - grid.anchorSec) / beat - 1e-6);
+    var off = grid.anchorSec + k * beat;
+    var prev = off - beat;
+    var onBeat = false;
+    var d = from - prev;
+    if (d >= 0 && d <= BEAT_PICKUP_TOL) {
+      off = Math.max(from, prev);
+      onBeat = true;
+    }
+    if (off < start) off = start;
+
+    // ③ 跳太多就不跳
+    var skip = off - start;
+    if (!(skip >= 0) || skip > cap + 1e-6) {
+      return { offset: start, skip: 0, reason: "跳过 " + skip.toFixed(2) + "s 超出上限" };
+    }
+    var reason;
+    if (skip < 0.02) reason = onBeat ? "本来就在拍上" : "起点即拍点";
+    else if (gapCapped) reason = "空白比上限还长 → 只跳到第一拍";
+    else if (gap >= 0.25) reason = "跳过 " + gap.toFixed(2) + "s 空白，落到第一拍";
+    else reason = "对齐到第一拍";
+    return { offset: off, skip: skip, reason: reason };
+  }
+
   /* ==================== v1.3.3 · autoplay 兜底（不带启动参数也不用点播放）==================== */
 
   /**
@@ -4902,6 +4994,7 @@
           return analyzeBeats(ab, from, len);
         },
         mixPlan: mixPlan,
+        pickup: pickBEntry, // ★ v1.5.1：给 B 选入点
         snapToBeat: snapToBeat,
         lastPlan: function () {
           return S.lastPlan;

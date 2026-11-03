@@ -3415,6 +3415,107 @@ async function main() {
     }
   }
 
+  section("90. ★★★ v1.5.1 B 的入点（跳过前奏/空白，落在拍上）");
+  {
+    /** 带「开头静音」的节拍轨（模拟前奏里的空气声） */
+    function mkClickGap(opts) {
+      const sr = opts.sr || 8000;
+      const bpm = opts.bpm;
+      const secs = opts.secs || 20;
+      const gap = opts.gap || 0;
+      const n = Math.round(secs * sr);
+      const data = new Float32Array(n);
+      const beat = 60 / bpm;
+      for (let t = gap; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      return {
+        duration: secs,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => data,
+      };
+    }
+
+    // ---- (a) 直接测选点：贴拍不跳、离拍就跳到第一拍、空白优先跳、超上限不跳 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      ok(typeof api.pickup === "function", "★★ 暴露了 gaplessPlayer.pickup()");
+      const bt = { start: 0.013, end: 0 };
+      const noData = { duration: 200, sampleRate: 8000, numberOfChannels: 1, length: 1, getChannelData: null };
+
+      // 锚点 0（拍在 0 / 0.5 / 1.0…），起点 0.013 本来就贴着拍 → 不该跳
+      const r1 = api.pickup({ bpm: 120, beatSec: 0.5, anchorSec: 0, conf: 0.9 }, bt, 200, noData);
+      ok(r1.skip < 0.02, "★★ 起点本来就贴着拍 → 不跳（skip=" + (r1.skip * 1000).toFixed(0) + "ms）");
+
+      // 锚点 0.25（拍在 0.25 / 0.75…）→ 应跳到 0.25
+      const r2 = api.pickup({ bpm: 120, beatSec: 0.5, anchorSec: 0.25, conf: 0.9 }, bt, 200, noData);
+      ok(Math.abs(r2.offset - 0.25) < 0.02, "★★ 离拍 0.24s → 跳到第一拍（offset=" + r2.offset.toFixed(3) + "）");
+      eq(r2.reason, "对齐到第一拍", "★★ 理由写清楚了");
+
+      // 开头 1.5s 空白 → 优先跳过空白
+      const gapBuf = mkClickGap({ bpm: 120, gap: 1.5 });
+      const r3 = api.pickup({ bpm: 120, beatSec: 0.5, anchorSec: 1.5, conf: 0.9 }, bt, 200, gapBuf);
+      ok(r3.skip > 1.3, "★★ 开头 1.5s 空白 → 跳过去（skip=" + r3.skip.toFixed(2) + "s）");
+      ok(r3.skip < 1.9, "★★ 但只跳到空白之后的第一拍，不多吃");
+      ok(/空白/.test(r3.reason), "★★ 日志理由写明「空白」");
+
+      // 空白 8s > 上限 6s → 放弃跳
+      const bigGap = mkClickGap({ bpm: 120, gap: 8, secs: 20 });
+      const r4 = api.pickup({ bpm: 120, beatSec: 0.5, anchorSec: 8, conf: 0.9 }, bt, 200, bigGap);
+      eq(r4.skip, 0, "★★ 空白比上限还长 → 不硬跳（不吃歌）");
+      ok(/上限|拍/.test(r4.reason), "★★ 理由写清楚了（" + r4.reason + "）");
+
+      // 没有网格 → 原样返回
+      const r5 = api.pickup(null, bt, 200, noData);
+      eq(r5.skip, 0, "★★ 没有拍点网格 → 不跳");
+    }
+
+    // ---- (b) 接到调度上：B 跳过前奏、进来源改动、进度从入点开始 ----
+    {
+      const e = await seamlessEnv("playorder", {
+        hooks: { decode: () => mkClickGap({ bpm: 120, gap: 1.2, secs: 200 }) },
+      });
+      e.win.__gpXfade = 3;
+      setLeft(e, 3.2);
+      const n0 = e.started.length;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[automix] B 入点") >= 1, "★★ 调度时打出了 B 入点");
+      eq(e.started.length, n0 + 1, "（前提）排上了 B");
+      const s = lastOf(e.started);
+      ok(Number(s.off) > 1.0, "★★ B 从空白之后进场（off=" + Number(s.off).toFixed(2) + "s）");
+      ok(Number(s.dur) < 199, "★★ 可播时长相应变短（dur=" + Number(s.dur).toFixed(1) + "s）");
+      ok(countLog(e, "B入点=+") >= 1, "★★ [sched] 那行也带上了入点");
+
+      // 交接后进度要从入点开始，而不是从 0 跳回
+      e.ctx.currentTime = 200.02;
+      enderOf(e.started, 0)();
+      await flush();
+      // live 窗口期间进度是被刻意抑制的（UI 还没 load）→ 先让 UI 认领，再看进度
+      e.channel.call("audioplayer.load", null, [
+        "2000_1_3136952023-x",
+        { songId: 2000, musicurl: "http://cdn.example/seam2.flac" },
+      ]);
+      await flush();
+      e.tick();
+      await flush();
+      e.flushTimers();
+      const prog = e.last("PlayProgress"); // 事件名是去掉 `audioplayer.on` 之后的
+      const pos = Number(argAt(prog, 1));
+      // 期望 pos ≈ 交叉时长(3s) + 入点(≈1.2s)；丢掉入点的话会正好是 3.0s
+      ok(pos > 3.4, "★★ 交接后进度从入点开始（pos=" + pos.toFixed(2) + "s ≈ 3 + 入点，不是 3）");
+    }
+  }
+
   /* ---------- 汇总 ---------- */
   console.log("\n====================");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");

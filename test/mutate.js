@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.5.0";',
+    find: 'var VERSION = "1.5.1";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -537,8 +537,8 @@ const MUTATIONS = [
   {
     name: "v1.2.0: 预约 B 时不带 B 的裁剪量（B 开头那 26ms 静音又回来了）",
     file: "main.js",
-    find: "      src.start(bStart, btrim.start, bdur);",
-    replace: "      src.start(bStart, 0, buf.duration); // 变异：不裁 B",
+    find: "      src.start(bStart, entry.offset, bPlayDur);",
+    replace: "      src.start(bStart, 0, bdur); // 变异：不裁 B、也不跳入点",
     expect: "81",
   },
   {
@@ -731,6 +731,34 @@ const MUTATIONS = [
     find: "          if (sn.delta) {",
     replace: "          if (false) { // 变异：不吸附",
     expect: "89",
+  },
+  {
+    name: "v1.5.1: B 的入点永远从 0 开始（前奏/空白照吃不误）",
+    file: "main.js",
+    find: "        entry = pickBEntry(gB2, btrim, bdur, buf);",
+    replace: "        entry = { offset: btrim.start, skip: 0, reason: '变异' };",
+    expect: "90",
+  },
+  {
+    name: "v1.5.1: 开头空白不跳过（入点落在空气声里）",
+    file: "main.js",
+    find: "    var from = start + Math.max(0, gap - 0.05);",
+    replace: "    var from = start; // 变异：不管空白",
+    expect: "90",
+  },
+  {
+    name: "v1.5.1: 空白比上限还长也硬跳（把自己扔进静音中间）",
+    file: "main.js",
+    find: "      if (gap >= cap - 0.01) {",
+    replace: "      if (false) { // 变异：硬跳",
+    expect: "90",
+  },
+  {
+    name: "v1.5.1: 交接后忘记入点（进度从 0 跳回）",
+    file: "main.js",
+    find: "      S.startOffset = sc.startOffset || 0; // ★ v1.5.1：B 可能从半拍/空白之后进场",
+    replace: "      S.startOffset = 0; // 变异：丢掉入点",
+    expect: "90",
   },
 ];
 
