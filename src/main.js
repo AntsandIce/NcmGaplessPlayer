@@ -968,7 +968,19 @@
     emit("audioplayer.onVolume", S.audioId[0], "", 0, v);
   }
 
+  function isNcm3() {
+    try { return /^3\./.test(String((window.APP_CONF && APP_CONF.appver) || "")); } catch (e) { return false; }
+  }
   function emitEnd() {
+    // ★ 3.1.42 兼容补丁：3.x 客户端**自己也会判定播完并推进**，我们伪造的 onEnd 会和它叠加，
+    //   表现为「快播完时直接跳到第三首」（实测 200ms 内两次 player.setCurrentPlay）。
+    //   所以 3.x 上先不伪造，等客户端自己推进；1.5s 内没动静才补发兜底。
+    // ★ 3.x 撤回：客户端不会自己推进，必须立刻伪造 onEnd（否则必然多 1.5s 静音）。
+    //   「跳一首」留给 getPlaybackInfo/getPlayedTime 的抑制逻辑去处理。
+    S.__endedAt = Date.now();
+    realEmitEnd();
+  }
+  function realEmitEnd() {
     log("[emit] onEnd ｜ playedTime=" + Math.round(S.playedMs) + "ms");
     emit("audioplayer.onEnd", S.audioId[0], {
       activeCode: 0,
@@ -2347,6 +2359,43 @@
 
   function handle(name, cb, args) {
     args = args || [];
+    // ★★ 3.x 事件契约重写：getPlayedTime / getPlaybackInfo 由**我们自己**按引擎真实状态回答。
+    //   原生播放器被我们按住（暂停/未加载），对「新曲目的 playId」只会回
+    //     {playedTime:0, result:false} → 客户端据此再判一次「结束」→ 跳歌 / ping-pong。
+    //   实测契约（3.1.42）：
+    //     请求 args[0] = { playId: "<trackId>_<sid>" }
+    //     getPlayedTime  期望 → { playedAudioTime, playedTime, result }
+    //     getPlaybackInfo期望 → { playId, playedTime, playedPercent, result, deviceAudioFormat, playAudioFormat, ... }
+    if (isNcm3() && (name === "audioplayer.getPlaybackInfo" || name === "audioplayer.getPlayedTime")) {
+      try {
+        var __q = (args && args[0]) || {};
+        var __qid = typeof __q.playId === "string" ? __q.playId : "";
+        var __qTrack = trackIdOf(__qid);
+        var __mine = (__qTrack !== null) &&
+          (__qTrack === S.loadedTrackId || __qTrack === S.curTrackId || (S.sched && S.sched.trackId === __qTrack));
+        if (__mine && typeof cb === "function") {
+          var __pos = Math.round(position() * 1000) || 0;
+          var __dur = Math.round((S.duration || 0) * 1000) || 0;
+          if (__pos < 0) __pos = 0;
+          if (__dur > 0 && __pos > __dur) __pos = __dur;
+          if (name === "audioplayer.getPlayedTime") {
+            cb({ playedAudioTime: __pos, playedTime: __pos, result: true });
+          } else {
+            var __fmt = { channels: 2, samplerate: (S.ctx && S.ctx.sampleRate) || 48000, samplesize: 16 };
+            cb({
+              cacheStrategyCode: "", cdnUsed: false, deviceAudioFormat: __fmt,
+              hasNetworkJanks: false, hasSeekJanks: false, hasSystemJanks: false,
+              p2pUsed: false, playAudioFormat: __fmt, playId: __qid,
+              playedPercent: __dur > 0 ? Math.min(100, (__pos / __dur) * 100) : 0,
+              playedTime: __pos, preloadWholeCached: false, result: true
+            });
+          }
+
+          return true; // 不交给原生（避免 result:false 触发客户端二次结束判定）
+        }
+
+      } catch (e) { log("[guard] 契约重写异常 ｜ " + (e && e.message)); }
+    }
     // ★ v0.4.0：逃生开关 —— `window.__gpNativeAll = true` 时把播放整条交回原生。
     //   放行 = 返回 false → installInterceptor 里 `below.apply(...)` 交给原生。
     if (AUDIO_CMDS[name] && passAllToNative()) {
@@ -2437,6 +2486,10 @@
       case "player.setCurrentPlay": {
         var tid = trackIdOf(args[0]);
         if (tid !== null) {
+          // ★ 3.x：客户端自己推进了 → 撤掉「补发 onEnd」的兜底计时器
+          if (S.__endTimer) { clearTimeout(S.__endTimer); S.__endTimer = 0; }
+          S.__advancedAt = Date.now();
+          S.__endFallbackGen = (S.__endFallbackGen || 0) + 1;
           // ★ v0.2.10：修掉「索引 / 下一首 是上一首的」这个会误导排查的日志 bug —— 显式传 tid。
           //   （`S.curTrackId = tid` 在这行之后才执行，v0.2.7 起就是这样。）
           var nx = nextTrack(tid);
@@ -2566,7 +2619,12 @@
       } catch (e) {
         log("[guard] ★ handle(" + name + ") 抛错 ｜ " + (e && e.name) + ": " + (e && e.message));
       }
-      return below.apply(this, arguments);
+      // ★ 支持「包装回调」：handle 里把替换后的回调放进 S.__cbSwap，这里才能真正交给原生。
+      var __cb = callback;
+      try {
+        if (S && S.__cbSwap) { __cb = S.__cbSwap; S.__cbSwap = null; }
+      } catch (e) {}
+      return below.call(this, name, __cb, args);
     };
     try {
       Object.defineProperty(channel, "call", {
