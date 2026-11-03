@@ -2106,9 +2106,12 @@
       log("[preload] 320k 接口 ★ br=" + d.br + " ｜ size=" + d.size + " ｜ type=" + d.type +
         " ｜ fee=" + d.fee + " ｜ payed=" + d.payed + " ｜ flag=" + d.flag +
         (d.freeTrialInfo ? " ｜ 试听片段=" + JSON.stringify(d.freeTrialInfo) : ""));
-      // ★ 付费/VIP 曲目该接口只给**试听片段**（freeTrialInfo 非空，实测有 64s 的），
-      //   预载它会在片段结束时断掉 —— 直接放弃，让客户端用它的 token 播整首。
+      // ★ 付费/VIP 曲目该接口只给**试听片段**，预载它会在片段边界直接断掉（实测 64.00s）。
+      //   实测该接口对试听给的码率是 320006 这种**非标准值**（正常为 128000/192000/320000/999000），
+      //   且有的曲目还会带 freeTrialInfo。任一命中就放弃预载 → 让客户端用它的 token 播整首。
+      var STD_BR = { "128000": 1, "192000": 1, "320000": 1, "3200000": 1, "999000": 1 };
       if (d.freeTrialInfo) throw new Error("只有试听片段（freeTrialInfo），放弃预载");
+      if (!STD_BR[String(d.br)]) throw new Error("码率 " + d.br + " 非标准值（疑似试听片段），放弃预载");
       return d.url;
     });
   }
