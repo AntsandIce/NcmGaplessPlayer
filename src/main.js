@@ -1535,7 +1535,18 @@
         S.preloadState = "decoding";
         var ctx = ensureCtx();
         if (!ctx) throw new Error("没有 AudioContext");
-        return ctx.decodeAudioData(buf);
+        return ctx.decodeAudioData(buf).then(function (ab) {
+          // ★ 3.x：解出来的时长若明显短于权威时长 → 这是试听/片段，丢掉（否则歌会在边界断掉）
+          if (!isNcm3() || !ab) return ab;
+          return resolveDurationMs(trackId).catch(function () { return 0; }).then(function (dtMs) {
+            if (dtMs && ab.duration && dtMs / 1000 - ab.duration > 3) {
+              throw new Error(
+                "解码时长 " + ab.duration.toFixed(1) + "s 短于实际 " + (dtMs / 1000).toFixed(1) + "s（试听片段），放弃预载"
+              );
+            }
+            return ab;
+          });
+        });
       })
       .then(function (ab) {
         if (!ab || tk !== S.preloadToken) return null;
@@ -2094,6 +2105,30 @@
   function api320Url(trackId) {
     return "https://music.163.com/api/song/enhance/player/url?ids=[" + trackId + "]&br=320000";
   }
+  /** 权威时长（ms）：走免签名的 /api/song/detail（公开接口，不需要 cookie）。
+   *  用来识别「试听片段」—— 该接口对不同曲目会回 br=320001/320006 等变体，
+   *  光看 br 会把完整的 320k 误判成片段。 */
+  function resolveDurationMs(trackId) {
+    var cache = S.durCache || (S.durCache = {});
+    if (cache[trackId]) return Promise.resolve(cache[trackId]);
+    return nativeFetchBytes("https://music.163.com/api/song/detail?ids=[" + trackId + "]", 12000).then(function (buf) {
+      var txt = "";
+      try {
+        txt = new TextDecoder("utf-8").decode(new Uint8Array(buf));
+      } catch (e) {
+        var a = new Uint8Array(buf);
+        for (var i = 0; i < Math.min(a.length, 8000); i++) txt += String.fromCharCode(a[i]);
+      }
+      var j = null;
+      try { j = JSON.parse(txt); } catch (e) {}
+      var s = j && j.songs && j.songs[0];
+      var dt = s && (s.duration || s.dt);
+      if (!dt) throw new Error("拿不到时长");
+      cache[trackId] = Number(dt);
+      return Number(dt);
+    });
+  }
+
   function resolveUrl320(trackId) {
     return nativeFetchBytes(api320Url(trackId), 15000).then(function (buf) {
       var txt = "";
@@ -2112,13 +2147,19 @@
       log("[preload] 320k 接口 ★ br=" + d.br + " ｜ size=" + d.size + " ｜ type=" + d.type +
         " ｜ fee=" + d.fee + " ｜ payed=" + d.payed + " ｜ flag=" + d.flag +
         (d.freeTrialInfo ? " ｜ 试听片段=" + JSON.stringify(d.freeTrialInfo) : ""));
-      // ★ 付费/VIP 曲目该接口只给**试听片段**，预载它会在片段边界直接断掉（实测 64.00s）。
-      //   实测该接口对试听给的码率是 320006 这种**非标准值**（正常为 128000/192000/320000/999000），
-      //   且有的曲目还会带 freeTrialInfo。任一命中就放弃预载 → 让客户端用它的 token 播整首。
-      var STD_BR = { "128000": 1, "192000": 1, "320000": 1, "3200000": 1, "999000": 1 };
+      // ★ 付费/VIP 曲目该接口可能只给**试听片段**，预载它会在片段边界直接断掉。
+      //   ⚠️ 不能只看 br：实测完整 320k 会回 br=320001，试听回 320006，数值不可靠。
+      //   改为「size/br 估算时长」对比「/api/song/detail 的权威时长」，差得多就是片段。
       if (d.freeTrialInfo) throw new Error("只有试听片段（freeTrialInfo），放弃预载");
-      if (!STD_BR[String(d.br)]) throw new Error("码率 " + d.br + " 非标准值（疑似试听片段），放弃预载");
-      return d.url;
+      var est = d.size && d.br ? d.size / (d.br / 8) : 0;
+      return resolveDurationMs(trackId).catch(function () { return 0; }).then(function (dtMs) {
+        if (dtMs && est && Math.abs(est - dtMs / 1000) > 5) {
+          throw new Error(
+            "试听片段（估算 " + est.toFixed(1) + "s ≠ 实际 " + (dtMs / 1000).toFixed(1) + "s），放弃预载"
+          );
+        }
+        return d.url;
+      });
     });
   }
   function fetchBytes(url, signal) {

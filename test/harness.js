@@ -2177,10 +2177,26 @@ async function main() {
   /* ==================== 3.1.x 适配（本分支新增） ==================== */
 
   /** 3.x 环境：APP_CONF.appver = 3.1.x，并让假原生桥能回答 network.fetch */
-  function env3x(jsonBody) {
+  /**
+   * 3.x 环境。
+   * @param jsonBody  player/url 接口的返回
+   * @param durMs     可选：song/detail 的权威时长；不给就按 size/br 自洽推算
+   */
+  function env3x(jsonBody, durMs) {
+    const d0 = (jsonBody && jsonBody.data && jsonBody.data[0]) || {};
+    const implied = d0.size && d0.br ? Math.round((d0.size / (d0.br / 8)) * 1000) : 158600;
+    const dur = durMs || implied;
     const e = createEnv({
-      onNative(name, cb) {
-        if (name === "network.fetch" && typeof cb === "function") {
+      onNative(name, cb, args) {
+        if (name !== "network.fetch" || typeof cb !== "function") return;
+        // ⚠️ originalCall 收到的是 channel.call 的完整参数，hooks 拿到的是 slice(2) →
+        //    args = [[{url}]]，要多剥一层。
+        const a0 = args && args[0];
+        const first = Array.isArray(a0) ? (a0[0] || {}) : (a0 || {});
+        const u = String(first.url || "");
+        if (u.indexOf("/api/song/detail") >= 0) {
+          cb({ blob: JSON.stringify({ songs: [{ id: 0, duration: dur }] }) });
+        } else {
           cb({ blob: JSON.stringify(jsonBody) });
         }
       },
@@ -2245,7 +2261,8 @@ async function main() {
     ok(countLog(eOk, "预载就绪（下一首）") >= 1, "★★ 预载就绪");
 
     // 试听片段（br 非标准值）
-    const eClip = env3x({ data: [{ url: "http://cdn.example/clip.mp3", br: 320006, size: 2562133, type: "mp3", fee: 1, payed: 1 }] });
+    // ★ 关键：br 是 320000（不是 320006），但 size 只够 64s，权威时长 158.6s → 靠时长判定拦下
+    const eClip = env3x({ data: [{ url: "http://cdn.example/clip.mp3", br: 320000, size: 2562133, type: "mp3", fee: 1, payed: 1 }] }, 158600);
     eClip.eapi.available = false;
     eClip.boot();
     await flush();
@@ -2254,7 +2271,8 @@ async function main() {
     await flush();
     await flush();
     eClip.flushTimers(); // 日志是攒着写的，断言前要刷一次
-    ok(countLog(eClip, "非标准值") >= 1, "★★ 试听片段（br=320006）被识别");
+    if (process.env.GP_DEBUG_3X) console.log("---- eClip log ----\n" + eClip.logs().slice(-2000));
+    ok(countLog(eClip, "试听片段") >= 1, "★★ 试听片段（估算 64s ≠ 实际 158.6s）被识别");
     eq(
       eClip.fetchLog.filter((u) => String(u).indexOf("clip.mp3") >= 0).length,
       0,
