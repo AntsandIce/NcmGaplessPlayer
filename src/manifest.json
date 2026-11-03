@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "name": "GaplessPlayer",
   "slug": "gapless-player",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "1carus",
   "description": "用 Web Audio 自建播放引擎，把切歌间隙压到 0。两条播放路径：预载命中走缓冲（采样级预约，真无缝），没命中走 <audio> 流式。可选依赖 LibEAPIRequest：装了才能预载/预约，没装则退回纯流式播放。",
   "preview": "preview.svg",
