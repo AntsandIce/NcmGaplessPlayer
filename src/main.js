@@ -1259,26 +1259,12 @@
   }
 
   /** 走 LibEAPIRequest 查某首歌的播放地址 */
-  // ★ 3.1.42 兼容补丁：LibEAPIRequest 可能比本插件晚就绪（插件按 slug 字母序加载）
-  //   这里等它就绪（最多 6s）再取地址，避免 preload 首轮直接失败。
-  function waitLib(ms) {
-    return new Promise(function (resolve) {
-      var t0 = Date.now();
-      (function tick() {
-        var lib = null;
-        try { lib = (typeof loadedPlugins !== "undefined" && loadedPlugins && loadedPlugins.LibEAPIRequest) || null; } catch (e) {}
-        var ok = !!(lib && typeof lib.eapiRequest === "function" &&
-          (typeof lib.isRequestAvailable !== "function" || lib.isRequestAvailable()));
-        if (ok || Date.now() - t0 > ms) return resolve(lib);
-        setTimeout(tick, 120);
-      })();
-    });
-  }
-
   function resolveUrl(trackId) {
-    return waitLib(6000).then(function (libReady) {
     return new Promise(function (resolve, reject) {
-      var lib = libReady;
+      var lib = null;
+      try {
+        lib = (typeof loadedPlugins !== "undefined" && loadedPlugins && loadedPlugins.LibEAPIRequest) || null;
+      } catch (e) {}
       if (!lib || typeof lib.eapiRequest !== "function") {
         reject(new Error("LibEAPIRequest 不在（未安装 / 未启用）"));
         return;
@@ -1338,7 +1324,6 @@
           fallbackDownload();
         },
       });
-    });
     });
   }
 
@@ -1483,7 +1468,33 @@
     S.preloadState = "fetching";
     var t0 = performance.now();
     log("[preload] 开始预载（" + (why || "?") + "）｜ track=" + trackId);
-    slot.promise = acquireAudio(trackId, ac)
+    slot.promise = resolveUrl(trackId)
+      .then(function (url) {
+        if (tk !== S.preloadToken) return null;
+        return fetchBytes(url, ac ? ac.signal : null);
+      })
+      .catch(function (e) {
+        // ★ 3.x：LibEAPI 那条取址路在 3.x 上必然失败（扫到的是 webpack 模块工厂）→
+        //   320k 免签名接口 → outer/url(128k) → 原生网络取字节。
+        //   2.10.x 保持上游语义（失败直接抛给下游 → 退回流式），不多打请求。
+        if (!isNcm3()) throw e;
+        if (tk !== S.preloadToken) return null;
+        log("[preload] LibEAPI 不可用（" + (e && e.message) + "）→ 试 320k 免签名接口");
+        return resolveUrl320(trackId)
+          .then(function (url320) {
+            if (tk !== S.preloadToken) return null;
+            return fetchBytes(url320, ac ? ac.signal : null);
+          })
+          .catch(function (e2) {
+            if (tk !== S.preloadToken) return null;
+            log("[preload] 320k 接口失败（" + (e2 && e2.message) + "）→ outer/url(128k) 兜底");
+            return fetchBytes(outerUrlFor(trackId), ac ? ac.signal : null).catch(function (e3) {
+              if (tk !== S.preloadToken) return null;
+              log("[preload] 128k 直链也失败（" + (e3 && e3.message) + "）→ 原生网络取字节");
+              return nativeFetchBytes(outerUrlFor(trackId));
+            });
+          });
+      })
       .then(function (buf) {
         if (!buf || tk !== S.preloadToken) return null;
         S.preloadState = "decoding";
@@ -2067,24 +2078,6 @@
       return d.url;
     });
   }
-  function acquireAudio(trackId, ac) {
-    return resolveUrl(trackId)
-      .then(function (url) { return fetchBytes(url, ac ? ac.signal : null); })
-      .catch(function (e) {
-        log("[preload] LibEAPI 不可用（" + (e && e.message) + "）→ 试 320k 免签名接口");
-        return resolveUrl320(trackId).then(function (url) {
-          return fetchBytes(url, ac ? ac.signal : null);
-        });
-      })
-      .catch(function (e2) {
-        log("[preload] 320k 接口失败（" + (e2 && e2.message) + "）→ outer/url(128k) 兜底");
-        return fetchBytes(outerUrlFor(trackId), ac ? ac.signal : null).catch(function (e3) {
-          log("[preload] 128k 直链也失败（" + (e3 && e3.message) + "）→ 原生网络取字节");
-          return nativeFetchBytes(outerUrlFor(trackId));
-        });
-      });
-  }
-
   function fetchBytes(url, signal) {
     var t0 = performance.now();
     // ★ v0.2.5：带上 signal，作废时才能真正把连接掐掉（不传就退回旧的裸 fetch）
