@@ -8,9 +8,9 @@
 
 - **真无缝**：`start(when, offset, duration)` 采样级预约，不是「淡入淡出遮缝」
 - **首尾裁剪**：MP3 的 priming / padding 按波形验过再裁，接缝连那 ~25ms 静音都不留
-- **交叉淡入淡出**：0~12s 等功率（曲线可选 / 可选高通扫频），默认关
+- **过渡风格**：干净 / 轻过渡 / DJ 三档，**按播放模式自动选**（也可手动改）
 - **不重复下载**：下一首提前下好，听过的不再重下、不再重解
-- **可观测**：每层都有日志和开关，出问题能定位到底层
+- **有界面**：右下角「G」→ 设置面板；一行状态告诉你现在谁在播、过渡怎么定的
 
 ## 支持范围
 
@@ -25,27 +25,31 @@
 2. 放进 `C:\betterncm\plugins\`；
 3. 重启网易云。
 
-**不用再点播放了**（1.3.3 起）。Chromium 的 autoplay 策略会让 `AudioContext` 在第一次点按之前
-一直是 `suspended`，JS 绕不过去 —— 所以起不来时**先让原生播放器播**，等你第一次点按
-（点哪里都算）再交回插件。代价：这次启动的**第一首**由原生播，那一首没有无缝/交叉。
-
-想要**从第一首就无缝**，用带参数的快捷方式启动（`AudioContext` 一开就是 `running`）：
-
-```
-"C:\Program Files (x86)\CloudMusic\cloudmusic.exe" --autoplay-policy=no-user-gesture-required
-```
+装好之后不用点播放、不用改快捷方式：插件会自己接管。**右下角「G」** 打开设置面板。
 
 想要**桌面歌词**的话建议一并装 [RuLyric](https://github.com/BetterNCM/RuLyric)：
 网易云自带的桌面歌词由原生渲染，插件按住原生播放器后它只剩歌名。
+
+## 过渡风格（推荐先看这个）
+
+面板里三选一，**默认按播放模式自动选**：
+
+| 风格 | 实际是 | 什么时候会自动选它 |
+|---|---|---|
+| 干净 | 0s，采样级无缝 | 顺序 / 列表循环 / 单曲循环（专辑连听不该交叉） |
+| 轻过渡 | 2.5s 等功率 | 随机播放 / 心动模式 |
+| DJ | 3s + 高通扫频 + s 曲线 | 手动选 |
+
+手动选过就**记住**（重启仍在）；想回到自动：控制台 `gaplessPlayer.setStyle(...)` 或直接在面板里切。
+显式设过时长（`__gpXfade`）优先级最高，不会被风格覆盖。
 
 ## 开关（控制台一行，立刻生效）
 
 | 开关 | 作用 | 默认 |
 |---|---|---|
-| `window.__gpXfade = 3` | 交叉淡入淡出时长（0~12s，**会记住**） | 关 |
-| `window.__gpXfadeCurve = "s-line"` | 交叉曲线：`equal` / `linear` / `s-line` / `r_s-line` / `exp` / `step` | `equal` |
-| `window.__gpXfadeEq = true` | 交叉时高通扫频（20→900Hz） | 关 |
-| `window.__gpTrimPad = true` | 连「作品静音」也裁（接缝更紧） | 关 |
+| `window.__gpStyle = "light"` | 过渡风格：`clean` / `light` / `dj`（会记住） | **智能** |
+| `window.__gpXfade = 3` | 直接指定交叉时长（0~12s，会记住，**优先级最高**） | — |
+| `window.__gpXfadeCurve` / `__gpXfadeEq` | 曲线 / 高通扫频（风格已包含，一般不用手动） | 跟随风格 |
 | `window.__gpTrim = false` | 完全关掉首尾裁剪 | 开 |
 | `window.__gpPromote = false` | 不把流式那首补成缓冲（省流量） | 开 |
 | `window.__gpCache` / `window.__gpBytesCache = false` | 关全部缓存 / 只关字节缓存（省内存） | 开 |
@@ -54,19 +58,27 @@
 | `window.__gpNativeAll = true` | 播放整条交回原生播放器（逃生） | 关 |
 | `window.__gpProbe = true` | automix 探针（诊断用，见 Releases 说明） | 关 |
 
+也可以用脚本接口（面板就是用它们）：
+
+```js
+gaplessPlayer.status()          // 一行状态
+gaplessPlayer.setStyle("dj")    // 切风格
+gaplessPlayer.xfade()           // {sec, curve, eq, source}
+gaplessPlayer.clearCache()      // 清缓存
+gaplessPlayer.openPanel()       // 开/关面板
+```
+
 ## 已知限制
 
 - **随机播放无法稳定无缝**：客户端切歌前约 80ms 才决定下一首，插件只能「押」
   （间隙已从约 0.5s 压到约 0.2s）。要 0 间隙请用**顺序播放 / 列表循环**。
-- **交叉默认关**，且 B 必须是已预载的缓冲 —— 随机播放时基本不会出现。
+- **交叉需要 B 是已预载的缓冲** —— 随机播放时预载命中率低，交叉会相应少出现。
 - **Automix（接拍过渡）暂未实现**：实测 3.1.42 客户端里它的决策层是悬空的（无消费者、无分析数据源），
   详情见 [v1.3.2 的 Release 说明](https://github.com/AntsandIce/NcmGaplessPlayer/releases/tag/v1.3.2)。
 - **流式那一首不做首尾裁剪**（`<audio>` 没有采样级定位）；无 LAME 头的 MP3 只能按波形裁，每边 ≤20ms。
-- **内存 / 流量**：最近缓冲最多留 2 首（≤160MB）；流式曲目听够 8s 会补一份（~6MB/首）。都可用开关关掉。
+- **内存 / 流量**：最近缓冲最多留 2 首（≤160MB）；流式曲目听够 8s 会补一份（~6MB/首）。都可用开关或面板关掉。
 - **320k 依赖旧版免签名接口**，可能被网易云关掉；关掉后自动退 128k，不影响播放。
-- **不开启动参数时，本次启动的第一首是原生播的**：那首没有无缝/交叉（之后的都正常）。
-  这是 autoplay 策略的硬限制（`AudioContext` 在首次点按前起不来，JS 绕不过去），
-  插件选择「先让原生着，点一下再接管」而不是「静音等你点」。
+- **本次启动的第一首是原生播的**：那首没有无缝/交叉，点击任意位置后接管（autoplay 策略所限）。
 - 付费/VIP 曲目若无权限，接口只给试听片段 → 这类曲目没有无缝（仍能完整播放）。
 - 插件依赖客户端内部接口（`channel.call` / `legacyNativeCmder`），**客户端升级可能失效**。
 

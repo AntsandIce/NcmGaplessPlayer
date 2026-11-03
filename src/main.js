@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.3.3";
+  var VERSION = "1.4.0";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -408,7 +408,10 @@
     //   claimed = UI 的 load 到了、已认领，等首个 play
     sched: null,
     /* ---- v1.3.0：交叉淡入淡出（P2）---- */
-    xfade: 0, // 交叉时长（秒）；0 = 关（默认，与 Spotify 一致：只做 gapless）
+    xfade: 0, // 交叉时长（秒）；0 = 关。显式设置过才会被 xfadeExplicit 标记
+    xfadeExplicit: false, // ★ v1.4.0：用户显式设过时长 → 不被风格/智能默认覆盖
+    style: null, // ★ v1.4.0：用户选的过渡风格（clean/light/dj）；null = 智能默认
+    stats: { plays: 0, hitPreload: 0, hitRecent: 0 }, // ★ v1.4.0：状态行用
     srcGain: null, // 当前缓冲 source 自己的增益（淡出用；不动总线 S.gain）
     srcFilter: null, // ★ v1.3.2：同一路的「高通」（交叉时做扫频淡出，平时 20Hz = 直通）
     mediaGain: null, // 流式元素那一路的增益（同上）
@@ -875,19 +878,127 @@
   var XFADE_POINTS = 64;
 
   /**
-   * ★ v1.3.2：交叉曲线可选，名字**对齐客户端 automix 的 `crossfade_line` 枚举**
-   * （`linear` / `s-line` / `r_s-line` / `exp` / `step` / `none`）——
-   * 这样哪天拿到客户端算好的计划，`crossfade_line` 能直接透传进来，不用再翻译一次。
+   * ★ v1.4.0：用户只需要选「过渡风格」，不用懂曲线/扫频/时长。
    *
-   * 开关：`window.__gpXfadeCurve = "s-line"`（默认 `equal` = 等功率）
+   *   干净 → 0s（采样级无缝，专辑/古典/现场就该这样）
+   *   轻过渡 → 2.5s 等功率（歌单日常）
+   *   DJ → 3s + 高通扫频 + s 曲线（随机/电子/串烧）
+   *
+   * 优先级（从高到低）：
+   *   ① `window.__gpXfade` 显式时长 / `window.__gpXfadeCurve` / `window.__gpXfadeEq`（老开关，仍然有效）
+   *   ② 用户选过的风格（`window.__gpStyle` 或存下来的）
+   *   ③ **智能默认**：看播放模式 —— 随机/心动 → 轻过渡；顺序/列表循环/单曲循环 → 干净
+   *
+   * ★ 为什么智能默认用播放模式：这是我们唯一**可靠**的上下文信号（`NM_SETTING_PLAYER.mode`）。
+   *   专辑连听几乎不该交叉，随机歌单几乎都该有一点 —— 用这一个信号就能覆盖大多数人的预期，
+   *   而且用户什么都不用设。
    */
-  function xfadeCurveName() {
+  var STYLE_KEY = "gaplessPlayer.style";
+
+  var STYLE_PRESETS = {
+    clean: { xfade: 0, curve: "equal", eq: false, label: "干净" },
+    light: { xfade: 2.5, curve: "equal", eq: false, label: "轻过渡" },
+    dj: { xfade: 3, curve: "s-line", eq: true, label: "DJ" },
+  };
+
+  function styleFromMode() {
+    var mode = readPlayMode();
+    // 随机 / 心动 → 前后没有专辑连续性，给一点过渡
+    if (mode === "playrandom" || mode === "playai") return "light";
+    return "clean";
+  }
+
+  /** 用户显式选过的风格（window > 已存），没选过返回 null（= 走智能默认） */
+  function xfadeStyle() {
     try {
-      if (typeof window !== "undefined" && window && typeof window.__gpXfadeCurve === "string") {
-        return String(window.__gpXfadeCurve).toLowerCase();
+      if (typeof window !== "undefined" && window && typeof window.__gpStyle === "string") {
+        var w = String(window.__gpStyle).toLowerCase();
+        if (STYLE_PRESETS[w]) {
+          if (S.style !== w) saveStyle(w);
+          return w;
+        }
       }
     } catch (e) {}
-    return "equal";
+    return S.style && STYLE_PRESETS[S.style] ? S.style : null;
+  }
+
+  function saveStyle(name) {
+    try {
+      if (!STYLE_PRESETS[name]) return;
+      S.style = name;
+      localStorage.setItem(STYLE_KEY, name);
+    } catch (e) {}
+  }
+
+  function loadStyle() {
+    try {
+      var raw = localStorage.getItem(STYLE_KEY);
+      if (raw && STYLE_PRESETS[raw]) S.style = raw;
+    } catch (e) {}
+  }
+
+  /**
+   * 把「显式开关 / 风格 / 智能默认」合成最终的 {sec, curve, eq, source}。
+   * `source` 只用于日志与面板显示（好让用户知道现在为什么是这个值）。
+   */
+  function effectiveXfade() {
+    var explicitSec = null;
+    try {
+      if (typeof window !== "undefined" && window && typeof window.__gpXfade === "number") {
+        explicitSec = window.__gpXfade;
+        if (Number(S.xfade) !== Number(explicitSec)) saveXfade(explicitSec);
+      }
+    } catch (e) {}
+    if (explicitSec === null && S.xfadeExplicit) explicitSec = S.xfade;
+
+    var styleName = xfadeStyle();
+    var preset = styleName ? STYLE_PRESETS[styleName] : null;
+    var autoName = styleName ? null : styleFromMode();
+    var autoPreset = autoName ? STYLE_PRESETS[autoName] : null;
+
+    var sec;
+    var source;
+    if (explicitSec !== null) {
+      sec = explicitSec;
+      source = "explicit";
+    } else if (preset) {
+      sec = preset.xfade;
+      source = "style:" + styleName;
+    } else {
+      sec = autoPreset ? autoPreset.xfade : 0;
+      source = "auto:" + autoName;
+    }
+    sec = Number(sec);
+    if (!isFinite(sec) || sec <= 0) sec = 0;
+    else if (sec > XFADE_MAX) sec = XFADE_MAX;
+    else if (sec < 0.5) sec = 0;
+
+    // 曲线：显式 > 风格 > 默认
+    var curve = "equal";
+    try {
+      if (typeof window !== "undefined" && window && typeof window.__gpXfadeCurve === "string") {
+        curve = String(window.__gpXfadeCurve).toLowerCase();
+      } else if (preset) {
+        curve = preset.curve;
+      }
+    } catch (e) {}
+
+    // 扫频：显式 > 风格 > 关
+    var eq = false;
+    try {
+      if (typeof window !== "undefined" && window && typeof window.__gpXfadeEq === "boolean") {
+        eq = window.__gpXfadeEq === true;
+      } else if (preset) {
+        eq = preset.eq === true;
+      }
+    } catch (e) {}
+
+    return { sec: sec, curve: curve, eq: eq && sec > 0, source: source };
+  }
+
+  /** 当前生效的交叉曲线名（显式 > 风格 > equal） */
+  function xfadeCurveName() {
+    return effectiveXfade().curve;
   }
 
   /** 单调 0→1 的曲线形状（f(x)，x∈[0,1]） */
@@ -928,28 +1039,15 @@
     return a;
   }
 
-  /**
-   * 当前生效的交叉时长（秒），0 = 关。
-   * 优先级：`window.__gpXfade`（运行时可改）> 存下来的设置（重启后还在）。
-   */
+  /** 当前生效的交叉时长（秒），0 = 关。 */
   function xfadeSeconds() {
-    var v = S.xfade;
-    try {
-      if (typeof window !== "undefined" && window && typeof window.__gpXfade === "number") {
-        v = window.__gpXfade;
-        if (Number(S.xfade) !== Number(window.__gpXfade)) saveXfade(window.__gpXfade);
-      }
-    } catch (e) {}
-    v = Number(v);
-    if (!isFinite(v) || v <= 0) return 0;
-    if (v > XFADE_MAX) v = XFADE_MAX;
-    if (v < 0.5) return 0; // 太短没有意义，还不如硬接
-    return v;
+    return effectiveXfade().sec;
   }
 
   function saveXfade(v) {
     try {
       S.xfade = Number(v) || 0;
+      S.xfadeExplicit = true; // ★ v1.4.0：显式设过时长 → 不再被风格/智能默认覆盖
       localStorage.setItem(XFADE_KEY, String(S.xfade));
     } catch (e) {}
   }
@@ -957,7 +1055,9 @@
   function loadXfade() {
     try {
       var raw = localStorage.getItem(XFADE_KEY);
+      if (raw === null) return;
       var v = Number(raw);
+      S.xfadeExplicit = true;
       if (isFinite(v) && v > 0) S.xfade = Math.min(v, XFADE_MAX);
     } catch (e) {}
   }
@@ -976,10 +1076,7 @@
   var EQ_SWEEP_HZ = 900; // 交叉时 A 扫到多少
 
   function xfadeEqEnabled() {
-    try {
-      if (typeof window !== "undefined" && window && window.__gpXfadeEq === true) return true;
-    } catch (e) {}
-    return false; // 默认关：会明显改变音色，得用户自己说「要」
+    return effectiveXfade().eq;
   }
 
   function newSourceChain() {
@@ -3365,6 +3462,8 @@
     // ★★ A1：预载已就绪 → 跳过「下载 + 解码」，直接起播（省下的就是那几秒）
     var pre = takePreload(trackId);
     if (pre) {
+      S.stats.plays++;
+      S.stats.hitPreload++;
       log("[preload] ★★ 命中！跳过下载 + 解码");
       onBufferReady(token, pre, "预载命中");
       return;
@@ -3373,6 +3472,8 @@
     // ★ v1.2.1：刚刚播过的那一首又回来了 → 缓冲还在，跳过下载 + 解码
     var rb = recentGet(trackId);
     if (rb) {
+      S.stats.plays++;
+      S.stats.hitRecent++;
       log(
         "[load] ★ 最近缓冲命中（同一首切回来）→ 跳过下载 + 解码 ｜ " +
           mb(rb.length * rb.numberOfChannels * 4)
@@ -3380,6 +3481,7 @@
       onBufferReady(token, rb, "最近缓冲命中");
       return;
     }
+    S.stats.plays++; // 没命中（要么流式、要么现下）
 
     // ★★ v0.4.0：没有就绪的预载 → 走流式（`<audio>` 边下边播，~0.5s 出声）。
     //   旧行为是「等这一首的预载下完 + 解码」（真机实测平均 3.5s）—— 流式把这段等待抹掉。
@@ -4022,17 +4124,352 @@
     };
   }
 
+  /* ==================== v1.4.0 · 状态行 + 设置面板 ==================== */
+
+  function sizeText(bytes) {
+    if (!bytes) return "0 MB";
+    return (bytes / 1024 / 1024).toFixed(1) + " MB";
+  }
+
+  function recentBytes() {
+    var t = 0;
+    var list = S.recentBufs || [];
+    for (var i = 0; i < list.length; i++) t += list[i].bytes || 0;
+    return t;
+  }
+
+  /**
+   * 一行状态。回答用户最容易困惑的三件事：
+   *   ① 现在是原生在放还是插件在放（第一首没无缝时最需要）；
+   *   ② 过渡到底生效没有、为什么是这个值（显式 / 风格 / 智能默认）；
+   *   ③ 缓存吃了多少内存、预载命中率如何。
+   */
+  function statusLine() {
+    var xf = effectiveXfade();
+    var eng;
+    if (S.deferNative) eng = "原生播（等首次点按）";
+    else if (!S.ctx) eng = "未建 AudioContext";
+    else eng = "Web Audio" + (S.ctx.state === "running" ? "" : "（" + S.ctx.state + "）");
+
+    var trans =
+      xf.sec > 0
+        ? xf.sec.toFixed(1) + "s · " + xf.curve + (xf.eq ? " + 扫频" : "") + " · " + xf.source
+        : "关 · " + xf.source;
+
+    var plays = S.stats.plays || 0;
+    var hit = (S.stats.hitPreload || 0) + (S.stats.hitRecent || 0);
+    var hitText = plays ? Math.round((hit / plays) * 100) + "%（" + hit + "/" + plays + "）" : "—";
+
+    return (
+      "引擎=" + eng + " ｜ 过渡=" + trans + " ｜ 缓存=" + (S.recentBufs || []).length + " 首/" +
+      sizeText(recentBytes()) + " ｜ 预载命中=" + hitText
+    );
+  }
+
+  /** 清掉两级缓存（面板上的按钮 + 控制台 API 都用它） */
+  function clearCaches() {
+    var n = (S.recentBufs || []).length;
+    S.recentBufs = [];
+    for (var k in BYTES_CACHE) {
+      if (Object.prototype.hasOwnProperty.call(BYTES_CACHE, k)) delete BYTES_CACHE[k];
+    }
+    log("[ui] 已清空缓存（缓冲 " + n + " 首 + 字节缓存）");
+    return n;
+  }
+
+  /** 切换过渡风格（面板按钮 / 控制台 `gaplessPlayer.setStyle("dj")` 都走这里） */
+  function applyStyle(name) {
+    if (!STYLE_PRESETS[name]) return false;
+    saveStyle(name);
+    log("[ui] 过渡风格 → " + name + "（" + STYLE_PRESETS[name].label + "，" + effectiveXfade().sec + "s）");
+    refreshPanel();
+    return true;
+  }
+
+  /* ---- 面板（纯 DOM 拼接，不引外部样式；客户端是 CEF，注入 fixed 元素即可） ---- */
+
+  var panel = { box: null, status: null, btn: null };
+
+  function domMake(tag, css, text) {
+    var n = document.createElement(tag);
+    if (css) n.style.cssText = css;
+    if (text !== undefined && text !== null) n.textContent = String(text);
+    return n;
+  }
+
+  var CSS_BTN =
+    "cursor:pointer;border:1px solid #3a3d47;background:#2a2d36;color:#e8e8ea;border-radius:6px;" +
+    "padding:4px 8px;font:12px system-ui,Segoe UI,sans-serif;margin:0 6px 6px 0";
+  var CSS_ROW = "display:flex;align-items:center;justify-content:space-between;margin:6px 0;gap:8px";
+  var CSS_LABEL = "color:#9aa0ad;font:12px system-ui,Segoe UI,sans-serif;white-space:nowrap";
+
+  function refreshPanel() {
+    if (!panel.box) return;
+    try {
+      if (panel.status) panel.status.textContent = statusLine();
+      // 风格高亮
+      if (panel.styleBtns) {
+        for (var i = 0; i < panel.styleBtns.length; i++) {
+          var b = panel.styleBtns[i];
+          var on = (xfadeStyle() || ("auto:" + styleFromMode())) === b.__style ||
+            (xfadeStyle() === null && b.__style === styleFromMode());
+          b.style.background = on ? "#3d6ef5" : "#2a2d36";
+          b.style.borderColor = on ? "#3d6ef5" : "#3a3d47";
+        }
+      }
+      if (panel.range) {
+        var xf = effectiveXfade();
+        panel.range.value = String(xf.sec);
+        panel.rangeLabel.textContent = xf.sec > 0 ? xf.sec.toFixed(1) + "s（" + xf.source + "）" : "关（" + xf.source + "）";
+      }
+      if (panel.curve) panel.curve.value = effectiveXfade().curve;
+      if (panel.eq) panel.eq.checked = effectiveXfade().eq;
+    } catch (e) {}
+  }
+
+  function closePanel() {
+    try {
+      if (panel.box && panel.box.parentNode) panel.box.parentNode.removeChild(panel.box);
+    } catch (e) {}
+    panel.box = null;
+  }
+
+  function openPanel() {
+    try {
+      if (typeof document === "undefined" || !document || typeof document.createElement !== "function") return false;
+      if (panel.box) {
+        closePanel();
+        return true;
+      }
+      var box = domMake(
+        "div",
+        "position:fixed;right:16px;bottom:64px;z-index:2147483000;width:300px;background:#20222a;color:#e8e8ea;" +
+          "border:1px solid #3a3d47;border-radius:10px;padding:12px;font:12px/1.6 system-ui,Segoe UI,sans-serif;" +
+          "box-shadow:0 10px 30px rgba(0,0,0,.55)"
+      );
+      box.setAttribute("data-gaplessplayer", "panel");
+      var head = domMake("div", "display:flex;justify-content:space-between;align-items:center;margin-bottom:6px");
+      head.appendChild(domMake("b", "", "GaplessPlayer " + VERSION));
+      var x = domMake("span", "cursor:pointer;color:#9aa0ad;padding:0 4px", "×");
+      x.onclick = function () {
+        closePanel();
+      };
+      head.appendChild(x);
+      box.appendChild(head);
+
+      panel.status = domMake("div", "color:#9aa0ad;margin-bottom:8px;word-break:break-all", statusLine());
+      box.appendChild(panel.status);
+
+      // 过渡风格
+      box.appendChild(domMake("div", CSS_LABEL, "过渡风格"));
+      var row = domMake("div", "margin:4px 0 8px 0");
+      panel.styleBtns = [];
+      ["clean", "light", "dj"].forEach(function (k) {
+        var b = domMake("button", CSS_BTN, STYLE_PRESETS[k].label);
+        b.__style = k;
+        b.onclick = function () {
+          applyStyle(k);
+        };
+        panel.styleBtns.push(b);
+        row.appendChild(b);
+      });
+      box.appendChild(row);
+
+      // 时长
+      var r1 = domMake("div", CSS_ROW);
+      r1.appendChild(domMake("span", CSS_LABEL, "交叉时长"));
+      panel.rangeLabel = domMake("span", CSS_LABEL, "");
+      r1.appendChild(panel.rangeLabel);
+      box.appendChild(r1);
+      var range = domMake("input", "width:100%;margin-bottom:8px");
+      range.type = "range";
+      range.min = "0";
+      range.max = "12";
+      range.step = "0.5";
+      range.oninput = function () {
+        saveXfade(Number(range.value));
+        refreshPanel();
+      };
+      panel.range = range;
+      box.appendChild(range);
+
+      // 曲线
+      var r2 = domMake("div", CSS_ROW);
+      r2.appendChild(domMake("span", CSS_LABEL, "曲线"));
+      var sel = domMake("select", "background:#2a2d36;color:#e8e8ea;border:1px solid #3a3d47;border-radius:6px");
+      ["equal", "linear", "s-line", "r_s-line", "exp", "step"].forEach(function (c) {
+        var o = domMake("option", "", c);
+        o.value = c;
+        sel.appendChild(o);
+      });
+      sel.onchange = function () {
+        try {
+          window.__gpXfadeCurve = sel.value;
+        } catch (e) {}
+        refreshPanel();
+      };
+      panel.curve = sel;
+      r2.appendChild(sel);
+      box.appendChild(r2);
+
+      // 几个布尔项
+      function checkboxRow(label, getter, setter) {
+        var r = domMake("div", CSS_ROW);
+        r.appendChild(domMake("span", CSS_LABEL, label));
+        var c = domMake("input");
+        c.type = "checkbox";
+        c.checked = !!getter();
+        c.onchange = function () {
+          setter(c.checked);
+          refreshPanel();
+        };
+        r.appendChild(c);
+        box.appendChild(r);
+        return c;
+      }
+      panel.eq = checkboxRow(
+        "高通扫频",
+        function () {
+          return effectiveXfade().eq;
+        },
+        function (v) {
+          try {
+            window.__gpXfadeEq = !!v;
+          } catch (e) {}
+        }
+      );
+      panel.trimPad = checkboxRow(
+        "裁作品静音",
+        function () {
+          return trimPadEnabled();
+        },
+        function (v) {
+          try {
+            window.__gpTrimPad = !!v;
+          } catch (e) {}
+        }
+      );
+      panel.promote = checkboxRow(
+        "流式补缓冲",
+        function () {
+          return promoteEnabled();
+        },
+        function (v) {
+          try {
+            window.__gpPromote = !!v;
+          } catch (e) {}
+        }
+      );
+
+      // 缓存
+      var r3 = domMake("div", CSS_ROW);
+      var cacheText = domMake("span", CSS_LABEL, "");
+      var clearBtn = domMake("button", CSS_BTN, "清空缓存");
+      clearBtn.onclick = function () {
+        clearCaches();
+        refreshPanel();
+      };
+      r3.appendChild(cacheText);
+      r3.appendChild(clearBtn);
+      box.appendChild(r3);
+      panel.cacheText = cacheText;
+
+      // 诊断（折叠）
+      var diag = domMake("details", "margin-top:8px;color:#9aa0ad");
+      diag.appendChild(domMake("summary", "cursor:pointer", "诊断"));
+      [
+        ["强制缓冲路径", "__gpStream", false],
+        ["关掉预约", "__gpSeamless", false],
+        ["整条交回原生", "__gpNativeAll", false],
+        ["automix 探针", "__gpProbe", false],
+      ].forEach(function (it) {
+        var r = domMake("div", CSS_ROW);
+        r.appendChild(domMake("span", CSS_LABEL, it[0]));
+        var c = domMake("input");
+        c.type = "checkbox";
+        c.onchange = function () {
+          try {
+            if (it[2]) window[it[1]] = c.checked;
+            else window[it[1]] = c.checked ? true : undefined;
+          } catch (e) {}
+        };
+        r.appendChild(c);
+        diag.appendChild(r);
+      });
+      var logBtn = domMake("button", CSS_BTN, "复制日志路径");
+      logBtn.onclick = function () {
+        try {
+          if (navigator.clipboard) navigator.clipboard.writeText(LOG);
+        } catch (e) {}
+      };
+      diag.appendChild(logBtn);
+      box.appendChild(diag);
+
+      document.body.appendChild(box);
+      panel.box = box;
+
+      // 每秒刷一次状态（便宜：只有文本节点）
+      if (!panel.timer) {
+        panel.timer = setInterval(function () {
+          if (!panel.box) return;
+          try {
+            if (panel.status) panel.status.textContent = statusLine();
+            if (panel.cacheText) panel.cacheText.textContent = "缓存 " + (S.recentBufs || []).length + " 首 / " + sizeText(recentBytes());
+          } catch (e) {}
+        }, 1000);
+      }
+      refreshPanel();
+      return true;
+    } catch (e) {
+      log("[ui] ★ 打不开面板 ｜ " + (e && e.name) + ": " + (e && e.message));
+      return false;
+    }
+  }
+
+  /** 右下角一个小圆钮（很淡，hover 才明显）；`window.__gpHideButton = true` 可隐藏 */
+  function initPanel() {
+    try {
+      if (typeof document === "undefined" || !document || typeof document.createElement !== "function") return;
+      if (window.__gpHideButton) return;
+      if (panel.btn) return;
+      var b = domMake(
+        "div",
+        "position:fixed;right:14px;bottom:18px;width:26px;height:26px;border-radius:50%;z-index:2147482999;" +
+          "background:#2a2d36;color:#9aa0ad;border:1px solid #3a3d47;text-align:center;line-height:26px;" +
+          "font:12px system-ui;cursor:pointer;opacity:.35;transition:opacity .2s;user-select:none",
+        "G"
+      );
+      b.title = "GaplessPlayer 设置";
+      b.onmouseenter = function () {
+        b.style.opacity = "1";
+      };
+      b.onmouseleave = function () {
+        b.style.opacity = ".35";
+      };
+      b.onclick = function () {
+        openPanel();
+      };
+      document.body.appendChild(b);
+      panel.btn = b;
+      log("[ui] 设置面板按钮已注入（右下角「G」；window.__gpHideButton = true 可隐藏）");
+    } catch (e) {
+      log("[ui] ★ 注入按钮失败 ｜ " + (e && e.message));
+    }
+  }
+
   /* ==================== 启动 ==================== */
 
   plugin.onLoad(function () {
     log("=== GaplessPlayer v" + VERSION + " (缓冲 + 流式 + 首尾裁剪" + (xfadeSeconds() > 0 ? " + 交叉淡入淡出" : "") + ") 启动 ===");
     loadXfade(); // ★ v1.3.0：读回上次设的交叉时长
+    loadStyle(); // ★ v1.4.0：读回上次选的过渡风格（没选过 → 智能默认）
     try {
       log(
         "[xfade] 交叉淡入淡出=" + (xfadeSeconds() > 0 ? xfadeSeconds().toFixed(1) + "s（曲线=" + xfadeCurveName() +
           (xfadeEqEnabled() ? "+扫频" : "") + "）" : "关") +
           " ｜ window.__gpXfade = 3 开启（0~12s，会记住）｜ __gpXfadeCurve / __gpXfadeEq 可调曲线与扫频"
       );
+      log("[status] " + statusLine());
     } catch (e) {}
     try {
       log("[env] origin=" + location.origin + " ｜ AudioContext=" + typeof AudioContext + " ｜ legacyNativeCmder=" + typeof legacyNativeCmder);
@@ -4097,6 +4534,19 @@
     }
 
     installInterceptor();
+    initPanel(); // ★ v1.4.0：右下角「G」→ 设置面板（没有 document 时自动跳过）
+    try {
+      // ★ v1.4.0：给用户一个可脚本化的入口（控制台一行就能改）
+      window.gaplessPlayer = {
+        version: VERSION,
+        status: statusLine,
+        xfade: effectiveXfade, // 现在是 {sec, curve, eq, source}，方便脚本/排查
+        setStyle: applyStyle,
+        setXfade: saveXfade,
+        clearCache: clearCaches,
+        openPanel: openPanel,
+      };
+    } catch (e) {}
 
     // 启动 3 秒后看一眼 UI 的处理器注册表（那时 UI 已经起来了）
     setTimeout(function () {

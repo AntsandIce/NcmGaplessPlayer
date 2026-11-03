@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.3.3";',
+    find: 'var VERSION = "1.4.0";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -675,6 +675,34 @@ const MUTATIONS = [
     find: "        if (S.nativeRunning) pauseNative();",
     replace: "        /* 变异：不停原生 */",
     expect: "87",
+  },
+  {
+    name: "v1.4.0: 智能默认失效（随机播放也永远不交叉）",
+    file: "main.js",
+    find: '    if (mode === "playrandom" || mode === "playai") return "light";',
+    replace: '    if (false) return "light"; // 变异：不智能',
+    expect: "88",
+  },
+  {
+    name: "v1.4.0: 显式时长不再优先（用户手动设的被风格盖掉）",
+    file: "main.js",
+    find: "    if (explicitSec !== null) {",
+    replace: "    if (false) { // 变异：忽略显式值",
+    expect: "88",
+  },
+  {
+    name: "v1.4.0: DJ 风格不扫频（等于只是个更长的交叉）",
+    file: "main.js",
+    find: '    dj: { xfade: 3, curve: "s-line", eq: true, label: "DJ" },',
+    replace: '    dj: { xfade: 3, curve: "s-line", eq: false, label: "DJ" }, // 变异：不扫频',
+    expect: "88",
+  },
+  {
+    name: "v1.4.0: 风格不持久化（每次重启都回到智能默认）",
+    file: "main.js",
+    find: "      localStorage.setItem(STYLE_KEY, name);",
+    replace: "      /* 变异：不记住 */",
+    expect: "88",
   },
 ];
 

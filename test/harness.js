@@ -1872,7 +1872,7 @@ async function main() {
     e.tick();
     await flush();
     e.flushTimers();
-    ok(countLog(e, "[sched] 预约") >= 1, "★★ 预约了（日志 [sched] 预约）");
+    ok(countLog(e, "预约 ｜") >= 1, "★★ 预约了（日志 [sched] 预约）");
     eq(e.started.length, n0 + 1, "★★ 多排了一个 source（B）");
     const s = lastOf(e.started);
     eq(s.off, 0, "★ 预约从 0 开始");
@@ -1893,7 +1893,7 @@ async function main() {
     ea.tick();
     await flush();
     ea.flushTimers();
-    eq(countLog(ea, "[sched] 预约"), 0, "★★ 槽里还没 ready（在飞）→ 不预约");
+    eq(countLog(ea, "预约 ｜"), 0, "★★ 槽里还没 ready（在飞）→ 不预约");
 
     // (b) 太早（还剩 2.5s）
     const eb = await seamlessEnv("playorder");
@@ -1901,7 +1901,7 @@ async function main() {
     eb.tick();
     await flush();
     eb.flushTimers();
-    eq(countLog(eb, "[sched] 预约"), 0, "★★ 还剩 2.5s（太早）→ 不预约");
+    eq(countLog(eb, "预约 ｜"), 0, "★★ 还剩 2.5s（太早）→ 不预约");
 
     // (c) 太晚（还剩 0.1s）
     const ec = await seamlessEnv("playorder");
@@ -1909,7 +1909,7 @@ async function main() {
     ec.tick();
     await flush();
     ec.flushTimers();
-    eq(countLog(ec, "[sched] 预约"), 0, "★★ 还剩 0.1s（太晚）→ 不预约");
+    eq(countLog(ec, "预约 ｜"), 0, "★★ 还剩 0.1s（太晚）→ 不预约");
 
     // (d) 随机播放模式 → 不预约
     const ed = await seamlessEnv("playrandom");
@@ -1917,7 +1917,7 @@ async function main() {
     ed.tick();
     await flush();
     ed.flushTimers();
-    eq(countLog(ed, "[sched] 预约"), 0, "★★ 模式是随机播放 → 不预约");
+    eq(countLog(ed, "预约 ｜"), 0, "★★ 模式是随机播放 → 不预约");
 
     // (e) 当前是列表最后一首（nextTrack() 为 null）→ 不预约
     const ee = await seamlessEnv("playorder", { cur: 6000 });
@@ -1925,7 +1925,7 @@ async function main() {
     ee.tick();
     await flush();
     ee.flushTimers();
-    eq(countLog(ee, "[sched] 预约"), 0, "★★ 最后一首没有下一首 → 不预约");
+    eq(countLog(ee, "预约 ｜"), 0, "★★ 最后一首没有下一首 → 不预约");
   }
 
   section("63. ★★★ v0.4.1 交接：上一首播完 → 下一首直接接上，且**绝不打断已接上的 B**");
@@ -2174,7 +2174,7 @@ async function main() {
     e.tick();
     await flush();
     e.flushTimers();
-    ok(countLog(e, "[sched] 预约") >= 1, "★★ 流式那一首也预约了（原来这里直接 return）");
+    ok(countLog(e, "预约 ｜") >= 1, "★★ 流式那一首也预约了（原来这里直接 return）");
     ok(countLog(e, "｜ 来源=流式") >= 1, "★★ 日志标明来源是流式");
     eq(e.started.length, n0 + 1, "★★ 排上了一个 buffer source");
     const s = lastOf(e.started);
@@ -2233,7 +2233,7 @@ async function main() {
     e.tick();
     await flush();
     e.flushTimers();
-    eq(countLog(e, "[sched] 预约"), 0, "★★ duration 无效 → 不预约");
+    eq(countLog(e, "预约 ｜"), 0, "★★ duration 无效 → 不预约");
   }
 
   /* ==================== 3.1.x 适配（本分支新增） ==================== */
@@ -2704,7 +2704,7 @@ async function main() {
       e.tick();
       await flush();
       e.flushTimers();
-      ok(countLog(e, "[sched] 预约") >= 1, "★★ 默认仍然照常预约（硬接）");
+      ok(countLog(e, "预约 ｜") >= 1, "★★ 默认仍然照常预约（硬接）");
       eq(countLog(e, "交叉=关"), 1, "★★ 日志写明「交叉=关」");
       eq(curveNodes(e).length, 0, "★★ 一条自动化曲线都没排");
       ok(Math.abs(Number(lastOf(e.started).at) - 200.02) < 0.05, "★★ B 还是排在 A 的结束采样上");
@@ -3178,6 +3178,81 @@ async function main() {
     await flush();
     e2.flushTimers();
     ok(countLog(e2, "[cmd] ▶ load") >= 1, "★★ 照旧由我们接管");
+  }
+
+  section("88. ★★★ v1.4.0 过渡风格智能默认 + 状态行 + 设置面板 API");
+  {
+    const api = (e) => e.win.gaplessPlayer;
+
+    // ---- (a) 智能默认：随机 → 轻过渡；顺序 → 干净 ----
+    {
+      const eRand = await seamlessEnv("playrandom");
+      const x1 = api(eRand).xfade();
+      eq(x1.source, "auto:light", "★★ 随机播放 → 智能默认「轻过渡」（source=auto:light）");
+      eq(x1.sec, 2.5, "★★ 轻过渡 = 2.5s");
+      eq(x1.curve, "equal", "★★ 轻过渡用等功率");
+      eq(x1.eq, false, "★★ 轻过渡不扫频");
+
+      const eSeq = await seamlessEnv("playorder");
+      const x2 = api(eSeq).xfade();
+      eq(x2.source, "auto:clean", "★★ 顺序播放 → 智能默认「干净」（source=auto:clean）");
+      eq(x2.sec, 0, "★★ 干净 = 0s（采样级无缝）");
+    }
+
+    // ---- (b) 用户选风格 → 立刻生效并记住 ----
+    {
+      const e = await seamlessEnv("playorder");
+      eq(api(e).xfade().sec, 0, "（前提）顺序播放默认不交叉");
+      ok(api(e).setStyle("dj") === true, "★★ setStyle('dj') 成功");
+      const x = api(e).xfade();
+      eq(x.source, "style:dj", "★★ 变成 style:dj");
+      eq(x.sec, 3, "★★ DJ = 3s");
+      eq(x.curve, "s-line", "★★ DJ 用 s-line 曲线");
+      eq(x.eq, true, "★★ DJ 打开高通扫频");
+      eq(String(e.localStorage.getItem("gaplessPlayer.style")), "dj", "★★ 风格被记住（重启后还在）");
+
+      // 关掉风格（改回干净）
+      api(e).setStyle("clean");
+      eq(api(e).xfade().sec, 0, "★★ 切回「干净」= 0s");
+    }
+
+    // ---- (c) 显式时长 > 风格（老开关仍然优先级最高） ----
+    {
+      const e = await seamlessEnv("playorder");
+      api(e).setStyle("dj");
+      e.win.__gpXfade = 6; // 显式 6s
+      const x = api(e).xfade();
+      eq(x.source, "explicit", "★★ 显式设过时长 → source=explicit");
+      eq(x.sec, 6, "★★ 显式 6s 覆盖风格的 3s");
+      eq(String(e.localStorage.getItem("gaplessPlayer.xfade")), "6", "★★ 显式时长也会记住");
+    }
+
+    // ---- (d) 状态行：回答「谁在播 / 过渡怎么定的 / 缓存与命中率」 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000); // 预载命中一次 → 命中率应有数
+      e.flushTimers();
+      const st = api(e).status();
+      ok(st.indexOf("引擎=") === 0, "★★ 状态行以「引擎=」开头（" + st.slice(0, 40) + "…）");
+      ok(st.indexOf("过渡=") > 0, "★★ 有过渡信息（含来源）");
+      ok(st.indexOf("缓存=") > 0, "★★ 有缓存占用");
+      ok(/预载命中=\d+%/.test(st), "★★ 有预载命中率（" + st.slice(st.indexOf("预载命中")) + "）");
+      ok(countLog(e, "[status] ") >= 1, "★★ 启动时也往日志里写一行状态");
+    }
+
+    // ---- (e) 清缓存 + 面板在没有 DOM 时安静跳过 ----
+    {
+      const e = await seamlessEnv("playorder");
+      ok((e.ctx.__gains || []).length > 0, "（前提）已经在播");
+      const n = api(e).clearCache();
+      eq(typeof n, "number", "★★ clearCache 返回清掉的条数");
+      eq(api(e).openPanel(), false, "★★ 没有 document（验证台）时 openPanel 安静返回 false，不抛错");
+      e.flushTimers();
+      ok(countLog(e, "[ui] ★ 打不开面板") + countLog(e, "[ui] 已清空缓存") >= 1, "★ 至少记了一行 UI 日志");
+    }
   }
 
   /* ---------- 汇总 ---------- */
