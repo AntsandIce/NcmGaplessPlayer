@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.5.2";',
+    find: 'var VERSION = "1.5.3";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -802,6 +802,42 @@ const MUTATIONS = [
     find: '      ensurePanelCss();\n      var b = el("div", "gp-fab", "♪");',
     replace: '      var b = el("div", "gp-fab", "♪");',
     expect: "91",
+  },
+  {
+    name: "v1.5.3: 不做预开（还是等切歌那一刻现拉流）",
+    file: "main.js",
+    find: "    maybePreopenNext(nid);",
+    replace: "    /* 变异：不预开 */",
+    expect: "92",
+  },
+
+  {
+    name: "v1.5.3: 切歌时不复用预开的流（重设 src = 重新下载）",
+    file: "main.js",
+    find: "      if (S.preopenUrl && S.preopenTrackId !== null && S.preopenTrackId === S.curTrackId) {",
+    replace: "      if (false) { // 变异：不复用",
+    expect: "92",
+  },
+  {
+    name: "v1.5.3: metadata 早已就绪也不补发（会一直等一个不会再来的事件）",
+    file: "main.js",
+    find: "    if (S.preopenUrl && el && Number(el.readyState) >= 1) {",
+    replace: "    if (false) { // 变异：不补",
+    expect: "92",
+  },
+  {
+    name: "v1.5.3: 换预载目标时不清预开（白占一条连接）",
+    file: "main.js",
+    find: '      clearPreopen("换预载目标");',
+    replace: "      /* 变异：不清 */",
+    expect: "92",
+  },
+  {
+    name: "v1.5.3: preopenStream 自己不守「元素在用」（复用函数被单独调用时踩雷）",
+    file: "main.js",
+    find: "    if (S.stream) return false; // 元素在用",
+    replace: "    if (false) return false; // 变异：不管",
+    expect: "92",
   },
 ];
 

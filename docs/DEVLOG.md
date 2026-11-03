@@ -1,6 +1,63 @@
-# GaplessPlayer 开发日志（0.1.0 → 1.5.2）
+# GaplessPlayer 开发日志（0.1.0 → 1.5.3）
 
 > 面向使用者的安装与使用说明见 [README](../README.md)。
+
+---
+
+## ★ v1.5.3 —— 没预载完也先「预开」下一首的流
+
+### 前提回顾
+
+无缝（采样级接缝）硬性要求 B **整首下载完 + 解码完** —— `AudioBufferSourceNode` 只能播完整的
+`AudioBuffer`，Web Audio 没有「流式 buffer 源」。所以 B 没就绪时只能退回流式接力，代价是
+`el.src = url` → 等 `canplay` → 出声，真机约 **500ms 空档**。
+
+### 这一版做的事
+
+那 500ms 里，B 的歌其实**已经在路上了**（预载槽 `status=pending`，地址也解析出来了）。
+所以提前把 `<audio>` 的 `src` 挂上、让它自己缓冲；等真切歌时 `canplay` 往往已经满足。
+
+三条安全边界（缺一不可）：
+
+1. **当前这首不走流式** —— 那个 `<audio>` 正被当前这首用着，动它就直接断音；
+2. B 的预载槽是 **pending** 且**地址已解析**（`slot.url`，本版新增记录）—— `ready` 不需要流，
+   `failed` 不值得试；
+3. 不是「整条交回原生」的逃生状态。
+
+### 两个必须处理的坑（都是测试逼出来的）
+
+1. **3.x 的 `musicurl` 是加密 token，不是 URL** —— 所以「复用」不能比字符串，要比
+   **是不是同一首**（`S.preopenTrackId === S.curTrackId`）。第一版按字符串比，3.x 上永远不会命中。
+2. **顺手清理会把正要用的那份清掉** —— 切歌时 `loadSong` 会先 `dropPreload()`（这首改走流式），
+   而 `dropPreload` 里加了「预载作废 → 清预开」；结果预开刚建好就被清。
+   → `dropPreload(why, { keepPreopen: true })`，并且所有清理路径都加一条守卫：
+   **正在播/即将播那一首的预开不许清**（`S.preopenTrackId !== S.curTrackId`）。
+   顺序也很要命：`startStream` 里 `attachStreamEvents()` 在 `apply()` **之前**跑，
+   补发 `onMeta` 会触发 `afterReady → maybePreload`，那一步就会去清预开 —— 守卫正是为了它。
+
+### 附带的一个小修
+
+预开的元素可能在**我们挂监听之前**就已经 `loadedmetadata` 了（等了 1 秒以上很常见）。
+`attachStreamEvents()` 末尾补一次：`readyState >= 1` 且确实是预开的那首 → 直接 `onMeta()`，
+否则会一直等一个不会再来的事件（表现为「流式起播卡住」）。
+
+### 验收
+
+```
+node test/harness.js  → 通过 558 项，失败 0 项（新增第 92 段 22 项）
+node test/mutate.js   → 变异点 113 个，抓住 113 个，漏网 0 个
+```
+
+第 92 段覆盖：窗口内预开（A 缓冲 / B pending）、预开时才建 `<audio>` 且只建一个、
+真切歌复用（src 不重设、不再 `load()`、补发 metadata、`onLoad` 发得出去）、
+当前在流式时**不**预开、换预载目标时清掉预开并撤 src。
+
+★ 还有一处**自我删减**：`maybePreopenNext` 里原本也判了一次 `S.stream`，但 `preopenStream` 内部已经守住了 ——
+删掉外层判断行为完全不变（对应的变异体永远抓不住），那就删掉，只留内层那道闸，
+并把它暴露成 `gaplessPlayer.preopen()` 让测试**直接**打这条守卫（否则它也只是「看不见的保险」）。
+
+★ 为了让用例成立，验证台补了两处基础设施：`createEnv({ document })` 注入假 DOM（上一版为面板加的）、
+以及假 `<audio>` 的 `removeAttribute("src")` 现在真的会清空 `src`（否则测不出「撤掉预开」）。
 
 ---
 

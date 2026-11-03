@@ -307,7 +307,7 @@ function createEnv(hooks) {
       canPlayType() {
         return "probably";
       },
-      removeAttribute() {},
+      removeAttribute(n) { if (n === "src") a.src = ""; },
     };
     audio.instances.push(a);
     audio.last = a;
@@ -3609,7 +3609,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.5\.2/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.5\.3/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -3657,6 +3657,143 @@ async function main() {
     eq(api.openPanel(), true, "★★ 再调 openPanel() 收起");
     eq(doc.body.children.length, 1, "★★ 卡片被移除");
     eq(doc.body.children[0].className, "gp-fab", "★★ 按钮恢复不高亮");
+  }
+
+  section("92. ★★★ v1.5.3 提前预开流（B 没下完时缩短接缝空档）");
+  {
+    /**
+     * 造一个「A 是缓冲、B 的预载挂住」的环境：
+     * 先让 A 正常预载就绪，再把取址接口换成「永不返回」的地址 —— 于是 B 的预载会一直 pending。
+     * （验证台默认 `__gpStream = false` 强制走缓冲，这里要显式删掉才允许流式）
+     */
+    async function hangNextEnv() {
+      const e = createEnv();
+      delete e.win.__gpStream;
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      await flush();
+      e.eapi.url = "http://cdn.example/hang/next.flac"; // ★ 从这一刻起 B 的取址会挂住
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-x",
+        { songId: 1000, musicurl: "http://cdn.example/a.flac" },
+      ]);
+      await flush();
+      await flush();
+      await flush();
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush();
+      e.flushTimers();
+      return e;
+    }
+    /** 空元素兜底：面板/流式都没建的时候也要能继续跑断言（否则变异体会把整个验证台搞崩） */
+    const elOf = (e) => e.audio.last || { src: "", __loads: 0, readyState: 0, duration: 0 };
+    const srcOf = (e) => String(elOf(e).src || "");
+
+    // ---- (a) B 的预载还在飞 → 窗口内预开 <audio>，但仍然预约不了 ----
+    {
+      const e = await hangNextEnv();
+      eq(countLog(e, "[load] 流式播放"), 0, "（前提）A 走的是缓冲（<audio> 空着可用）");
+      eq(countLog(e, "[stream] ★ 提前预开"), 0, "（前提）还没预开");
+      eq(countLog(e, "[sched] 预约"), 0, "（前提）B 没 ready，还没法预约");
+
+      setLeft(e, 1.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[stream] ★ 提前预开 <audio>") >= 1, "★★ 窗口内提前把 B 的流预开了");
+      eq(e.audio.instances.length, 1, "★★ 预开时才建了 <audio>（而且只建一个）");
+      ok(/hang\/next/.test(srcOf(e)), "★★ <audio> 的 src 挂的是 B 的地址");
+      ok(elOf(e).__loads >= 1, "★★ 调了 load() 让浏览器自己缓冲");
+      eq(countLog(e, "预约 ｜"), 0, "★★ 这时仍然预约不了（B 没 ready，采样级接缝还是指望不上）");
+    }
+
+    // ---- (b) 真切歌 → 复用预开的元素；metadata 早已就绪时补一次 ----
+    {
+      const e = await hangNextEnv();
+      setLeft(e, 1.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[stream] ★ 提前预开 <audio>") >= 1, "（前提）已经预开");
+      const el = elOf(e);
+      const srcBefore = String(el.src);
+      const loads1 = el.__loads;
+
+      // 预开的元素在挂监听**之前**就已经有 metadata 了（真机上等了 1 秒以上就会这样）
+      el.readyState = 1;
+      el.duration = 210;
+
+      e.channel.call("audioplayer.load", null, [
+        idOf(2000) + "-x",
+        { songId: 2000, musicurl: "http://cdn.example/b-encrypted-token" },
+      ]);
+      await flush();
+      await flush();
+      e.flushTimers();
+
+      ok(countLog(e, "[stream] ★ 复用提前预开的") >= 1, "★★ 真切歌时复用了预开的流");
+      eq(srcOf(e), srcBefore, "★★ src 没被重设（等于没重新下载）");
+      eq(elOf(e).__loads, loads1, "★★ 也没有再调 load()");
+      ok(countLog(e, "[stream] ★★ 就绪（metadata）") >= 1, "★★ 补发了 metadata 就绪（否则会一直等一个不会再来的事件）");
+      ok(e.emitted.some((x) => x.name === "Load"), "★★ onLoad 也发出去了（事件名去掉 `on` 后是 Load）");
+    }
+
+    // ---- (c) 当前这首正在流式 → 那个 <audio> 在用，绝不能预开 ----
+    {
+      const e = createEnv();
+      delete e.win.__gpStream;
+      e.eapi.url = "http://cdn.example/hang/both.flac"; // A 的预载也挂住 → A 只能走流式
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-x",
+        { songId: 1000, musicurl: "http://cdn.example/a.flac" },
+      ]);
+      await flush();
+      await flush();
+
+      // 让 A 真的「就绪」：⚠️ 必须在 flushTimers 之前发 metadata，
+      //   否则会先跑到「metadata 超时 8s」那条兜底（验证台的 flushTimers 不看时间，直接跑）。
+      e.eapi.url = "http://cdn.example/hang/next2.flac"; // 之后 B 的预载走这个地址
+      const elA = elOf(e);
+      elA.readyState = 1;
+      elA.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush();
+      e.flushTimers(); // 日志是攒着写的，统一在这里冲（此时 metadata 已经发过了）
+      ok(countLog(e, "[load] 流式播放") >= 1, "（前提）当前这首走的是流式");
+      ok(countLog(e, "[stream] ★★ 就绪（metadata）") >= 1, "（前提）A 已经流式就绪");
+
+      setLeft(e, 1.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[stream] ★ 提前预开"), 0, "★★ 当前在流式时不做预开（动了就断音）");
+      ok(!/hang\/next2/.test(srcOf(e)), "★★ <audio> 的 src 仍然是当前这首，没被顶掉");
+      eq(e.win.gaplessPlayer.preopen("http://cdn.example/whatever.flac"), false,
+        "★★ preopenStream 自己也守住「元素在用就不动」（谁调都不行）");
+    }
+
+    // ---- (d) 换预载目标 / 预载作废 → 预开的流要清掉 ----
+    {
+      const e = await hangNextEnv();
+      setLeft(e, 1.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[stream] ★ 提前预开 <audio>") >= 1, "（前提）已经预开");
+      e.channel.call("player.setCurrentPlay", null, [idOf(3000)]); // 切到别的歌 → 预载换目标
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[stream] 清掉提前预开的流") >= 1, "★★ 换目标时清掉了预开的流");
+      eq(srcOf(e), "", "★★ <audio> 的 src 也被撤了（不白占连接）");
+    }
   }
 
   /* ---------- 汇总 ---------- */

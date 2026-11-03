@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.5.2";
+  var VERSION = "1.5.3";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -413,6 +413,8 @@
     style: null, // ★ v1.4.0：用户选的过渡风格（clean/light/dj）；null = 智能默认
     beatCache: {}, // ★ v1.5.0：trackId|head/tail → 拍点网格
     lastPlan: null, // ★ v1.5.0：最近一次 automix 判定（排查用）
+    preopenUrl: null, // ★ v1.5.3：为 B 提前预开的 <audio> 地址（切歌时复用）
+    preopenTrackId: null, // ★ v1.5.3：预开的是哪一首（3.x 的 musicurl 是加密 token，只能比 id）
     stats: { plays: 0, hitPreload: 0, hitRecent: 0 }, // ★ v1.4.0：状态行用
     srcGain: null, // 当前缓冲 source 自己的增益（淡出用；不动总线 S.gain）
     srcFilter: null, // ★ v1.3.2：同一路的「高通」（交叉时做扫频淡出，平时 20Hz = 直通）
@@ -700,6 +702,13 @@
         el.removeEventListener("ended", onEnded);
       } catch (e) {}
     };
+
+    // ★ v1.5.3：这首的流**提前预开过** → metadata 可能在我们挂监听之前就发完了，
+    //   那就补一次（否则会一直等一个不会再来第二次的事件）。
+    if (S.preopenUrl && el && Number(el.readyState) >= 1) {
+      log("[stream] ★ 复用提前预开的流（metadata 早已就绪）｜ readyState=" + el.readyState);
+      onMeta();
+    }
   }
 
   function clearMetaTimer() {
@@ -750,6 +759,14 @@
         }
       }
       if (token !== S.loadToken) return true; // 已经过期 → 当作已处理
+      // ★ v1.5.3：这一首的流已经预开过 → **别再重设 src**（重设 = 重新下载，等于白预开）
+      if (S.preopenUrl && S.preopenTrackId !== null && S.preopenTrackId === S.curTrackId) {
+        log("[stream] ★ 复用提前预开的 <audio>（不重设 src）");
+        S.preopenUrl = null; // 接管完成，交回正常流程
+        S.preopenTrackId = null;
+        return true;
+      }
+      S.preopenUrl = null;
       try {
         el.pause();
         el.src = u;
@@ -1894,6 +1911,10 @@
   function startPreload(trackId, why) {
     // ★ v0.2.5：换槽前先把上一个在飞的下载掐断（否则它照跑到底，白花带宽）
     var old = S.preload;
+    // ★ v1.5.3：换的是**别的歌** → 之前为它预开的流没用了，清掉（别白占连接）
+    if (S.preopenUrl && S.preopenTrackId !== S.curTrackId && (!old || old.trackId !== trackId)) {
+      clearPreopen("换预载目标");
+    }
     if (old && old.abort) {
       try {
         old.abort.abort();
@@ -1910,7 +1931,7 @@
     } catch (e) {
       ac = null;
     }
-    var slot = { trackId: trackId, why: why || "?", status: "pending", buffer: null, promise: null, abort: ac };
+    var slot = { trackId: trackId, why: why || "?", status: "pending", buffer: null, promise: null, abort: ac, url: null };
     S.preload = slot;
     S.preloadState = "fetching";
     var t0 = performance.now();
@@ -1937,6 +1958,7 @@
       ? Promise.resolve(cachedBytes)
       : resolveUrl(trackId)
           .then(function (url) {
+            if (url) slot.url = url; // ★ v1.5.3：记下来，B 没下完时用它提前预开流
             if (tk !== S.preloadToken) return null;
             return fetchBytes(url, ac ? ac.signal : null);
           })
@@ -2031,12 +2053,16 @@
    *   45.253 [fetch] ★ 26.76 MB ｜ 1971ms        ← 作废之后那 26.76MB 还是下完了
    * 所以「不白下」是句空话：省掉的只是解码 + 内存，带宽照样花。
    */
-  function dropPreload(why) {
+  function dropPreload(why, opts) {
     var p = S.preload;
     if (p && p.abort) {
       try {
         p.abort.abort();
       } catch (e) {}
+    }
+    // ★ v1.5.3：预载作废 → 为它预开的流也一起清掉
+    if (S.preopenUrl && !(opts && opts.keepPreopen) && S.preopenTrackId !== S.curTrackId) {
+      clearPreopen("预载作废");
     }
     S.preload = null;
     S.preloadToken++;
@@ -2200,6 +2226,76 @@
    *   ③ 置信「顺序播放」：`NM_SETTING_PLAYER.mode` 能读到就**一票定音**；读不到退回 `seqStreak >= 2`
    *   ④ 距结束 [0.3, 1.5]s（由 100ms tick 命中）
    */
+  /* ==================== v1.5.3 · 提前预开流（B 没下完时缩短接缝空档）==================== */
+
+  /**
+   * 问题：无缝的前提是 B **整首下载完 + 解码完**（`AudioBufferSourceNode` 只能播完整的
+   *   `AudioBuffer`，Web Audio 没有「流式 buffer 源」）。所以 B 还在下的时候，只能退回流式接力 ——
+   *   而流式接力的代价是：`el.src = url` → 等 `canplay` → 才出声，真机实测约 **500ms 空档**。
+   *
+   * ★ 但这一段空档里，B 的歌其实**已经在本地/在路上了**（预载槽 status=pending，地址也有了）。
+   *   所以这里提前把 `<audio>` 的 src 挂上、让它自己缓冲 —— 等真切歌时，`canplay` 往往已经满足，
+   *   只剩 `play()` 那一下。
+   *
+   * 安全边界（这几点必须同时成立，否则宁可不预开）：
+   *   ① 当前这首**不走流式**（`S.stream` 为假）—— 那个 `<audio>` 正被当前这首用着，动它就断音；
+   *   ② B 的预载槽是 **pending**（还在下/还在解），且**地址已经解析出来**；
+   *   ③ 不是「整条交回原生」的逃生状态。
+   */
+
+  /** 清掉提前预开的流（换歌 / 预载作废时调） */
+  function clearPreopen(why) {
+    if (!S.preopenUrl) return;
+    S.preopenTrackId = null;
+    var was = S.preopenUrl;
+    S.preopenUrl = null;
+    log("[stream] 清掉提前预开的流（" + (why || "?") + "）｜ " + String(was).slice(-48));
+    if (S.stream) return; // 元素正在给当前这首播 → 绝对不动
+    try {
+      if (S.el) {
+        S.el.pause();
+        if (typeof S.el.removeAttribute === "function") S.el.removeAttribute("src");
+        if (typeof S.el.load === "function") S.el.load();
+      }
+    } catch (e) {}
+  }
+
+  function preopenStream(url, trackId) {
+    if (!url) return false;
+    if (S.stream) return false; // 元素在用
+    if (passAllToNative()) return false;
+    var u = String(url);
+    if (S.preopenUrl === u) return false; // 已经预开过这一首
+    var el = ensureEl();
+    if (!el) return false;
+    try {
+      el.preload = "auto";
+      el.src = u;
+      if (typeof el.load === "function") el.load();
+      S.preopenUrl = u;
+      S.preopenTrackId = trackId;
+      log("[stream] ★ 提前预开 <audio>（B 还没就绪）｜ " + u.slice(-64));
+      return true;
+    } catch (e) {
+      log("[stream] ★ 预开失败（忽略，照旧走原路）｜ " + (e && e.message));
+      return false;
+    }
+  }
+
+  /** 调度窗口里发现 B 还没 ready → 顺手把它的流预开 */
+  function maybePreopenNext(nid) {
+    try {
+      if (!useStream()) return;
+      // ★ 「元素正在用就不许动」这道闸在 preopenStream 内部（这里再判一次是死代码：删掉行为不变）
+      if (passAllToNative()) return;
+      var p = S.preload;
+      if (!p || p.trackId !== nid) return;
+      if (p.status !== "pending") return; // ready 就不需要流；failed 也不值得试
+      if (!p.url) return; // 地址还没解析出来 → 等下一次 tick
+      preopenStream(p.url, p.trackId);
+    } catch (e) {}
+  }
+
   function maybeScheduleSeamless() {
     try {
       if (typeof window !== "undefined" && window && window.__gpSeamless === false) return;
@@ -2218,6 +2314,9 @@
     if (!nt) return;
     var nid = trackIdOf(nt.id);
     if (nid === null || nid === S.curTrackId) return;
+
+    // ★ v1.5.3：B 还没就绪就先把它的流预开（真切歌时省掉 canplay 那几百毫秒）
+    maybePreopenNext(nid);
 
     var p = S.preload;
     if (!p || p.trackId !== nid || p.status !== "ready" || p.why !== "下一首") return;
@@ -3581,7 +3680,7 @@
       // 顺手掐掉「这一首自己的」在飞预载（已经没用了）；但**别动「下一首」那一份**
       if (S.preload && S.preload.trackId === trackId) {
         log("[preload] 这一首改走流式 → 掐掉它自己的在飞预载");
-        dropPreload();
+        dropPreload('这一首改走流式', { keepPreopen: true }); // ★ v1.5.3：预开的流正是给它用的
       }
       if (startStream(token, url, local)) return;
       log("[stream] ★ 流式起不来 → 退回缓冲路径");
@@ -4320,7 +4419,7 @@
           //   真机踩过：开机记忆是「上一份歌单」的歌，切歌单后它还在下，白下 22MB。
           if (S.preload && !keep && S.preload.trackId !== S.curTrackId) {
             var dead = S.preload.trackId;
-            dropPreload(); // ★ v0.2.5：真的 abort 掉在飞的下载，不只是丢结果
+            dropPreload("不在新歌单"); // ★ v0.2.5：真的 abort 掉在飞的下载，不只是丢结果（预开也一并清掉）
             log("[mem] 预载的 " + dead + " 不在新歌单里 → 作废（已掐断下载）");
           }
           maybePreload();
@@ -5111,6 +5210,7 @@
         },
         mixPlan: mixPlan,
         pickup: pickBEntry, // ★ v1.5.1：给 B 选入点
+        preopen: preopenStream, // ★ v1.5.3：诊断用（也会走「元素在用就不动」的守卫）
         snapToBeat: snapToBeat,
         lastPlan: function () {
           return S.lastPlan;
