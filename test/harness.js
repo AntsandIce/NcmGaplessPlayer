@@ -81,7 +81,7 @@ function section(name) {
 
 /* ==================== 假环境 ==================== */
 
-function createEnv() {
+function createEnv(hooks) {
   const emitted = []; // triggerRegisterCall 记录
   const nativeCalls = []; // 落到「原版 channel.call」的调用
   const started = []; // source.start 记录
@@ -375,8 +375,11 @@ function createEnv() {
   win.registeredCalls = registeredCalls;
 
   /* ---- 假 channel ---- */
-  const originalCall = function (name) {
-    nativeCalls.push({ name, args: Array.prototype.slice.call(arguments, 2) });
+  const originalCall = function (name, cb) {
+    const callArgs = Array.prototype.slice.call(arguments, 2);
+    nativeCalls.push({ name, args: callArgs });
+    // ★ 3.x 用例需要假的「原生网络层」：插件会 channel.call("network.fetch", cb, [{url}])
+    if (hooks && typeof hooks.onNative === "function") hooks.onNative(name, cb, callArgs);
   };
   // 假的原生桥：UI 用 channel.registerCall("audioplayer.onPlayState", cb) 注册。
   // 真机上它是 cloudmusic.dll 里 native function 包的壳；这里只记录调用。
@@ -2171,6 +2174,118 @@ async function main() {
     eq(countLog(e, "[sched] 预约"), 0, "★★ duration 无效 → 不预约");
   }
 
+  /* ==================== 3.1.x 适配（本分支新增） ==================== */
+
+  /** 3.x 环境：APP_CONF.appver = 3.1.x，并让假原生桥能回答 network.fetch */
+  function env3x(jsonBody) {
+    const e = createEnv({
+      onNative(name, cb) {
+        if (name === "network.fetch" && typeof cb === "function") {
+          cb({ blob: JSON.stringify(jsonBody) });
+        }
+      },
+    });
+    e.APP_CONF.appver = "3.1.42.205594";
+    return e;
+  }
+
+  section("78. ★★★ 3.1.x 事件契约：getPlayedTime / getPlaybackInfo 由插件自答（修「跳歌」）");
+  {
+    const e78 = createEnv();
+    e78.APP_CONF.appver = "3.1.42.205594";
+    e78.boot();
+    await flush();
+    e78.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(e78, 1000);
+    e78.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+    await flush();
+    e78.ctx.currentTime += 5; // 播 5 秒
+    e78.tick();
+
+    const pt = [];
+    e78.channel.call("audioplayer.getPlayedTime", (r) => pt.push(r), [{ playId: idOf(1000) + "-x" }]);
+    const a = pt[0] || {};
+    eq(a.result, true, "★★ 3.x：getPlayedTime 由插件自答（result=true，不再让原生回 false → 客户端不会再判一次结束）");
+    ok(Number(a.playedTime) > 0, "★★ 自答里是引擎的真实播放位置（" + a.playedTime + "ms）");
+    eq(!!a.playedAudioTime, true, "★★ 契约字段 playedAudioTime 也在");
+
+    const pi = [];
+    e78.channel.call("audioplayer.getPlaybackInfo", (r) => pi.push(r), [{ playId: idOf(1000) + "-x" }]);
+    const b = pi[0] || {};
+    eq(b.result, true, "★★ 3.x：getPlaybackInfo 也被自答");
+    eq(b.playId, idOf(1000) + "-x", "★★ playId 原样回填（否则客户端对不上）");
+    ok(Number(b.playedTime) > 0, "★★ 带真实 playedTime");
+    eq(!!b.deviceAudioFormat, true, "★★ 契约字段 deviceAudioFormat 在");
+
+    const other = [];
+    e78.channel.call("audioplayer.getPlayedTime", (r) => other.push(r), [{ playId: "999999_zzz" }]);
+    eq(other.length, 0, "★★ 不认识的 playId → 不乱答");
+    ok(
+      e78.nativeCalls.some((x) => x.name === "audioplayer.getPlayedTime"),
+      "★★ 放行时确实落到了原版 channel.call"
+    );
+  }
+
+  section("79. ★★★ 3.1.x 预载：免签名 320k 接口 / 试听片段被拒");
+  {
+    // 正常 320k
+    const eOk = env3x({ data: [{ url: "http://cdn.example/320.mp3", br: 320000, size: 6000000, type: "mp3", fee: 1, payed: 1 }] });
+    eOk.eapi.available = false; // 3.x 上 LibEAPIRequest 找不到请求函数
+    eOk.boot();
+    await flush();
+    eOk.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(eOk, 1000);
+    await flush();
+    await flush();
+    ok(countLog(eOk, "320k 接口") >= 1, "★★ 3.x：LibEAPI 不可用时走免签名 320k 接口");
+    ok(
+      eOk.fetchLog.some((u) => String(u).indexOf("cdn.example/320.mp3") >= 0),
+      "★★ 真的按接口给的地址预载了"
+    );
+    ok(countLog(eOk, "预载就绪（下一首）") >= 1, "★★ 预载就绪");
+
+    // 试听片段（br 非标准值）
+    const eClip = env3x({ data: [{ url: "http://cdn.example/clip.mp3", br: 320006, size: 2562133, type: "mp3", fee: 1, payed: 1 }] });
+    eClip.eapi.available = false;
+    eClip.boot();
+    await flush();
+    eClip.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(eClip, 1000);
+    await flush();
+    await flush();
+    eClip.flushTimers(); // 日志是攒着写的，断言前要刷一次
+    ok(countLog(eClip, "非标准值") >= 1, "★★ 试听片段（br=320006）被识别");
+    eq(
+      eClip.fetchLog.filter((u) => String(u).indexOf("clip.mp3") >= 0).length,
+      0,
+      "★★ 试听片段没有被下载（否则歌会在片段边界断掉）"
+    );
+    ok(
+      countLog(eClip, "outer/url(128k) 兜底") >= 1,
+      "★★ 试听片段被拒后按预期降级（退 128k 直链 → 拿不到就安静放弃）"
+    );
+  }
+
+  section("80. ★★★ 3.1.x 加密 musicurl 播不了 → 用自有地址重试一次");
+  {
+    const e80 = env3x({ data: [{ url: "http://cdn.example/retry.mp3", br: 320000, size: 5000000, type: "mp3" }] });
+    delete e80.win.__gpStream; // 走流式
+    e80.boot();
+    await flush();
+    e80.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+    streamLoad(e80, idOf(1000) + "-x", "TOKEN_ENC");
+    await flush();
+    const el = e80.audio.last;
+    eq(el.src, "TOKEN_ENC", "（前提）先把客户端的加密 token 挂到 el.src");
+    el.error = { message: "Format error" };
+    e80.audio.emit("error");
+    await flush();
+    await flush();
+    await flush();
+    e80.flushTimers(); // 日志是攒着写的
+    eq(el.src, "http://cdn.example/retry.mp3", "★★ 媒体错误后改用自有 320k 地址重挂");
+    ok(countLog(e80, "改用自有地址重试") >= 1, "★★ 日志写明走了重试");
+  }
   /* ---------- 汇总 ---------- */
   console.log("\n====================");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
