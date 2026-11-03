@@ -2020,18 +2020,49 @@
     });
   }
 
+  // ★★ 3.x 320k：免签名接口（实测无需 eapi 签名，走客户端原生网络会自动带 cookie）
+  //   GET /api/song/enhance/player/url?ids=[id]&br=320000 → data[0].url（br=320000）
+  //   ⚠️ /v1 和 /weapi 两个变体都要求签名，会返回 {"msg":"参数错误","code":400}
+  function api320Url(trackId) {
+    return "https://music.163.com/api/song/enhance/player/url?ids=[" + trackId + "]&br=320000";
+  }
+  function resolveUrl320(trackId) {
+    return nativeFetchBytes(api320Url(trackId), 15000).then(function (buf) {
+      var txt = "";
+      try {
+        txt = new TextDecoder("utf-8").decode(new Uint8Array(buf));
+      } catch (e) {
+        var a = new Uint8Array(buf);
+        var s = "";
+        for (var i = 0; i < Math.min(a.length, 8000); i++) s += String.fromCharCode(a[i]);
+        txt = s;
+      }
+      var j = null;
+      try { j = JSON.parse(txt); } catch (e) {}
+      var d = j && j.data && j.data[0];
+      if (!d || !d.url) throw new Error("320k 接口没给 url ｜ " + txt.slice(0, 120));
+      log("[preload] 320k 接口 ★ br=" + d.br + " ｜ size=" + d.size + " ｜ type=" + d.type);
+      return d.url;
+    });
+  }
   function acquireAudio(trackId, ac) {
     return resolveUrl(trackId)
       .then(function (url) { return fetchBytes(url, ac ? ac.signal : null); })
       .catch(function (e) {
-        log("[preload] API 取址不可用（" + (e && e.message) + "）→ 改用 outer/url 直链");
-        return fetchBytes(outerUrlFor(trackId), ac ? ac.signal : null)
-          .catch(function (e2) {
-            log("[preload] 直链失败（" + (e2 && e2.message) + "）→ 原生网络兜底");
-            return nativeFetchBytes(outerUrlFor(trackId));
-          });
+        log("[preload] LibEAPI 不可用（" + (e && e.message) + "）→ 试 320k 免签名接口");
+        return resolveUrl320(trackId).then(function (url) {
+          return fetchBytes(url, ac ? ac.signal : null);
+        });
+      })
+      .catch(function (e2) {
+        log("[preload] 320k 接口失败（" + (e2 && e2.message) + "）→ outer/url(128k) 兜底");
+        return fetchBytes(outerUrlFor(trackId), ac ? ac.signal : null).catch(function (e3) {
+          log("[preload] 128k 直链也失败（" + (e3 && e3.message) + "）→ 原生网络取字节");
+          return nativeFetchBytes(outerUrlFor(trackId));
+        });
       });
   }
+
   function fetchBytes(url, signal) {
     var t0 = performance.now();
     // ★ v0.2.5：带上 signal，作废时才能真正把连接掐掉（不传就退回旧的裸 fetch）
