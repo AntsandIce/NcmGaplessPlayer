@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 上游项目（2.10.x 的问题）
+    url: https://github.com/Ehytr/NcmGaplessPlayer/issues
+    about: 2.10.x 上的问题请先看上游；本分支只负责 3.x 适配与打包
+  - name: BetterNCM（chromatic）
+    url: https://github.com/std-microblock/chromatic
+    about: 插件装不上、注入失败、插件管理器异常等问题属于 BetterNCM

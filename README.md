@@ -1,3 +1,49 @@
+# GaplessPlayer — 3.x 分支
+
+> 真无缝播放引擎，**新增对网易云音乐 3.1.x 的支持**（上游只支持 2.10.x）。
+> English: [README.en.md](README.en.md) ｜ 实测记录: [docs/verification.md](docs/verification.md)
+
+## 本分支支持范围
+
+| 客户端 | 支持 | 预载音质 | 说明 |
+|---|---|---|---|
+| 2.10.x | ✅ 上游行为原样保留 | 320k | 与上游逐字节一致（3.x 兜底链路会立即 rethrow） |
+| **3.1.x** | ✅ **本分支新增**（实测 `3.1.42.205594`） | **320k**（失败退 128k） | 需 BetterNCM 1.3.4 |
+| 3.0.x | ⚠️ 未专门测试 | — | 补丁以 `APP_CONF.appver` 是否以 `3.` 开头为开关 |
+
+## 3.x 上修了什么
+
+| # | 现象 | 原因 / 修法 |
+|---|---|---|
+| 1 | BetterNCM 直接**跳过**本插件 | `manifest.json` 需要 `"ncm3-compatible": true` |
+| 2 | 预载必然失败：`[preload] 放弃 ｜ n is not a function` | `LibEAPIRequest` 靠扫描窗口函数源码定位请求函数；3.x 上第一个命中（id `1368`）是 **webpack 模块工厂**，没有 `__webpack_require__` 无法调用 → 本分支改为自带取址 |
+| 3 | 快播完时**跳一首**（有时跳回歌单头，严重时两首 ping-pong） | 客户端推进后会拿**新曲目**的 `playId` 问 `audioplayer.getPlayedTime` / `getPlaybackInfo`；原生被插件按住只回 `{playedTime:0, result:false}` → 客户端**再判一次结束**。现由插件按自身引擎状态自答这两个查询 |
+| 4 | `[sched] 预约` 从不出现、**没有无缝** | 3.x 报 `mode=playrandom`，上游对非顺序模式一律不预约。现在：顺序/列表循环直接预约；随机模式下**上一次预测命中**（`hitStreak ≥ 1`）也允许；押错由 `abortSeam()` / `cancelSched()` 撤销 |
+| 5 | 预载只有 128k | 新增**旧版免签名接口**，可拿 320k |
+
+### 3.x 取址链路
+
+```
+① LibEAPIRequest.eapiRequest(...)                              320k（仅 2.10 可用）
+② GET /api/song/enhance/player/url?ids=[<id>]&br=320000        320k（免签名旧接口）
+③ GET /song/media/outer/url?id=<id>.mp3                        128k（兜底）
+④ channel.call("network.fetch", …)                                  原生网络兜底
+```
+
+②③④ 走客户端原生网络层，自动带登录 cookie，VIP/高音质权限正常生效。
+> ⚠️ ② 是历史遗留接口（`/v1` 与 `/weapi/` 都需要 eapi 签名，会返回 `{"msg":"参数错误","code":400}`），随时可能被关闭；关掉后自动退 128k 无缝，**不影响播放**。
+
+### 已知限制
+
+- **随机播放**：客户端切歌前约 80 ms 才决定下一首 → 只有上一次预测命中时才排真无缝。想稳定无缝请用**顺序播放 / 列表循环**。
+- **3.x 每次启动需真实点击一次播放按钮**（CEF 的 `AudioContext` 需要用户手势才 `resume()`，模拟点击不算）。
+- **网易云原生歌词会失效**（插件接管播放链），可换用 [RuLyric](https://github.com/BetterNCM/RuLyric)。
+- 开发：`python build.py`（产物在 `dist/`）、`python build.py --install`（直接装进 BetterNCM）、`node test/harness.js`（291 项断言，上游基线同为全绿）。
+
+---
+
+以下为上游原始 README（未改动）
+---
 # GaplessPlayer
 
 > 给网易云音乐 PC 版做的**真无缝**播放引擎：把「下一首」提前排到「这一首」的最后一个采样上，切歌间隙从几百毫秒压到 **0**。
