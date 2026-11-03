@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.3.1";',
+    find: 'var VERSION = "1.3.2";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -579,14 +579,14 @@ const MUTATIONS = [
   {
     name: "v1.3.0: 用线性淡入淡出代替等功率（中点塌 -3dB，听起来音量掉一截）",
     file: "main.js",
-    find: "      a[i] = rising ? Math.sin(th) : Math.cos(th);",
-    replace: "      a[i] = rising ? i / (XFADE_POINTS - 1) : 1 - i / (XFADE_POINTS - 1); // 变异：线性",
+    find: "        return Math.sin(x * Math.PI * 0.5); // equal power（默认）",
+    replace: "        return x; // 变异：线性（默认档退化成线性）",
     expect: "84",
   },
   {
     name: "v1.3.0: 交叉曲线挂在主音量总线上（会改掉用户设的音量）",
     file: "main.js",
-    find: "    var gB = newSourceGain();",
+    find: "    var gB = chainB.gain;",
     replace: "    var gB = S.gain; // 变异：直接用总线",
     expect: "84",
   },
@@ -633,6 +633,27 @@ const MUTATIONS = [
     find: '              throw new Error(\n                "解码时长 " + ab.duration.toFixed(1) + "s 短于实际 " + (dtMs / 1000).toFixed(1) + "s（试听片段），不补"\n              );',
     replace: "              /* 变异：片段也照收 */",
     expect: "85",
+  },
+  {
+    name: "v1.3.2: 曲线预设被忽略（永远等功率，__gpXfadeCurve 失效）",
+    file: "main.js",
+    find: "    var name = xfadeCurveName();",
+    replace: '    var name = "equal"; // 变异：忽略预设',
+    expect: "86",
+  },
+  {
+    name: "v1.3.2: 高通扫频不排（DJ 过渡那一下没了）",
+    file: "main.js",
+    find: "      var aFilter = currentFilterNode();",
+    replace: "      var aFilter = null; // 变异：不扫频",
+    expect: "86",
+  },
+  {
+    name: "v1.3.2: automix 探针不记录（客户端哪天接上计划也发现不了）",
+    file: "main.js",
+    find: "    if (!probeOn()) return cb;",
+    replace: "    if (true) return cb; // 变异：不记录",
+    expect: "86",
   },
 ];
 

@@ -1,8 +1,68 @@
-# GaplessPlayer 开发日志（0.1.0 → 1.3.1）
+# GaplessPlayer 开发日志（0.1.0 → 1.3.2）
 
 > 面向使用者的安装与使用说明见 [README](../README.md)。
 
 ---
+
+## ★ v1.3.2 —— 交叉曲线可选 + 高通扫频 + automix 探针（P3 的前哨）
+
+### 先说结论：这台客户端的 automix 够不着
+
+用户问「Automix 难不难 / 原生有的话能不能利用」，于是把客户端翻了个底朝天。实测（3.1.42.205594）：
+
+| 在哪 | 有什么 |
+|---|---|
+| **原生 DLL**（cloudmusic.dll / neaudio*.dll / audioeffects.dll / cloudmusic.exe） | `automix` / `crossfade` / `智能过渡` **0 命中**；`mix_params` / `crossfade_start_time` / `tempo_values` / `eq_type` **0 命中**；`r_s-line` / `strategy_rhythm` / `band_pass` **0 命中**。只有 `AutoTrackChangeFadeIn/Out`、`Seek/Pause/StopFadeIn/Out`、`P8AudioVolumeFade` —— 固定音量淡入淡出 |
+| **渲染层**（`package/orpheus.ntpk`，实为「100 字节头 + zip」，247 个 js / 21MB） | **完整的 automix 决策库**：`AutomixEffectConfig0922`（`abtest.getList` + `realtime:true`）、`__AUTOMIX_DEV`、`mix_strategy`（rhythm/vocal/atmosphere/accompaniment/silence/crossfade/donothing/custom）、`song_a/song_b` 的 `crossfade_line / crossfade_start_time / crossfade_end_time / eq_type / mix_start_time / silence_time / beat_array / bpm`、`mix_params`（`b_start_a_time` / `beat_sync_enabled` / `tempo_sync_enabled` / `b_prepare_time` / `ui_switch_time`）、`ori_song_*`（`bpm` / `repBpm` / `mode`(调性) / `genre` / `length_ms`）、`crossfade_line` 枚举（`linear/log/exp/s-line/r_*/step`） |
+| **入口** | `kernel-service-play-effect` 只出现 1 次；其它 chunk 全都没有引用 automix；分析数据（bpm/repBpm/beat_array）没有任何抓取点 |
+| **客户端能调的开关** | `audioplayer.switchEffect("id", [{name:"fade", on:e}])` —— 就一个 fade 开关 |
+
+**结论**：这一版的 automix 决策层是**悬空**的 —— 算得出计划，但没人喂分析数据、也没人消费它
+（决策层随版本先发了，渲染层/接线还没到，或只在服务端 + AB 命中的账号上）。原生那条路彻底堵死：
+① 原生没有 automix 渲染器；② 我们已经把音频链整个换成 Web Audio，没法把 PCM 塞回原生。
+
+顺带记下它内置的 crossfade 策略（反编译出来的算式），和我们现在的实现一致、只是时长可调：
+
+```js
+song_a.crossfade_start_time = A.length_ms - 5000   // A 最后 5 秒开始
+song_b.crossfade_start_time = 0                    // B 从 0 开始
+song_b.crossfade_end_time   = 5000
+song_a.crossfade_line = "r_s-line" ／ song_b.crossfade_line = "s-line"   // 两边曲线形状不同
+mix_params.ui_switch_time = crossfade_start_time + 2500
+```
+
+代价：**P3 的「分析 + 决策」没法白嫖**，要么等客户端接上，要么自研（服务端分析 + 缓存）。
+
+### 那这一版做了什么（能落地、且为 P3 铺路的三件事）
+
+**① 交叉曲线可选** —— 名字**故意对齐客户端的 `crossfade_line` 枚举**
+（`equal`(默认) / `linear` / `s-line` / `r_s-line` / `exp` / `step`）。
+哪天拿到它算好的计划，`crossfade_line` 可以**直接透传**，不用再翻译一层。
+实现要点：淡出用 `f(1-x)` 而不是 `1-f(x)` —— 等功率的淡出是 `cos(θ)`，正好是 `sin` 的镜像；
+写成 `1-sin` 就退化成线性补偿、中点塌 -3dB（正是 P2 要避免的毛病）。
+
+**② 可选的高通扫频**（`window.__gpXfadeEq = true`，默认关：会明显改音色）。
+交叉期间把出场的 A 从 20Hz 扫到 900Hz，把低频让给 B —— DJ 过渡的招牌手法。
+链路改成 `src → gain → filter(highpass@20Hz) → 总线`，**常驻**插好：
+平时 20Hz 高通≈直通，交叉时才去动 `frequency`。
+为什么不临场插：给正在响的节点断线重连会有可闻的爆音。
+扫频同样要复位（撤销/暂停/交接后拉回 20Hz），否则这一首会一直闷着。
+
+**③ automix 探针**（`window.__gpProbe = true`，默认关、零成本）：
+记 `abtest.getList` 的请求与回应、`audioplayer.*` 的**参数键名形状**（一变就打 `★ 形状变了`）、
+以及没见过的命令名。三条任意一条命中 = 客户端把 automix 接上了 → 那时再走「复用它的计划」。
+形状去重很重要：不然每个 `audioplayer.load` 都刷一行，真机日志会被淹掉。
+
+### 验收
+
+```
+node test/harness.js  → 通过 415 项，失败 0 项（新增第 86 段 22 项）
+node test/mutate.js   → 变异点 87 个，抓住 87 个，漏网 0 个
+```
+
+第 86 段覆盖：默认等功率中点 0.707 / linear 0.5 / s-line 前段压得更低 / step 前后分明 /
+扫频只扫 A（20→900Hz、时长=交叉时长、日志 +扫频）/ 暂停后复位到 20Hz /
+默认不扫频 / 探针默认不写日志 / 记请求形状 + 记回应 / 同形状只记一次 / 形状变了再记一次 / 新字段可见。
 
 ## ★ v1.3.1 —— 把「流式那一首」补成缓冲（补掉 1.2.1 的缺口）
 

@@ -21,6 +21,7 @@ BetterNCM 插件：把「下一首」提前排到「这一首」的最后一个�
 
 | 版本 | 要点 |
 |---|---|
+| **1.3.2** | 交叉曲线可选（对齐 `crossfade_line`）+ 可选高通扫频 + automix 探针（`window.__gpProbe`） |
 | **1.3.1** | 流式听过的歌**补成缓冲**：切回来不重新拉流，也能当交叉的 B |
 | 1.3.0 | **等功率交叉淡入淡出** 0~12s（默认关，`window.__gpXfade`） |
 | 1.2.1 | 裁剪分层（填充必裁 / 作品静音默认不裁）+ 并发去重 + 字节缓存 / 最近缓冲 |
@@ -133,6 +134,47 @@ window.__gpXfade = 0   // 关（默认）
 补完之后，这首再切回来会命中 `[preload] ★ 复用刚播过的缓冲（不下载 / 不解码）`，
 并且**可以当交叉的 B** 了（之前流式播过的歌做不到）。
 
+## 1.3.2：交叉曲线可选 + 高通扫频 + automix 探针
+
+### 交叉曲线（名字对齐客户端的 `crossfade_line` 枚举）
+
+```js
+window.__gpXfadeCurve = "equal"    // 默认：等功率（中点 -3dB）
+window.__gpXfadeCurve = "linear"   // 线性（中点 -6dB，会塌一下，仅对比用）
+window.__gpXfadeCurve = "s-line"   // smoothstep
+window.__gpXfadeCurve = "r_s-line" // 端部更陡的 S
+window.__gpXfadeCurve = "exp"      // 指数
+window.__gpXfadeCurve = "step"     // 硬切式
+```
+
+名字故意和客户端 automix 的 `crossfade_line` 一致 —— 哪天能拿到它算好的计划，
+`crossfade_line` 可以**直接透传**进来，不用再翻译一层。
+
+### 高通扫频（DJ 过渡的招牌手法）
+
+```js
+window.__gpXfadeEq = true   // 默认关：会明显改变音色，得你说了算
+```
+
+交叉期间把**出场的 A** 从 20Hz 高通扫到 900Hz，把低频让给 B。
+链路里给每个 source / 流式元素都常驻插了一个高通（平时 20Hz ≈ 直通，不改音色），
+所以扫频是**零爆音**的 —— 不用断开正在响的节点再重连。
+
+### automix 探针：为什么 P3 暂时没法「直接复用客户端」
+
+实测（3.1.42.205594）：渲染层里有一整套 automix **决策库**（`AutomixEffectConfig0922` AB 实验、
+`mix_strategy` / `crossfade_start_time` / `eq_type` / `tempo_values` 计划骨架、五种策略），
+但**原生模块里一个计划字段都没有**（`mix_params` / `r_s-line` / `strategy_rhythm` 全 0 命中），
+而且**除它自己那个 bundle 之外没有任何 chunk 引用它** —— 决策层目前是「悬空」的。
+
+`window.__gpProbe = true` 会记录（只记录、不干预）：
+
+- `abtest.getList` 的请求与回应（看 `AutomixEffectConfig0922` 有没有下发）；
+- `audioplayer.*` 的**参数键名**：形状一变就打 `★ 形状变了`（比如突然多出 `mix_strategy`）；
+- 没见过的命令名（比如 `audioplayer.setMixPlan`）。
+
+这三条任意一条命中，就说明客户端把 automix 接上了 —— 那时再走「复用它的计划」这条路。
+
 ## 修了什么（相对上游 1.0.0）
 
 | # | 现象 | 原因 / 修法 |
@@ -157,7 +199,10 @@ window.__gpXfade = 0   // 关（默认）
   不想付这份流量：`window.__gpPromote = false`。
 - **作品静音默认不裁**：`window.__gpTrimPad = true` 才连它一起削（更紧，但会切掉 ≤40ms 的作品静音）。
 - **交叉默认关**：`window.__gpXfade = 3` 打开（0~12s，会记住）。B 必须是缓冲，
-  所以随机播放（预载命中率低）时交叉基本不会出现。
+  所以随机播放（预载命中率低）时交叉基本不会出现。曲线用 `window.__gpXfadeCurve`，
+  高通扫频用 `window.__gpXfadeEq = true`。
+- **Automix 暂时做不了**（实测本机 3.1.42 的决策层是悬空的，详见 1.3.2 一节）。
+  打开 `window.__gpProbe = true` 可以盯着它哪天被接上。
 - **不带启动参数时需要点一次播放**：改用上面的 `--autoplay-policy=no-user-gesture-required` 启动参数后已不需要（已在 3.1.42 实测：`AudioContext` 启动即 `running`）。
 - **桌面歌词只剩歌名**：应用内歌词页正常（跟着插件伪造的进度滚），但 3.x 的**桌面歌词由原生渲染**，插件把原生播放器按住后它拿不到播放位置。实测"把位置喂回原生"无效（原生暂停时根本不推进渲染）。需要桌面歌词请用 [RuLyric](https://github.com/BetterNCM/RuLyric) 等第三方自绘方案。
 - **320k 依赖旧版免签名接口**，它随时可能被网易云关闭；关掉后自动退 128k 无缝，不影响播放。

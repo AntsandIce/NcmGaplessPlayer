@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.3.1";
+  var VERSION = "1.3.2";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -410,7 +410,9 @@
     /* ---- v1.3.0：交叉淡入淡出（P2）---- */
     xfade: 0, // 交叉时长（秒）；0 = 关（默认，与 Spotify 一致：只做 gapless）
     srcGain: null, // 当前缓冲 source 自己的增益（淡出用；不动总线 S.gain）
+    srcFilter: null, // ★ v1.3.2：同一路的「高通」（交叉时做扫频淡出，平时 20Hz = 直通）
     mediaGain: null, // 流式元素那一路的增益（同上）
+    mediaFilter: null, // ★ v1.3.2：流式元素那一路的高通
     /* ---- v0.4.0 流式路径（<audio>）---- */
     el: null, // ★ 持久的 <audio>：createMediaElementSource 对同一元素只能调一次 → 全生命周期复用
     mediaSrc: null, // MediaElementSource → 接进 S.gain
@@ -559,16 +561,31 @@
       El.preload = "auto";
       El.volume = 1; // 音量统一由 S.gain 控，别两处都调
       S.mediaSrc = S.ctx.createMediaElementSource(El);
-      // ★ v1.3.0：流式这一路也插一层自己的 gain，交叉淡入淡出时才能淡出「元素这一路」
-      S.mediaGain = S.ctx.createGain();
-      S.mediaSrc.connect(S.mediaGain);
-      S.mediaGain.connect(S.gain); // mediaSrc → mediaGain → gain → analyser → destination
     } catch (e) {
       log("[stream] ★ createMediaElementSource 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
       S.el = null;
       S.mediaSrc = null;
       S.mediaGain = null;
+      S.mediaFilter = null;
       return null;
+    }
+    // ★ v1.3.0/v1.3.2：流式这一路也插「自己的 gain + 高通」，交叉时才能淡出 / 扫频。
+    //   ⚠️ 这两层建不起来不能连累流式播放本身 → 退化成直连总线。
+    try {
+      S.mediaGain = S.ctx.createGain();
+      S.mediaFilter = S.ctx.createBiquadFilter();
+      S.mediaFilter.type = "highpass";
+      S.mediaFilter.frequency.value = EQ_BASE_HZ;
+      S.mediaSrc.connect(S.mediaGain);
+      S.mediaGain.connect(S.mediaFilter);
+      S.mediaFilter.connect(S.gain); // mediaSrc → mediaGain → mediaFilter → gain → analyser → destination
+    } catch (e) {
+      log("[stream] ★ 流式的 gain/高通建不起来 → 直连总线（交叉时没有淡出）｜ " + (e && e.message));
+      S.mediaGain = null;
+      S.mediaFilter = null;
+      try {
+        S.mediaSrc.connect(S.gain);
+      } catch (e2) {}
     }
     S.el = El;
     El.addEventListener("durationchange", function () {
@@ -851,12 +868,56 @@
   var XFADE_KEY = "gaplessPlayer.xfade";
   var XFADE_POINTS = 64;
 
-  /** 等功率曲线表（rising=true 是淡入：0→1） */
-  function equalPowerCurve(rising) {
+  /**
+   * ★ v1.3.2：交叉曲线可选，名字**对齐客户端 automix 的 `crossfade_line` 枚举**
+   * （`linear` / `s-line` / `r_s-line` / `exp` / `step` / `none`）——
+   * 这样哪天拿到客户端算好的计划，`crossfade_line` 能直接透传进来，不用再翻译一次。
+   *
+   * 开关：`window.__gpXfadeCurve = "s-line"`（默认 `equal` = 等功率）
+   */
+  function xfadeCurveName() {
+    try {
+      if (typeof window !== "undefined" && window && typeof window.__gpXfadeCurve === "string") {
+        return String(window.__gpXfadeCurve).toLowerCase();
+      }
+    } catch (e) {}
+    return "equal";
+  }
+
+  /** 单调 0→1 的曲线形状（f(x)，x∈[0,1]） */
+  function curveShape(name, x) {
+    switch (name) {
+      case "linear":
+        return x;
+      case "s":
+      case "s-line":
+        return 3 * x * x - 2 * x * x * x; // smoothstep
+      case "rs":
+      case "r_s-line": // 端部更陡的 S（反向 smoothstep）
+        return x < 0.5 ? 2 * x * x : 1 - 2 * (1 - x) * (1 - x);
+      case "exp":
+        return x * x * x;
+      case "step":
+      case "r_step":
+        return x < 0.5 ? 0 : 1;
+      case "none":
+        return x < 1 ? 0 : 1;
+      default:
+        return Math.sin(x * Math.PI * 0.5); // equal power（默认）
+    }
+  }
+
+  /**
+   * 生成一条交叉曲线（rising=true 是淡入 0→1）。
+   * ★ 淡出用 `f(1-x)` 而不是 `1-f(x)`：等功率的淡出是 cos(θ)，正好是 sin 的镜像；
+   *   写成 `1-sin` 就退化成「线性补偿」，中点会塌 -3dB（正是 P2 要避免的毛病）。
+   */
+  function crossfadeCurve(rising) {
+    var name = xfadeCurveName();
     var a = new Float32Array(XFADE_POINTS);
     for (var i = 0; i < XFADE_POINTS; i++) {
-      var th = (i / (XFADE_POINTS - 1)) * Math.PI * 0.5;
-      a[i] = rising ? Math.sin(th) : Math.cos(th);
+      var x = i / (XFADE_POINTS - 1);
+      a[i] = curveShape(name, rising ? x : 1 - x);
     }
     return a;
   }
@@ -896,32 +957,75 @@
   }
 
   /**
-   * 每个 source 自己的增益节点。
-   * ★ 交叉淡入淡出**只能动这里**：`S.gain` 是总线音量（用户音量条），
-   *   在它上面做曲线会把用户音量也一起改了。
+   * 每个 source 自己的「增益 + 高通」两级节点链：
+   *
+   *   src ──▶ gain ──▶ filter(highpass @20Hz，听感上等于直通) ──▶ 总线 S.gain ──▶ …
+   *
+   * ★ 为什么要提前建好 filter：交叉时想给 A 做「高通扫频淡出」（DJ 过渡的招牌手法），
+   *   必须**在起播前**就插在链路里 —— 否则要断开正在响的节点再重连，
+   *   真机上会有可闻的爆音。
+   * ★ 为什么不能挂在 `S.gain` 上：那是用户音量条，在它上面做曲线 = 改用户的音量。
    */
-  function newSourceGain() {
+  var EQ_BASE_HZ = 20; // 默认频率（20Hz 高通≈直通，只挡掉次声）
+  var EQ_SWEEP_HZ = 900; // 交叉时 A 扫到多少
+
+  function xfadeEqEnabled() {
     try {
-      var g = S.ctx.createGain();
-      g.connect(S.gain);
-      return g;
-    } catch (e) {
-      log("[xfade] ★ 建 gain 失败 ｜ " + (e && e.message));
-      return null;
-    }
+      if (typeof window !== "undefined" && window && window.__gpXfadeEq === true) return true;
+    } catch (e) {}
+    return false; // 默认关：会明显改变音色，得用户自己说「要」
   }
 
-  /** 从 t0 起用 xf 秒把 param 走一条等功率曲线（rising=true 淡入 / false 淡出） */
+  function newSourceChain() {
+    var g = null;
+    var f = null;
+    try {
+      g = S.ctx.createGain();
+      f = S.ctx.createBiquadFilter();
+      f.type = "highpass";
+      f.frequency.value = EQ_BASE_HZ;
+      try {
+        f.Q.value = 0.707;
+      } catch (e) {}
+      g.connect(f);
+      f.connect(S.gain);
+    } catch (e) {
+      log("[xfade] ★ 建 gain/filter 失败 ｜ " + (e && e.message));
+      // 退化成老链路：直接接总线
+      try {
+        if (g) g.connect(S.gain);
+      } catch (e2) {}
+      return { gain: g, filter: null };
+    }
+    return { gain: g, filter: f };
+  }
+
+  /** 从 t0 起用 xf 秒把 param 走一条曲线（rising=true 淡入 / false 淡出） */
   function scheduleFade(param, t0, xf, rising) {
     if (!param || !(xf > 0)) return false;
     try {
       param.cancelScheduledValues(0); // ⚠️ 不清掉旧的，setValueCurveAtTime 会因「区间内有事件」抛错
-      param.setValueCurveAtTime(equalPowerCurve(rising), t0, xf);
+      param.setValueCurveAtTime(crossfadeCurve(rising), t0, xf);
       return true;
     } catch (e) {
       log(
         "[xfade] ★ " + (rising ? "淡入" : "淡出") + "排不上 ｜ " + (e && e.name) + ": " + (e && e.message)
       );
+      return false;
+    }
+  }
+
+  /** 交叉期间给「出场的 A」做高通扫频（20Hz → 900Hz），把低频让给新歌 */
+  function scheduleEqSweep(filter, t0, xf) {
+    if (!filter || !filter.frequency || !(xf > 0)) return false;
+    try {
+      var p = filter.frequency;
+      p.cancelScheduledValues(0);
+      p.setValueAtTime(EQ_BASE_HZ, t0);
+      p.linearRampToValueAtTime(EQ_SWEEP_HZ, t0 + xf);
+      return true;
+    } catch (e) {
+      log("[xfade] ★ 扫频排不上 ｜ " + (e && e.name) + ": " + (e && e.message));
       return false;
     }
   }
@@ -935,9 +1039,23 @@
     } catch (e) {}
   }
 
+  /** 把高通拉回直通 */
+  function restoreEq(filter) {
+    if (!filter || !filter.frequency) return;
+    try {
+      filter.frequency.cancelScheduledValues(0);
+      filter.frequency.value = EQ_BASE_HZ;
+    } catch (e) {}
+  }
+
   /** 当前“正在响的那一路”的增益节点（缓冲是 source 自己的，流式是元素的） */
   function currentGainNode() {
     return S.stream ? S.mediaGain : S.srcGain;
+  }
+
+  /** 当前“正在响的那一路”的高通节点 */
+  function currentFilterNode() {
+    return S.stream ? S.mediaFilter : S.srcFilter;
   }
 
   /** 两条路径都停：缓冲的 source + 流式的元素 */
@@ -955,11 +1073,14 @@
     // ★ v1.3.0：交叉淡入淡出可能把增益留在中间，停的时候要拉回 1
     restoreGain(S.srcGain, 1);
     S.srcGain = null;
+    restoreEq(S.srcFilter); // ★ v1.3.2
+    S.srcFilter = null;
     if (S.el && S.stream) {
       try {
         S.el.pause();
       } catch (e) {}
       restoreGain(S.mediaGain, 1); // 流式那一路同理
+      restoreEq(S.mediaFilter);
     }
   }
 
@@ -970,9 +1091,10 @@
     stopSource();
     var src = S.ctx.createBufferSource();
     src.buffer = S.buffer;
-    // ★ v1.3.0：source → 自己的 gain → 总线。有了这一层，A 才能被淡出（不动用户的音量）
-    var g = newSourceGain();
-    if (g) src.connect(g);
+    // ★ v1.3.0/v1.3.2：source → 自己的 gain → 自己的高通 → 总线。
+    //   有了这两层，A 才能被淡出 / 扫频，而且**不动用户的音量**（S.gain 才是音量条）。
+    var chain = newSourceChain();
+    if (chain.gain) src.connect(chain.gain);
     else src.connect(S.gain);
     src.onended = function () {
       if (src === S.source) onNaturalEnd();
@@ -993,7 +1115,8 @@
       return;
     }
     S.source = src;
-    S.srcGain = g; // ★ v1.3.0
+    S.srcGain = chain.gain; // ★ v1.3.0
+    S.srcFilter = chain.filter; // ★ v1.3.2
     S.startCtxTime = at;
     S.startOffset = off; // 仍记「可听时间轴」→ position() 不用改
     log(
@@ -1380,9 +1503,12 @@
       S.trim = sc.trim || zeroTrim(); // ★ v1.2.0：从这一刻起 B 的裁剪量生效
       // ★ v1.3.0：B 自己的 gain 接管（它的淡入曲线已经走完了，值是 1）
       S.srcGain = sc.gain || null;
+      S.srcFilter = sc.filter || null; // ★ v1.3.2
       sc.gain = null;
+      sc.filter = null;
       sc.fadeA = null;
       sc.fadeB = null;
+      sc.eqA = null;
       S.startCtxTime = sc.startCtxTime;
       S.startOffset = 0;
       S.pausedAt = 0;
@@ -1875,6 +2001,7 @@
     //   （暂停/拖动都走这里，A 还要继续响）
     restoreGain(sc.fadeA, 1);
     restoreGain(sc.fadeB, 0);
+    restoreEq(sc.eqA); // ★ v1.3.2：扫频也要复位，否则 A 会一直闷着
     if (sc.phase === "armed") {
       try {
         sc.src.onended = null;
@@ -1904,6 +2031,7 @@
     log("[sched] ★ 押错 → 撤销预约（" + (why || "?") + "）｜ 原本预约 " + sc.trackId);
     restoreGain(sc.fadeA, 1); // ★ v1.3.0：押错时 A 还要继续响，增益必须复位
     restoreGain(sc.fadeB, 0);
+    restoreEq(sc.eqA); // ★ v1.3.2
     if (sc.phase === "armed") {
       try {
         sc.src.onended = null;
@@ -2050,15 +2178,16 @@
     // ★ 手写建 source —— **不能复用 `startSource()`**：它第 3 行无条件 `stopSource()`，会把正在播的 A 停掉。
     var src = S.ctx.createBufferSource();
     src.buffer = buf;
-    // ★ v1.3.0：B 走自己的 gain（交叉时要在它身上做淡入）
-    var gB = newSourceGain();
+    // ★ v1.3.0/v1.3.2：B 走自己的 gain + 高通（交叉时在它身上做淡入）
+    var chainB = newSourceChain();
+    var gB = chainB.gain;
     if (gB) src.connect(gB);
     else src.connect(S.gain);
     src.onended = function () {
       if (src === S.source) onNaturalEnd();
     };
     if (fadeSec > 0 && gB) {
-      // 淡入：从 0 起，等功率曲线到 1
+      // 淡入：从 0 起，按当前曲线（默认等功率）到 1
       if (!scheduleFade(gB.gain, bStart, fadeSec, true)) {
         restoreGain(gB, 1); // 曲线排不上就别淡了（宁可硬接）
       }
@@ -2081,6 +2210,12 @@
         if (scheduleFade(aNode.gain, bStart, fadeSec, false)) gA = aNode;
       }
     }
+    // ★ v1.3.2：A 的高通扫频（20Hz→900Hz），把低频让给新歌 —— DJ 过渡的招牌手法
+    var eqA = null;
+    if (fadeSec > 0 && xfadeEqEnabled()) {
+      var aFilter = currentFilterNode();
+      if (aFilter && scheduleEqSweep(aFilter, bStart, fadeSec)) eqA = aFilter;
+    }
 
     // ★ 刻意**不动 `S.source`**：A 的 `onended` 守卫是 `src === S.source`，
     //   一旦改成 B，A 播完时守卫失败 → `onNaturalEnd` 不触发 → 不发 `[end]` → UI 永不推进。
@@ -2091,8 +2226,10 @@
       duration: bdur,
       trim: btrim,
       gain: gB, // ★ v1.3.0：B 的增益节点（交接后成为 S.srcGain）
+      filter: chainB.filter, // ★ v1.3.2：B 的高通（交接后成为 S.srcFilter）
       fadeA: gA, // 被淡出的那一路（撤销时要复位）
       fadeB: gB && fadeSec > 0 ? gB : null,
+      eqA: eqA, // 被扫频的那一路（撤销时要复位）
       xfade: fadeSec,
       startCtxTime: bStart,
       endCtxTime: endCtxTime,
@@ -2105,7 +2242,9 @@
         " ｜ 模式=" + (mode || "seqStreak=" + S.seqStreak) +
         " ｜ 来源=" + (S.stream ? "流式" : "缓冲") +
         " ｜ B裁剪=首" + (btrim.start * 1000).toFixed(1) + "ms 尾" + (btrim.end * 1000).toFixed(1) + "ms" +
-        (fadeSec > 0 ? " ｜ 交叉=" + fadeSec.toFixed(2) + "s（等功率）" : " ｜ 交叉=关")
+        (fadeSec > 0
+          ? " ｜ 交叉=" + fadeSec.toFixed(2) + "s（曲线=" + xfadeCurveName() + (eqA ? "+扫频" : "") + "）"
+          : " ｜ 交叉=关")
     );
   }
 
@@ -3668,6 +3807,10 @@
       try {
         traceCommand(name, args);
       } catch (e) {}
+      // ★ v1.3.2：automix 探针（默认关；只记录不干预，见 probeWrap 的注释）
+      try {
+        callback = probeWrap(name, callback, args);
+      } catch (e) {}
       try {
         if (handle(name, callback, args)) return;
       } catch (e) {
@@ -3698,6 +3841,95 @@
     }
   }
 
+  /* ==================== v1.3.2 · automix 探针（只记录，不干预）==================== */
+
+  /**
+   * 为什么要有它（静态分析给的结论）：
+   *   本机客户端（3.1.42.205594）的渲染层里有一整套 automix **决策库**：
+   *   `AutomixEffectConfig0922`（AB 实验）＋ `mix_strategy` / `crossfade_start_time` /
+   *   `eq_type` / `tempo_values` / `mix_params` 的计划骨架，策略有
+   *   rhythm/vocal/atmosphere/accompaniment/silence/crossfade/custom。
+   *
+   *   但：① 原生模块（cloudmusic.dll / neaudio*.dll / audioeffects.dll）里
+   *   `mix_params` / `crossfade_start_time` / `r_s-line` / `strategy_rhythm` **全部 0 命中**；
+   *   ② 除它自己那个 bundle 之外，**没有任何 chunk 引用它**；
+   *   ③ 分析数据（bpm/repBpm/beat_array）没有任何抓取点。
+   *   → 这一版的决策层是「悬空的」：算得出计划，但没人给它喂数据、也没人消费。
+   *
+   * 所以先放一个探针盯着（等客户端把它接上/AB 命中，第一时间就能发现）：
+   *   ① `abtest.getList` 有没有真的下发 `AutomixEffectConfig0922`；
+   *   ② `audioplayer.*` 的**参数键名**有没有多出计划字段；
+   *   ③ 有没有出现没见过的命令名（例如 `audioplayer.setMixPlan`）。
+   *
+   * 开关：`window.__gpProbe = true`（默认关，零成本；同一形状只记一次，不会刷屏）
+   */
+  function probeOn() {
+    try {
+      return !!(typeof window !== "undefined" && window && window.__gpProbe);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 把一个参数树压成「键名 + 类型」的形状描述（最多两层，够看出计划字段） */
+  function probeShape(v, depth) {
+    if (v === null) return "null";
+    var t = typeof v;
+    if (t === "string") return "str(" + v.length + ")";
+    if (t !== "object") return t + "(" + String(v).slice(0, 24) + ")";
+    var isArr = Object.prototype.toString.call(v) === "[object Array]";
+    if (depth >= 2) return isArr ? "array" : "object";
+    var keys = [];
+    try {
+      for (var k in v) {
+        if (Object.prototype.hasOwnProperty.call(v, k)) keys.push(k);
+      }
+    } catch (e) {}
+    if (!keys.length) return isArr ? "array[0]" : "{}";
+    var out = [];
+    for (var i = 0; i < keys.length && i < 20; i++) {
+      var sv;
+      try {
+        sv = probeShape(v[keys[i]], depth + 1);
+      } catch (e) {
+        sv = "?";
+      }
+      out.push(keys[i] + ":" + sv);
+    }
+    return (isArr ? "[" : "{") + out.join(",") + (keys.length > 20 ? ",…" : "") + (isArr ? "]" : "}");
+  }
+
+  /** 包一层回调/记录参数形状。返回原回调（或包装后的）——不改变任何行为 */
+  function probeWrap(name, cb, args) {
+    if (!probeOn()) return cb;
+    try {
+      var shape = probeShape(args, 0);
+      var st = S.probeSeen || (S.probeSeen = {});
+      var isNew = !Object.prototype.hasOwnProperty.call(st, name);
+      if (isNew || st[name] !== shape) {
+        st[name] = shape;
+        // ★ 命令名放最前面、变化标记放中间：这样 `[probe] <命令> ｜` 可以稳定地数次数
+        log(
+          "[probe] " + name + " ｜ " + (isNew ? "首次" : "★ 形状变了") + " ｜ " + String(shape).slice(0, 800)
+        );
+      }
+    } catch (e) {}
+    // 回应只抓「和过渡 / AB 有关」的命令，避免把每个调用的返回值都刷进日志
+    if (typeof cb !== "function" || !/abtest\.|mix|effect|strategy|automix/i.test(name)) return cb;
+    return function () {
+      try {
+        var out;
+        try {
+          out = JSON.stringify(arguments[0]);
+        } catch (e) {
+          out = String(arguments[0]);
+        }
+        log("[probe] " + name + " ← " + String(out).slice(0, 900));
+      } catch (e) {}
+      return cb.apply(this, arguments);
+    };
+  }
+
   /* ==================== 启动 ==================== */
 
   plugin.onLoad(function () {
@@ -3705,8 +3937,9 @@
     loadXfade(); // ★ v1.3.0：读回上次设的交叉时长
     try {
       log(
-        "[xfade] 交叉淡入淡出=" + (xfadeSeconds() > 0 ? xfadeSeconds().toFixed(1) + "s（等功率）" : "关") +
-          " ｜ 开启方式：控制台 window.__gpXfade = 3（0~12s，会记住）"
+        "[xfade] 交叉淡入淡出=" + (xfadeSeconds() > 0 ? xfadeSeconds().toFixed(1) + "s（曲线=" + xfadeCurveName() +
+          (xfadeEqEnabled() ? "+扫频" : "") + "）" : "关") +
+          " ｜ window.__gpXfade = 3 开启（0~12s，会记住）｜ __gpXfadeCurve / __gpXfadeEq 可调曲线与扫频"
       );
     } catch (e) {}
     try {

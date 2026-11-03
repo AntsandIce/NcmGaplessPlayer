@@ -254,6 +254,52 @@ getPlaybackInfo {playId:"<id>_XXXXXX"} → {… playedTime:0, playId:"", result:
 
 ---
 
+## 4e. 交叉曲线 / 高通扫频 / automix 探针（v1.3.2）
+
+### 交叉曲线
+
+```js
+window.__gpXfadeCurve = "equal"    // 默认等功率（中点 -3dB）
+window.__gpXfadeCurve = "linear"   // 线性（中点 -6dB，仅对比用）
+window.__gpXfadeCurve = "s-line"   // smoothstep
+window.__gpXfadeCurve = "r_s-line"
+window.__gpXfadeCurve = "exp"
+window.__gpXfadeCurve = "step"     // 硬切式
+```
+
+名字和客户端 automix 的 `crossfade_line` 枚举一致，方便以后把计划里的曲线名直接透传。
+日志里会写 `交叉=3.00s（曲线=s-line）`。
+
+### 高通扫频（默认关）
+
+`window.__gpXfadeEq = true` 打开：交叉期间把出场的 A 从 20Hz 扫到 900Hz，
+日志变成 `交叉=3.00s（曲线=equal+扫频）`。
+
+- 链路里给每个 source / 流式元素**常驻**插了一个高通（平时 20Hz≈直通），所以扫频零爆音；
+- 暂停 / 拖动 / 押错都会把高通复位到 20Hz —— 否则这一首会一直闷着（有断言盯着）。
+
+### automix 探针
+
+`window.__gpProbe = true`，日志形如：
+
+```
+[probe] abtest.getList ｜ 首次 ｜ [{list:[{name:str(21),desc:str(12),…}]}]
+[probe] abtest.getList ← {"code":200,"data":{"automixEffect":{…}}}
+[probe] audioplayer.load ｜ 首次 ｜ [str(10),{musicurl:str(28),format:str(3),…}]
+[probe] audioplayer.load ｜ ★ 形状变了 ｜ [str(10),{musicurl:str(28),mix_strategy:str(18),…}]
+```
+
+**怎么读**：
+
+- 出现 `abtest.getList` 且回应里带 `automixEffect` → AB 开始下发了，automix 可能已经启用；
+- `audioplayer.*` 的键名里出现 `mix_strategy` / `crossfade_*` / `eq_type` → 客户端开始把计划交给播放器了
+  （这是「可以走复用决策」的信号）；
+- 出现没见过的命令名（例如 `audioplayer.setMixPlan`）→ 同上。
+
+同一形状只记一次，所以**不会刷屏**；形状一变（多了字段）会再记一行并标 `★ 形状变了`。
+
+---
+
 ## 5. 排查建议
 
 - 关键日志：`[sched] 预约 / 认领`、`[end] ★ 自然播完 → 无缝交接`、`[preload] 320k 接口`、`[nafetch]`。
@@ -262,5 +308,5 @@ getPlaybackInfo {playId:"<id>_XXXXXX"} → {… playedTime:0, playId:"", result:
   2. 看有没有 `[sched] 预约`：没有 = 门槛没过（模式 / 预测 / 时间窗）；
   3. 看 `[preload]` 是否出现 `320k 接口`，失败会自动退 128k。
 - 一次结束推进两首：确认 `getPlayedTime` / `getPlaybackInfo` 被插件接管（结束窗口内应有「自答」记录）。
-- 上线验证：`node test/harness.js` → `通过 393 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85）。
-  变异测试：`node test/mutate.js` → `变异点 84 个，抓住 84 个，漏网 0 个`。
+- 上线验证：`node test/harness.js` → `通过 415 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86）。
+  变异测试：`node test/mutate.js` → `变异点 87 个，抓住 87 个，漏网 0 个`。

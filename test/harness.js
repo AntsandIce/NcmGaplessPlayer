@@ -149,6 +149,33 @@ function createEnv(hooks) {
         disconnect() {},
       };
     },
+    /** ★ v1.3.2：交叉淡入淡出会用到高通扫频，假环境也得有 BiquadFilter */
+    createBiquadFilter() {
+      const param = (v) => ({
+        value: v,
+        events: [],
+        setValueAtTime(x, t) {
+          this.events.push({ type: "set", v: x, t });
+          this.value = x;
+        },
+        linearRampToValueAtTime(x, t) {
+          this.events.push({ type: "ramp", v: x, t });
+          this.value = x;
+        },
+        cancelScheduledValues() {
+          this.events = [];
+        },
+      });
+      const f = {
+        type: "lowpass",
+        frequency: param(350),
+        Q: param(1),
+        connect() {},
+        disconnect() {},
+      };
+      (ctx.__filters = ctx.__filters || []).push(f);
+      return f;
+    },
     createMediaElementSource(el) {
       meSrcCalls.push(el);
       return { connect() {}, disconnect() {} };
@@ -2691,7 +2718,7 @@ async function main() {
       await flush();
       e.flushTimers();
       ok(countLog(e, "★ 交叉预约") >= 1, "★★ 窗口跟着变宽（3s 的交叉必须提前 3s 就排）");
-      ok(countLog(e, "交叉=3.00s（等功率）") >= 1, "★★ 日志写明 3.00s 等功率");
+      ok(countLog(e, "交叉=3.00s（曲线=equal）") >= 1, "★★ 日志写明 3.00s、曲线=equal（等功率）");
       const t0 = 200.02 - 3;
       ok(Math.abs(Number(lastOf(e.started).at) - t0) < 0.02, "★★ B 提前 3s 起播（" + Number(lastOf(e.started).at).toFixed(3) + "）");
 
@@ -2938,6 +2965,143 @@ async function main() {
       ok(countLog(e, "试听片段"), "★★ 片段被识别");
       ok(countLog(e, "放弃（不影响播放）｜ track=1000") >= 1, "★★ 宁可不补，也不把半首塞进缓存");
       ok(countLog(e, "★ 已补成缓冲") === 0, "★★ 没有补成");
+    }
+  }
+
+  section("86. ★★ v1.3.2 交叉曲线可选（对齐客户端 automix 的 crossfade_line）+ 高通扫频 + automix 探针");
+  {
+    const curveNodes86 = (e) =>
+      (e.ctx.__gains || [])
+        .map((g) => ({ node: g, ev: g.gain.events.filter((x) => x.type === "curve") }))
+        .filter((x) => x.ev.length > 0);
+    const isRising86 = (ev) => ev.curve[0] < ev.curve[ev.curve.length - 1];
+    const pickRising = (e) => {
+      const n = curveNodes86(e).find((x) => isRising86(x.ev[0]));
+      return n ? n.ev[0].curve : null;
+    };
+
+    // ---- (a) 曲线预设 ----
+    {
+      // 默认：等功率（中点 ≈ 0.707）
+      const e0 = await seamlessEnv("playorder");
+      e0.win.__gpXfade = 3;
+      setLeft(e0, 3.2);
+      e0.tick();
+      await flush();
+      e0.flushTimers();
+      const cEq = pickRising(e0);
+      ok(!!cEq && Math.abs(cEq[Math.floor(cEq.length / 2)] - 0.707) < 0.05, "★★ 默认 equal：中点 ≈ 0.707");
+      ok(countLog(e0, "曲线=equal") >= 1, "★★ 日志写出曲线名");
+
+      // linear：中点 ≈ 0.5
+      const e1 = await seamlessEnv("playorder");
+      e1.win.__gpXfade = 3;
+      e1.win.__gpXfadeCurve = "linear";
+      setLeft(e1, 3.2);
+      e1.tick();
+      await flush();
+      e1.flushTimers();
+      const cLin = pickRising(e1);
+      ok(!!cLin && Math.abs(cLin[Math.floor(cLin.length / 2)] - 0.49) < 0.06, "★★ linear：中点 ≈ 0.5");
+      ok(countLog(e1, "曲线=linear") >= 1, "★★ 日志写明曲线=linear");
+
+      // s-line（smoothstep）：x≈0.25 处应当明显低于等功率的 0.38
+      const e2 = await seamlessEnv("playorder");
+      e2.win.__gpXfade = 3;
+      e2.win.__gpXfadeCurve = "s-line";
+      setLeft(e2, 3.2);
+      e2.tick();
+      await flush();
+      const cS = pickRising(e2);
+      ok(!!cS && cS[16] < 0.25, "★★ s-line：前段压得比等功率低（x≈0.25 时 " + (cS ? cS[16].toFixed(3) : "?") + "）");
+
+      // step：中点前是 0、之后是 1
+      const e3 = await seamlessEnv("playorder");
+      e3.win.__gpXfade = 3;
+      e3.win.__gpXfadeCurve = "step";
+      setLeft(e3, 3.2);
+      e3.tick();
+      await flush();
+      const cStep = pickRising(e3);
+      ok(!!cStep && cStep[10] === 0 && cStep[54] === 1, "★★ step：前半 0、后半 1（硬切式）");
+    }
+
+    // ---- (b) 高通扫频（DJ 过渡的招牌手法） ----
+    {
+      const e = await seamlessEnv("playorder");
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeEq = true;
+      setLeft(e, 3.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      const filters = (e.ctx.__filters || []).filter((f) => f.frequency.events.some((x) => x.type === "ramp"));
+      eq(filters.length, 1, "★★ 只有 A 那一路被扫频（B 不动）");
+      const evs = filters.length ? filters[0].frequency.events : [];
+      const setEv = evs.find((x) => x.type === "set");
+      const rampEv = evs.find((x) => x.type === "ramp");
+      eq(setEv && setEv.v, 20, "★★ 从 20Hz（直通）起");
+      eq(rampEv && rampEv.v, 900, "★★ 扫到 900Hz");
+      ok(!!rampEv && Math.abs(rampEv.t - (200.02 - 3 + 3)) < 0.05, "★★ 扫频时长 = 交叉时长");
+      ok(countLog(e, "+扫频") >= 1, "★★ 日志标出「+扫频」");
+
+      // 撤销（暂停）后必须复位 —— 否则这一首会一直闷着
+      e.channel.call("audioplayer.pause", null, []);
+      await flush();
+      eq(filters.length ? filters[0].frequency.value : -1, 20, "★★ 暂停后高通复位到 20Hz（不再闷）");
+    }
+
+    // ---- (c) 默认不扫频（会改音色，得用户自己开） ----
+    {
+      const e = await seamlessEnv("playorder");
+      e.win.__gpXfade = 3;
+      setLeft(e, 3.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      const ramps = (e.ctx.__filters || []).filter((f) => f.frequency.events.some((x) => x.type === "ramp"));
+      eq(ramps.length, 0, "★★ __gpXfadeEq 没开 → 一条扫频都不排");
+      eq(countLog(e, "+扫频"), 0, "★★ 日志里也不会写 +扫频");
+    }
+
+    // ---- (d) automix 探针：默认不打扰，开了才记（含「参数形状变了」） ----
+    {
+      const eOff = createEnv();
+      eOff.boot();
+      await flush();
+      eOff.channel.call("abtest.getList", () => {}, [{ list: [{ name: "AutomixEffectConfig0922" }] }]);
+      eOff.flushTimers();
+      eq(countLog(eOff, "[probe]"), 0, "★★ 默认关：一条探针日志都不写");
+
+      const eOn = createEnv({
+        onNative(name, cb) {
+          if (name === "abtest.getList" && typeof cb === "function") {
+            cb({ code: 200, data: { automixEffect: { enable: 1 } } });
+          }
+        },
+      });
+      eOn.win.__gpProbe = true;
+      eOn.boot();
+      await flush();
+      eOn.channel.call("abtest.getList", () => {}, [{ list: [{ name: "AutomixEffectConfig0922" }] }]);
+      eOn.flushTimers();
+      ok(countLog(eOn, "[probe] abtest.getList ｜") >= 1, "★★ 记下了 AB 请求的参数形状（能看出有没有问 AutomixEffectConfig0922）");
+      ok(countLog(eOn, "[probe] abtest.getList ←") >= 1, "★★ 也记下了回应（AB 到底有没有下发）");
+      ok(countLog(eOn, "automixEffect") >= 1, "★★ 回应里出现 automixEffect 字样");
+
+      // 同形状只记一次；形状一变就再记一次（这是「客户端开始塞计划字段」的探测器）
+      eOn.channel.call("audioplayer.load", () => {}, ["a", { musicurl: "http://x/a.mp3" }]);
+      eOn.channel.call("audioplayer.load", () => {}, ["a", { musicurl: "http://x/a.mp3" }]);
+      eOn.flushTimers();
+      eq(countLog(eOn, "[probe] audioplayer.load ｜"), 1, "★★ 同一形状只记一次（不刷屏）");
+      eOn.channel.call("audioplayer.load", () => {}, [
+        "a",
+        { musicurl: "http://x/a.mp3", mix_strategy: "strategy_crossfade", crossfade_start_time: 1234 },
+      ]);
+      eOn.flushTimers();
+      eq(countLog(eOn, "[probe] audioplayer.load ｜"), 2, "★★ 形状变了 → 再记一次");
+      ok(countLog(eOn, "[probe] audioplayer.load ｜ ★ 形状变了") >= 1, "★★ 明确标出「形状变了」");
+      ok(countLog(eOn, "mix_strategy:str(") >= 1, "★★ 新字段（mix_strategy）一眼可见 —— 这就是 automix 接上时的信号");
     }
   }
 
