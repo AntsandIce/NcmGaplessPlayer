@@ -603,6 +603,35 @@
       clearMetaTimer();
       var msg = (el.error && (el.error.message || "code " + el.error.code)) || "unknown";
       log("[stream] ★ 媒体错误 ｜ " + msg);
+      // ★ 3.x：客户端通过 audioplayer.load 给的是**加密 musicurl**（不是 URL），
+      //   <audio> 直接吃它多数时候能播，但部分曲目会 Format error → 表现为「加载失败」。
+      //   这里用插件自己的取址链路重试一次；仍失败才把错误抛给 UI。
+      if (isNcm3() && S.elRetryToken !== token) {
+        S.elRetryToken = token;
+        var tid = S.curTrackId;
+        log("[stream] 3.x：加密 token 不可播 → 改用自有地址重试 ｜ track=" + tid);
+        resolveUrl320(tid)
+          .catch(function () { return outerUrlFor(tid); })
+          .then(function (u) {
+            if (token !== S.loadToken) return;
+            try {
+              el.src = u;
+              el.load();
+              log("[stream] 重试 src=" + String(u).slice(0, 90));
+              armMetaTimer(token);
+            } catch (e) {
+              log("[stream] ★ 重试设置 src 失败 ｜ " + (e && e.message));
+              S.ready = false;
+              emitLoad(-1, String(msg));
+            }
+          })
+          .catch(function (e2) {
+            log("[stream] ★ 自有地址也不可用 ｜ " + (e2 && e2.message));
+            S.ready = false;
+            emitLoad(-1, String(msg));
+          });
+        return;
+      }
       S.ready = false;
       emitLoad(-1, String(msg));
     }
