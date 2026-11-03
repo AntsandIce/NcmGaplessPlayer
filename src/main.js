@@ -2470,6 +2470,7 @@
         var __q = (args && args[0]) || {};
         var __qid = typeof __q.playId === "string" ? __q.playId : "";
         var __qTrack = trackIdOf(__qid);
+
         var __mine = (__qTrack !== null) &&
           (__qTrack === S.loadedTrackId || __qTrack === S.curTrackId || (S.sched && S.sched.trackId === __qTrack));
         if (__mine && typeof cb === "function") {
@@ -2750,6 +2751,7 @@
         },
       });
       log("[guard] ✅ channel.call 已锁定（defineProperty）");
+
     } catch (e) {
       channel.call = wrapped;
       log("[guard] defineProperty 不可用，改用普通赋值 ｜ " + (e && e.message));
@@ -2789,6 +2791,7 @@
     } catch (e) {
       log("[mem] ★ 开机预载启动失败 ｜ " + (e && e.message));
     }
+
 
     // ★ 越早越好：先把「UI 事件处理器注册表」的兜底钩子装上
     installRegistryHook();
