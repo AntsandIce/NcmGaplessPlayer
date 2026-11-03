@@ -1405,6 +1405,8 @@
     var p = S.preload;
     if (!p || p.why !== "下一首") return;
     if (p.trackId === tid) {
+      // ★ 3.1.42：命中历史（随机模式下就靠它决定敢不敢预约无缝）
+      S.hitStreak = (S.hitStreak || 0) + 1;
       // 押中了 → 顺序可预测，计数清零（之前误判过的话在这里恢复）
       if (S.preloadNextOff) {
         S.preloadNextOff = false;
@@ -1416,6 +1418,7 @@
       S.preloadMisses = 0;
       return;
     }
+    S.hitStreak = 0;
     S.preloadMisses++;
     log(
       "[preload] ✗ 预测失败 " + S.preloadMisses + "/" + PRELOAD_MISS_LIMIT +
@@ -1704,8 +1707,15 @@
     // ③ 置信「顺序播放」：能读到模式就让它权威（⚠️ 单曲循环下 seqStreak 会冻结在高位）
     var mode = readPlayMode();
     if (mode !== null) {
-      if (mode !== "playonce" && mode !== "playorder") return;
-    } else if (S.seqStreak < 2) {
+      if (mode !== "playonce" && mode !== "playorder") {
+        // ★ 3.1.42：随机/心动模式下也未必不可预测 —— 只要**上一次「预载下一首」押中了**
+        //   （说明客户端这会儿是顺序推进），就允许预约；没命中就老实等流式接力。
+        if (!(isNcm3() && (S.hitStreak || 0) >= 1)) return;
+      }
+    } else if (!isNcm3() && S.seqStreak < 2) {
+      // ★ 3.1.42：3.x 读不到 NM_SETTING_PLAYER（localStorage 拿不到）→ 不能靠 seqStreak 等两首。
+      //   改为直接信任「预载槽 == 列表下一首 且 ready」这个已校验过的条件；
+      //   万一押错，setCurrentPlay 分支的 abortSeam / cancelSched 会把它撤销。
       return;
     }
 
