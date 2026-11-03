@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.1.0";
+  var VERSION = "1.3.1";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -407,6 +407,10 @@
     //   live    = 上一首已播完、下一首**已在响**、UI 还没发 load（~120ms 窗口）
     //   claimed = UI 的 load 到了、已认领，等首个 play
     sched: null,
+    /* ---- v1.3.0：交叉淡入淡出（P2）---- */
+    xfade: 0, // 交叉时长（秒）；0 = 关（默认，与 Spotify 一致：只做 gapless）
+    srcGain: null, // 当前缓冲 source 自己的增益（淡出用；不动总线 S.gain）
+    mediaGain: null, // 流式元素那一路的增益（同上）
     /* ---- v0.4.0 流式路径（<audio>）---- */
     el: null, // ★ 持久的 <audio>：createMediaElementSource 对同一元素只能调一次 → 全生命周期复用
     mediaSrc: null, // MediaElementSource → 接进 S.gain
@@ -418,7 +422,8 @@
     silentTick: 0, // 静音自检：连续读到 FFT 全 0 的次数
     silentSuspect: false, // 疑似被跨域静音（taint）→ 退回缓冲路径
     audioId: ["", ""], // [id, idStr]
-    duration: 0,
+    duration: 0, // ★ v1.2.0：**可听**时长（缓冲路径 = 解码时长 - trim.start - trim.end）
+    trim: null, // ★ v1.2.0：当前曲目的首尾裁剪 { start, end }（秒，缓冲时间轴）；流式/未就绪 = null
     startCtxTime: 0, // 本段开始时的 ctx.currentTime
     startOffset: 0, // 本段从曲目的第几秒开始
     paused: true,
@@ -443,6 +448,13 @@
     preload: null, // { trackId, why, status:"pending"|"ready"|"failed", buffer, promise, abort }
     preloadToken: 0, // 丢弃过期预载
     preloadState: "idle", // idle | fetching | decoding | ready | failed
+    // ★ v1.2.1：trackId → { start, end } 首尾裁剪量。按曲目缓存 —— 预载时算好，
+    //   起播/预约/认领时按 trackId 取（预载命中与「即时加载」共用同一份）。
+    trimCache: {},
+    // ★ v1.2.1：最近播过的缓冲（最多 2 首，见 recentPut）→ 切回来时不下载也不解码
+    recentBufs: [],
+    // ★ v1.3.1：正在后台把「流式那首」补成缓冲（存 trackId，防重复发起）
+    promoteBusy: null,
 
     /* ---- v0.2.10 自适应：播放顺序到底可不可预测 ---- */
     preloadMisses: 0, // 连续「预载下一首」押不中的次数
@@ -547,18 +559,22 @@
       El.preload = "auto";
       El.volume = 1; // 音量统一由 S.gain 控，别两处都调
       S.mediaSrc = S.ctx.createMediaElementSource(El);
-      S.mediaSrc.connect(S.gain); // mediaSrc → gain → analyser → destination（可视化照常）
+      // ★ v1.3.0：流式这一路也插一层自己的 gain，交叉淡入淡出时才能淡出「元素这一路」
+      S.mediaGain = S.ctx.createGain();
+      S.mediaSrc.connect(S.mediaGain);
+      S.mediaGain.connect(S.gain); // mediaSrc → mediaGain → gain → analyser → destination
     } catch (e) {
       log("[stream] ★ createMediaElementSource 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
       S.el = null;
       S.mediaSrc = null;
+      S.mediaGain = null;
       return null;
     }
     S.el = El;
     El.addEventListener("durationchange", function () {
       if (S.stream && S.el && isFinite(S.el.duration) && S.el.duration > 0) S.duration = S.el.duration;
     });
-    log("[stream] <audio> 已建好（mediaSrc → gain → analyser → destination）");
+    log("[stream] <audio> 已建好（mediaSrc → mediaGain → gain → analyser → destination）");
     return El;
   }
 
@@ -689,6 +705,7 @@
     var el = ensureEl();
     if (!el) return false;
     S.stream = true;
+    S.trim = null; // ★ v1.2.0：流式 =<audio>的原始时间轴，没法做首尾裁剪（也没有采样级控制）
     S.elToken = token;
     attachStreamEvents(token);
     armMetaTimer(token);
@@ -818,6 +835,111 @@
     }
   }
 
+  /* ==================== v1.3.0 · 交叉淡入淡出（P2）==================== */
+
+  /**
+   * Spotify 的 crossfade 是**等功率**（equal-power）交叉，不是线性：
+   *   淡出 cos(θ·π/2)、淡入 sin(θ·π/2)，θ 从 0 到 π/2。
+   *   两条曲线中点都是 -3dB，功率之和恒定；线性交叉中点会「塌一下」（音量听起来掉一截）。
+   *
+   * ⚠️ 与 v0.4.1 的「无缝预约」是同一条时间轴上的两种模式：
+   *   xfade = 0 → B 排在 A 的**结束采样**上（0 间隙，v0.4.1 行为，默认）
+   *   xfade > 0 → B 提前 `xf` 秒起播，两边各走一条等功率曲线（Spotify 的 crossfade）
+   */
+
+  var XFADE_MAX = 12; // Spotify 的上限就是 12s
+  var XFADE_KEY = "gaplessPlayer.xfade";
+  var XFADE_POINTS = 64;
+
+  /** 等功率曲线表（rising=true 是淡入：0→1） */
+  function equalPowerCurve(rising) {
+    var a = new Float32Array(XFADE_POINTS);
+    for (var i = 0; i < XFADE_POINTS; i++) {
+      var th = (i / (XFADE_POINTS - 1)) * Math.PI * 0.5;
+      a[i] = rising ? Math.sin(th) : Math.cos(th);
+    }
+    return a;
+  }
+
+  /**
+   * 当前生效的交叉时长（秒），0 = 关。
+   * 优先级：`window.__gpXfade`（运行时可改）> 存下来的设置（重启后还在）。
+   */
+  function xfadeSeconds() {
+    var v = S.xfade;
+    try {
+      if (typeof window !== "undefined" && window && typeof window.__gpXfade === "number") {
+        v = window.__gpXfade;
+        if (Number(S.xfade) !== Number(window.__gpXfade)) saveXfade(window.__gpXfade);
+      }
+    } catch (e) {}
+    v = Number(v);
+    if (!isFinite(v) || v <= 0) return 0;
+    if (v > XFADE_MAX) v = XFADE_MAX;
+    if (v < 0.5) return 0; // 太短没有意义，还不如硬接
+    return v;
+  }
+
+  function saveXfade(v) {
+    try {
+      S.xfade = Number(v) || 0;
+      localStorage.setItem(XFADE_KEY, String(S.xfade));
+    } catch (e) {}
+  }
+
+  function loadXfade() {
+    try {
+      var raw = localStorage.getItem(XFADE_KEY);
+      var v = Number(raw);
+      if (isFinite(v) && v > 0) S.xfade = Math.min(v, XFADE_MAX);
+    } catch (e) {}
+  }
+
+  /**
+   * 每个 source 自己的增益节点。
+   * ★ 交叉淡入淡出**只能动这里**：`S.gain` 是总线音量（用户音量条），
+   *   在它上面做曲线会把用户音量也一起改了。
+   */
+  function newSourceGain() {
+    try {
+      var g = S.ctx.createGain();
+      g.connect(S.gain);
+      return g;
+    } catch (e) {
+      log("[xfade] ★ 建 gain 失败 ｜ " + (e && e.message));
+      return null;
+    }
+  }
+
+  /** 从 t0 起用 xf 秒把 param 走一条等功率曲线（rising=true 淡入 / false 淡出） */
+  function scheduleFade(param, t0, xf, rising) {
+    if (!param || !(xf > 0)) return false;
+    try {
+      param.cancelScheduledValues(0); // ⚠️ 不清掉旧的，setValueCurveAtTime 会因「区间内有事件」抛错
+      param.setValueCurveAtTime(equalPowerCurve(rising), t0, xf);
+      return true;
+    } catch (e) {
+      log(
+        "[xfade] ★ " + (rising ? "淡入" : "淡出") + "排不上 ｜ " + (e && e.name) + ": " + (e && e.message)
+      );
+      return false;
+    }
+  }
+
+  /** 撤销预约 / 暂停 / 押错时：把被改过的增益拉回原值（否则 A 会一直以淡出后的音量播） */
+  function restoreGain(node, v) {
+    if (!node || !node.gain) return;
+    try {
+      node.gain.cancelScheduledValues(0);
+      node.gain.value = v;
+    } catch (e) {}
+  }
+
+  /** 当前“正在响的那一路”的增益节点（缓冲是 source 自己的，流式是元素的） */
+  function currentGainNode() {
+    return S.stream ? S.mediaGain : S.srcGain;
+  }
+
   /** 两条路径都停：缓冲的 source + 流式的元素 */
   function stopSource() {
     if (S.source) {
@@ -830,10 +952,14 @@
       } catch (e) {}
       S.source = null;
     }
+    // ★ v1.3.0：交叉淡入淡出可能把增益留在中间，停的时候要拉回 1
+    restoreGain(S.srcGain, 1);
+    S.srcGain = null;
     if (S.el && S.stream) {
       try {
         S.el.pause();
       } catch (e) {}
+      restoreGain(S.mediaGain, 1); // 流式那一路同理
     }
   }
 
@@ -844,25 +970,41 @@
     stopSource();
     var src = S.ctx.createBufferSource();
     src.buffer = S.buffer;
-    src.connect(S.gain);
+    // ★ v1.3.0：source → 自己的 gain → 总线。有了这一层，A 才能被淡出（不动用户的音量）
+    var g = newSourceGain();
+    if (g) src.connect(g);
+    else src.connect(S.gain);
     src.onended = function () {
       if (src === S.source) onNaturalEnd();
     };
     var at = when > 0 ? when : S.ctx.currentTime + 0.02;
+    // ★★ v1.2.0：offset 是「可听时间轴」上的秒数（UI / pausedAt / position() 都用它），
+    //   start() 要的是「缓冲时间轴」→ 必须 + trim.start。
+    //   同时把时长传到「可听末尾」为止（第 3 个参数）：尾部填充不会被播出来，
+    //   `onended` 也正好落在真正该结束的那个采样上（而不是填充之后）。
+    var tr = S.trim || zeroTrim();
+    var off = offset || 0;
+    var bufAt = off + tr.start;
+    var playDur = Math.max(0.02, S.duration - off);
     try {
-      src.start(at, offset || 0);
+      src.start(at, bufAt, playDur);
     } catch (e) {
       log("[play] ★ start 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
       return;
     }
     S.source = src;
+    S.srcGain = g; // ★ v1.3.0
     S.startCtxTime = at;
-    S.startOffset = offset || 0;
+    S.startOffset = off; // 仍记「可听时间轴」→ position() 不用改
     log(
       "[play] source.start ｜ at=" +
         at.toFixed(3) +
         " ｜ offset=" +
-        (offset || 0).toFixed(3) +
+        off.toFixed(3) +
+        " ｜ 缓冲偏移=" +
+        bufAt.toFixed(3) +
+        " ｜ 时长=" +
+        playDur.toFixed(3) +
         " ｜ ctxTime=" +
         S.ctx.currentTime.toFixed(3)
     );
@@ -1199,11 +1341,14 @@
       //   反过来写（先提升 B 再 stopSource）就会**把正在响的 B 停掉**。
       log(
         "[end] ★ 自然播完 → 无缝交接 ｜ A=" + S.curTrackId + " → B=" + sc.trackId +
-          " ｜ 来源=" + (S.stream ? "流式" : "缓冲")
+          " ｜ 来源=" + (S.stream ? "流式" : "缓冲") +
+          (sc.xfade ? " ｜ 交叉=" + sc.xfade.toFixed(2) + "s" : "")
       );
       // ★ v0.4.2：流式的「结束时刻」是从 `duration - currentTime` 推的。万一估晚了
       //   （VBR / 流式 metadata 的 duration 是估算值），`ended` 已经来了而 B 还排在将来
       //   → 立刻换一个新节点「现在起播」：宁可早 5ms，也不留一个空档。
+      //   ⚠️ v1.3.0：开了交叉时 `startCtxTime` 是「交叉起点」，本来就早于结束时刻，
+      //   所以这里的判断天然不会误触发（真触发了说明交叉根本没开始）。
       if (sc.startCtxTime > S.ctx.currentTime + 0.03) {
         try {
           sc.src.onended = null;
@@ -1212,12 +1357,15 @@
         } catch (e) {}
         var fix = S.ctx.createBufferSource();
         fix.buffer = sc.buffer;
-        fix.connect(S.gain);
+        if (sc.gain) fix.connect(sc.gain); // ★ v1.3.0：复用 B 的 gain（淡入曲线已经在它身上排好了）
+        else fix.connect(S.gain);
         fix.onended = function () {
           if (fix === S.source) onNaturalEnd();
         };
         try {
-          fix.start(S.ctx.currentTime + 0.005, 0);
+          // ★ v1.2.0：补起的节点也必须带 B 自己的裁剪（否则这一段会把 B 的首部静音播出来）
+          var fixTrim = sc.trim || zeroTrim();
+          fix.start(S.ctx.currentTime + 0.005, fixTrim.start, sc.duration);
         } catch (e2) {}
         sc.src = fix;
         sc.startCtxTime = S.ctx.currentTime + 0.005;
@@ -1229,6 +1377,12 @@
       S.source = sc.src;
       S.buffer = sc.buffer;
       S.duration = sc.duration;
+      S.trim = sc.trim || zeroTrim(); // ★ v1.2.0：从这一刻起 B 的裁剪量生效
+      // ★ v1.3.0：B 自己的 gain 接管（它的淡入曲线已经走完了，值是 1）
+      S.srcGain = sc.gain || null;
+      sc.gain = null;
+      sc.fadeA = null;
+      sc.fadeB = null;
       S.startCtxTime = sc.startCtxTime;
       S.startOffset = 0;
       S.pausedAt = 0;
@@ -1305,8 +1459,15 @@
     return list[k + 1];
   }
 
-  /** 走 LibEAPIRequest 查某首歌的播放地址 */
+  /** 走 LibEAPIRequest 查某首歌的播放地址（★ v1.2.1：并发只发一次，见 `once()`） */
   function resolveUrl(trackId) {
+    return once("eapi:" + trackId, function () {
+      return resolveUrlOnce(trackId);
+    });
+  }
+
+  /** 真正的取址实现（别直接调它 —— 走 `resolveUrl` 才有并发去重） */
+  function resolveUrlOnce(trackId) {
     return new Promise(function (resolve, reject) {
       var lib = null;
       try {
@@ -1503,6 +1664,9 @@
       } catch (e) {}
     }
     var tk = ++S.preloadToken;
+    // ★ v1.2.0：gapless 信息在这里解析、留到后面两个 .then 用 ——
+    //   ⚠️ 必须声明在**函数作用域**：放进去 `then(buf)` 里下一层就取不到了（会 ReferenceError → 预载永远失败）。
+    var ginfo = null;
     // AbortController 拿不到就安静退化（老 webview 没有它 → 退回旧行为，不抛错）
     var ac = null;
     try {
@@ -1515,38 +1679,67 @@
     S.preloadState = "fetching";
     var t0 = performance.now();
     log("[preload] 开始预载（" + (why || "?") + "）｜ track=" + trackId);
-    slot.promise = resolveUrl(trackId)
-      .then(function (url) {
-        if (tk !== S.preloadToken) return null;
-        return fetchBytes(url, ac ? ac.signal : null);
-      })
-      .catch(function (e) {
-        // ★ 3.x：LibEAPI 那条取址路在 3.x 上必然失败（扫到的是 webpack 模块工厂）→
-        //   320k 免签名接口 → outer/url(128k) → 原生网络取字节。
-        //   2.10.x 保持上游语义（失败直接抛给下游 → 退回流式），不多打请求。
-        if (!isNcm3()) throw e;
-        if (tk !== S.preloadToken) return null;
-        log("[preload] LibEAPI 不可用（" + (e && e.message) + "）→ 试 320k 免签名接口");
-        return resolveUrl320(trackId)
-          .then(function (url320) {
+    // ★ v1.2.1：这一首刚播过（缓冲还在 LRU 里）→ 直接把槽填成 ready，不下载也不解码。
+    //   真机证据：A→B→A 这种「切走再切回来」每次都会白下一整首（5~6MB）+ 重解 ~600ms。
+    var reuse = recentGet(trackId);
+    if (reuse) {
+      slot.status = "ready";
+      slot.buffer = reuse;
+      slot.trim = trimOf(trackId);
+      S.preloadState = "ready";
+      slot.promise = Promise.resolve(reuse);
+      log(
+        "[preload] ★ 复用刚播过的缓冲（不下载 / 不解码）｜ track=" + trackId + " ｜ " +
+          mb(reuse.length * reuse.numberOfChannels * 4)
+      );
+      return slot.promise;
+    }
+    // ★ v1.2.1：字节缓存命中就完全跳过「取址 + 下载」（真机实测同一首会被反复预载）
+    var cachedBytes = cacheGetBytes(trackId);
+    if (cachedBytes) log("[preload] ★ 字节缓存命中 → 跳过取址 + 下载 ｜ track=" + trackId);
+    slot.promise = (cachedBytes
+      ? Promise.resolve(cachedBytes)
+      : resolveUrl(trackId)
+          .then(function (url) {
             if (tk !== S.preloadToken) return null;
-            return fetchBytes(url320, ac ? ac.signal : null);
+            return fetchBytes(url, ac ? ac.signal : null);
           })
-          .catch(function (e2) {
+          .catch(function (e) {
+            // ★ 3.x：LibEAPI 那条取址路在 3.x 上必然失败（扫到的是 webpack 模块工厂）→
+            //   320k 免签名接口 → outer/url(128k) → 原生网络取字节。
+            //   2.10.x 保持上游语义（失败直接抛给下游 → 退回流式），不多打请求。
+            if (!isNcm3()) throw e;
             if (tk !== S.preloadToken) return null;
-            log("[preload] 320k 接口失败（" + (e2 && e2.message) + "）→ outer/url(128k) 兜底");
-            return fetchBytes(outerUrlFor(trackId), ac ? ac.signal : null).catch(function (e3) {
-              if (tk !== S.preloadToken) return null;
-              log("[preload] 128k 直链也失败（" + (e3 && e3.message) + "）→ 原生网络取字节");
-              return nativeFetchBytes(outerUrlFor(trackId));
-            });
-          });
-      })
+            log("[preload] LibEAPI 不可用（" + (e && e.message) + "）→ 试 320k 免签名接口");
+            return resolveUrl320(trackId)
+              .then(function (url320) {
+                if (tk !== S.preloadToken) return null;
+                return fetchBytes(url320, ac ? ac.signal : null);
+              })
+              .catch(function (e2) {
+                if (tk !== S.preloadToken) return null;
+                log("[preload] 320k 接口失败（" + (e2 && e2.message) + "）→ outer/url(128k) 兜底");
+                return fetchBytes(outerUrlFor(trackId), ac ? ac.signal : null).catch(function (e3) {
+                  if (tk !== S.preloadToken) return null;
+                  log("[preload] 128k 直链也失败（" + (e3 && e3.message) + "）→ 原生网络取字节");
+                  return nativeFetchBytes(outerUrlFor(trackId));
+                });
+              });
+          }))
       .then(function (buf) {
         if (!buf || tk !== S.preloadToken) return null;
         S.preloadState = "decoding";
         var ctx = ensureCtx();
         if (!ctx) throw new Error("没有 AudioContext");
+        // ★ v1.2.0：gapless 信息必须在 decode **之前**解析 —— decodeAudioData 会转移
+        //   这个 ArrayBuffer 的所有权，解完再读就 detach 了（读会抛）。
+        try {
+          ginfo = gaplessInfo(buf);
+        } catch (e) {}
+        // ★ v1.2.1：给「字节缓存」留一份副本（decode 会把 buf 本身 detach 掉）
+        try {
+          cachePutBytes(trackId, buf);
+        } catch (e) {}
         return ctx.decodeAudioData(buf).then(function (ab) {
           // ★ 3.x：解出来的时长若明显短于权威时长 → 这是试听/片段，丢掉（否则歌会在边界断掉）
           if (!isNcm3() || !ab) return ab;
@@ -1564,6 +1757,7 @@
         if (!ab || tk !== S.preloadToken) return null;
         slot.status = "ready";
         slot.buffer = ab;
+        slot.trim = noteTrim(trackId, ginfo, ab); // ★ v1.2.0：首尾裁剪（试听校验之后才裁，别影响判定）
         S.preloadState = "ready";
         log(
           "[preload] ★★ 预载就绪（" + (why || "?") + "）｜ track=" + trackId + " ｜ " + ab.duration.toFixed(1) + "s ｜ " +
@@ -1677,6 +1871,10 @@
     var sc = S.sched;
     if (!sc) return;
     S.sched = null;
+    // ★ v1.3.0：撤销时把 A 的增益拉回来 —— 否则它会被留在淡出中途的音量上
+    //   （暂停/拖动都走这里，A 还要继续响）
+    restoreGain(sc.fadeA, 1);
+    restoreGain(sc.fadeB, 0);
     if (sc.phase === "armed") {
       try {
         sc.src.onended = null;
@@ -1688,7 +1886,10 @@
         sc.src.disconnect();
       } catch (e) {}
     }
-    log("[sched] 撤销（" + (why || "?") + "）｜ track=" + sc.trackId + " ｜ 阶段=" + sc.phase);
+    log(
+      "[sched] 撤销（" + (why || "?") + "）｜ track=" + sc.trackId + " ｜ 阶段=" + sc.phase +
+        (sc.xfade ? " ｜ 交叉=" + sc.xfade.toFixed(2) + "s（已复位增益）" : "")
+    );
   }
 
   /**
@@ -1701,6 +1902,8 @@
     if (!sc) return;
     S.sched = null;
     log("[sched] ★ 押错 → 撤销预约（" + (why || "?") + "）｜ 原本预约 " + sc.trackId);
+    restoreGain(sc.fadeA, 1); // ★ v1.3.0：押错时 A 还要继续响，增益必须复位
+    restoreGain(sc.fadeB, 0);
     if (sc.phase === "armed") {
       try {
         sc.src.onended = null;
@@ -1734,6 +1937,7 @@
     S.paused = true;
     S.buffer = null;
     S.duration = 0;
+    S.trim = null; // ★ v1.2.0：押错了 → 裁剪量也跟着作废（下一首自己会重算）
     S.playedMs = 0;
     S.playStartedAt = 0;
   }
@@ -1789,39 +1993,78 @@
     }
 
     // ④ 时间窗 + 结束时刻
+    //   ★ v1.3.0：开了交叉淡入淡出时，窗口要**跟着变宽** —— 3s 的交叉必须在
+    //   还剩 ≥3s 的时候就把 B 排上，否则永远进不了这个窗口（旧窗口只有 1.5s）。
+    var xf = xfadeSeconds();
+    var winMax = Math.max(1.5, xf + 0.4);
     var left;
     var endCtxTime;
     if (S.stream) {
       // ★ v0.4.2：流式那一首也能预约（真机实测：不预约的话自然播完要卡 **503ms**）。
       //   `<audio>` 给不出「采样级」的结束时刻，但 `duration - currentTime` 在 Chrome 里是
       //   **按 last_time_update 插值算出来的**（不是 250ms 一跳），误差只有几毫秒；
-      //   而我们要排的只是 1.5s 以内的未来时刻，媒体时钟与 AudioContext 的漂移也可以忽略。
+      //   而我们要排的只是几秒以内的未来时刻，媒体时钟与 AudioContext 的漂移也可以忽略。
       //   ⚠️ 唯一不确定的是 `duration` 本身（VBR / 流式 metadata 可能是估算值）
       //   → 交接时还有一道「估晚了就立刻起播」的兜底（见 onNaturalEnd）。
       var ed = Number(S.el.duration);
       var ec = Number(S.el.currentTime);
       if (!isFinite(ed) || !isFinite(ec) || ed <= 0) return;
       left = ed - ec;
-      if (left < 0.3 || left > 1.5) return;
+      if (left < 0.3 || left > winMax) return;
       endCtxTime = S.ctx.currentTime + left;
     } else {
-      endCtxTime = S.startCtxTime + (S.buffer.duration - S.startOffset);
+      // ★ v1.2.0：用「可听时长」而不是 `S.buffer.duration` —— 否则会把 A 尾部那 10~40ms
+      //   填充也算成音乐，B 就晚进来那么一点点（正是 P0 要消掉的那段）。
+      endCtxTime = S.startCtxTime + (S.duration - S.startOffset);
       left = endCtxTime - S.ctx.currentTime;
-      if (left < 0.3 || left > 1.5) return;
+      if (left < 0.3 || left > winMax) return;
     }
 
     var buf = peekPreloadBuffer(nid);
     if (!buf) return;
 
+    // ★★ v1.2.0：B 自己的首尾裁剪 —— 绝不能套用 A 的（两首的 delay/padding 不一样）。
+    //   start(t0, btrim.start, bdur)：从 B 的「可听起点」起，只播「可听长度」，
+    //   于是 A 的最后一个可听采样 → B 的第一个可听采样，中间没有编码器补的静音。
+    var btrim = trimOf(nid);
+    var bdur = Math.max(0.02, buf.duration - btrim.start - btrim.end);
+
+    // ★ v1.3.0：交叉窗口。xf 受三件事约束：用户设的上限、A 还剩多少、B 有多长。
+    var bStart = endCtxTime;
+    var fadeSec = 0;
+    if (xf > 0) {
+      fadeSec = Math.min(xf, left - 0.05, bdur - 0.05);
+      if (fadeSec >= 0.5) {
+        bStart = endCtxTime - fadeSec;
+        if (bStart < S.ctx.currentTime + 0.05) {
+          // 排晚了（比如用户刚拖到结尾）→ 只能缩短交叉，宁短暂也不留空档
+          bStart = S.ctx.currentTime + 0.05;
+          fadeSec = endCtxTime - bStart;
+        }
+      } else {
+        fadeSec = 0; // 窗口不够 → 退回硬接（v0.4.1 行为）
+      }
+    }
+    if (fadeSec < 0.5) fadeSec = 0;
+
     // ★ 手写建 source —— **不能复用 `startSource()`**：它第 3 行无条件 `stopSource()`，会把正在播的 A 停掉。
     var src = S.ctx.createBufferSource();
     src.buffer = buf;
-    src.connect(S.gain);
+    // ★ v1.3.0：B 走自己的 gain（交叉时要在它身上做淡入）
+    var gB = newSourceGain();
+    if (gB) src.connect(gB);
+    else src.connect(S.gain);
     src.onended = function () {
       if (src === S.source) onNaturalEnd();
     };
+    if (fadeSec > 0 && gB) {
+      // 淡入：从 0 起，等功率曲线到 1
+      if (!scheduleFade(gB.gain, bStart, fadeSec, true)) {
+        restoreGain(gB, 1); // 曲线排不上就别淡了（宁可硬接）
+      }
+    }
     try {
-      src.start(endCtxTime, 0);
+      src.start(bStart, btrim.start, bdur);
     } catch (e) {
       log("[sched] ★ start 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
       try {
@@ -1829,22 +2072,40 @@
       } catch (e2) {}
       return;
     }
+
+    // ★ v1.3.0：A 的淡出（缓冲用 source 的 gain，流式用元素的 gain）
+    var gA = null;
+    if (fadeSec > 0) {
+      var aNode = currentGainNode();
+      if (aNode && aNode.gain) {
+        if (scheduleFade(aNode.gain, bStart, fadeSec, false)) gA = aNode;
+      }
+    }
+
     // ★ 刻意**不动 `S.source`**：A 的 `onended` 守卫是 `src === S.source`，
     //   一旦改成 B，A 播完时守卫失败 → `onNaturalEnd` 不触发 → 不发 `[end]` → UI 永不推进。
     S.sched = {
       src: src,
       trackId: nid,
       buffer: buf,
-      duration: buf.duration,
-      startCtxTime: endCtxTime,
+      duration: bdur,
+      trim: btrim,
+      gain: gB, // ★ v1.3.0：B 的增益节点（交接后成为 S.srcGain）
+      fadeA: gA, // 被淡出的那一路（撤销时要复位）
+      fadeB: gB && fadeSec > 0 ? gB : null,
+      xfade: fadeSec,
+      startCtxTime: bStart,
       endCtxTime: endCtxTime,
       phase: "armed",
       announced: false,
     };
     log(
-      "[sched] 预约 ｜ A=" + S.curTrackId + " → B=" + nid + " ｜ at=" + endCtxTime.toFixed(3) +
-        " ｜ 还剩 " + left.toFixed(2) + "s ｜ 模式=" + (mode || "seqStreak=" + S.seqStreak) +
-        " ｜ 来源=" + (S.stream ? "流式" : "缓冲")
+      "[sched] " + (fadeSec > 0 ? "★ 交叉预约" : "预约") + " ｜ A=" + S.curTrackId + " → B=" + nid + " ｜ at=" +
+        bStart.toFixed(3) + " ｜ 还剩 " + left.toFixed(2) + "s ｜ 结束 at=" + endCtxTime.toFixed(3) +
+        " ｜ 模式=" + (mode || "seqStreak=" + S.seqStreak) +
+        " ｜ 来源=" + (S.stream ? "流式" : "缓冲") +
+        " ｜ B裁剪=首" + (btrim.start * 1000).toFixed(1) + "ms 尾" + (btrim.end * 1000).toFixed(1) + "ms" +
+        (fadeSec > 0 ? " ｜ 交叉=" + fadeSec.toFixed(2) + "s（等功率）" : " ｜ 交叉=关")
     );
   }
 
@@ -1862,6 +2123,7 @@
     S.pausedAt = 0;
     S.duration = sc.duration;
     S.buffer = sc.buffer;
+    S.trim = sc.trim || zeroTrim(); // ★ v1.2.0：B 的首尾裁剪一并接管
     S.lastEmitPos = -1;
     S.pendingSeek = null;
     if (S.autoPlayTimer) {
@@ -2121,6 +2383,12 @@
    *  用来识别「试听片段」—— 该接口对不同曲目会回 br=320001/320006 等变体，
    *  光看 br 会把完整的 320k 误判成片段。 */
   function resolveDurationMs(trackId) {
+    return once("dur:" + trackId, function () {
+      return resolveDurationMsOnce(trackId);
+    });
+  }
+
+  function resolveDurationMsOnce(trackId) {
     var cache = S.durCache || (S.durCache = {});
     if (cache[trackId]) return Promise.resolve(cache[trackId]);
     return nativeFetchBytes("https://music.163.com/api/song/detail?ids=[" + trackId + "]", 12000).then(function (buf) {
@@ -2142,6 +2410,12 @@
   }
 
   function resolveUrl320(trackId) {
+    return once("url320:" + trackId, function () {
+      return resolveUrl320Once(trackId);
+    });
+  }
+
+  function resolveUrl320Once(trackId) {
     return nativeFetchBytes(api320Url(trackId), 15000).then(function (buf) {
       var txt = "";
       try {
@@ -2188,6 +2462,254 @@
       });
   }
 
+  /* ==================== v1.2.1 · 去重与复用（真机日志里的两笔浪费）==================== */
+
+  /**
+   * 同一个 key 的并发请求只真正发一次（多个调用方共享同一个 promise）。
+   *
+   * ★ 真机证据（v1.2.0 首跑日志，01:55:35）：`player.setCurrentPlay` 会先抢着解析一次
+   *   320k 地址，`startPreload` 又解析一次 → 同一个 id 的 `player/url` 与 `song/detail`
+   *   **各打了两遍**。`once()` 把并发合并成一次；**失败也清掉**，不会把一次失败记成永久结论。
+   */
+  var INFLIGHT = {};
+
+  function once(key, factory) {
+    if (INFLIGHT[key]) return INFLIGHT[key];
+    var p;
+    try {
+      p = factory();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+    INFLIGHT[key] = p;
+    function clear() {
+      if (INFLIGHT[key] === p) delete INFLIGHT[key];
+    }
+    p.then(clear, clear);
+    return p;
+  }
+
+  /**
+   * 下载过的字节（trackId → ArrayBuffer），LRU 最多 3 份（320k 约 6MB/份）。
+   * 真机证据：同一首会被反复预载（换槽 → 换回来），每次都白下一遍 5~6MB。
+   *
+   * ⚠️ 只给「预载」用：正常加载走的是客户端给的地址（3.x 是加密 token），
+   *    拿这里的字节会绕过「试听片段」校验，宁可少省一点也不能播半首。
+   * ⚠️ `decodeAudioData` 会 **detach** 传进去的 ArrayBuffer → 交出/存下的都得是副本。
+   */
+  var BYTES_CACHE_MAX = 3;
+  var BYTES_CACHE = {}; // trackId -> { buf, seq }
+  var bytesSeq = 0;
+
+  /** 全局缓存开关：`window.__gpCache = false` → 字节缓存与最近缓冲都停用（省内存 / 排查用） */
+  function cacheEnabled() {
+    try {
+      if (typeof window !== "undefined" && window && window.__gpCache === false) return false;
+    } catch (e) {}
+    return true;
+  }
+
+  /** 逃生开关：`window.__gpBytesCache = false` → 只关字节缓存 */
+  function bytesCacheEnabled() {
+    if (!cacheEnabled()) return false;
+    try {
+      if (typeof window !== "undefined" && window && window.__gpBytesCache === false) return false;
+    } catch (e) {}
+    return true;
+  }
+
+  function cacheGetBytes(trackId) {
+    if (!bytesCacheEnabled()) return null;
+    var e = BYTES_CACHE[trackId];
+    if (!e || !e.buf || typeof e.buf.slice !== "function") return null;
+    e.seq = ++bytesSeq; // LRU：取用即刷新
+    try {
+      return e.buf.slice(0);
+    } catch (err) {
+      return null;
+    }
+  }
+
+  function cachePutBytes(trackId, buf) {
+    if (!buf || trackId === null || trackId === undefined) return;
+    if (typeof buf.slice !== "function") return;
+    if (!bytesCacheEnabled()) return;
+    try {
+      BYTES_CACHE[trackId] = { buf: buf.slice(0), seq: ++bytesSeq };
+    } catch (e) {
+      return;
+    }
+    var keys = [];
+    for (var k in BYTES_CACHE) {
+      if (Object.prototype.hasOwnProperty.call(BYTES_CACHE, k)) keys.push(k);
+    }
+    keys.sort(function (a, b) {
+      return BYTES_CACHE[a].seq - BYTES_CACHE[b].seq;
+    });
+    for (var i = 0; i < keys.length - BYTES_CACHE_MAX; i++) delete BYTES_CACHE[keys[i]];
+  }
+
+  /**
+   * 「刚刚播过的那几首」的缓冲（最多 2 首 / 合计 ≤160MB）。
+   * 真机证据：切歌像换台（A→B→A→B→C→B）时，同一首会反复下载 + 解码
+   * （日志里 `[trim] track=X` 出现 4 次 = 解了 4 遍）。这里把最近播过的缓冲留住，
+   * 再回到它时**不下载也不解码**。
+   *
+   * ⚠️ 内存：每首 320k 的 3 分钟歌解出来约 50MB。2 首都留下 → 最坏情况
+   *    「当前 + 预载 + 2 首最近」= 4 份。所以按字节预算封顶，超了就丢最旧的。
+   */
+  var RECENT_MAX = 2;
+  var RECENT_BUDGET = 160 * 1024 * 1024; // 两首 4~5 分钟的歌（各约 70MB）刚好放下
+
+  function recentGet(trackId) {
+    if (!cacheEnabled()) return null;
+    var list = S.recentBufs || [];
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].trackId === trackId && list[i].buffer) {
+        // LRU：命中的挪到最前
+        if (i > 0) {
+          var e = list.splice(i, 1)[0];
+          list.unshift(e);
+        }
+        return list[0].buffer;
+      }
+    }
+    return null;
+  }
+
+  function recentPut(trackId, buffer) {
+    if (!buffer || trackId === null || trackId === undefined) return;
+    if (!cacheEnabled()) return;
+    var bytes = (buffer.length || 0) * (buffer.numberOfChannels || 1) * 4;
+    if (!bytes || bytes > RECENT_BUDGET) return; // 单首就超预算 → 干脆不留
+    var list = S.recentBufs || (S.recentBufs = []);
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (list[i].trackId === trackId) list.splice(i, 1);
+    }
+    list.unshift({ trackId: trackId, buffer: buffer, bytes: bytes });
+    var total = 0;
+    for (var k = 0; k < list.length; k++) total += list[k].bytes;
+    while (list.length > RECENT_MAX || total > RECENT_BUDGET) {
+      var drop = list.pop();
+      if (!drop) break;
+      total -= drop.bytes;
+    }
+  }
+
+  /** 只查「字节缓存里有没有」，不复制（复制 6MB 只为了判断存在与否太浪费） */
+  function hasCachedBytes(trackId) {
+    if (!bytesCacheEnabled()) return false;
+    var e = BYTES_CACHE[trackId];
+    return !!(e && e.buf);
+  }
+
+  /* ==================== v1.3.1 · 把「流式那一首」补成缓冲 ==================== */
+
+  /**
+   * 为什么要有它（v1.2.1 留下的缺口）：
+   *   两级缓存（字节缓存 / 最近缓冲）都只在**缓冲路径**上生效 ——
+   *   而 `<audio>` 流式播放**不产生 AudioBuffer**，元素被切走之后什么都不剩。
+   *   于是「随机播放听过的歌再切回来」还得从头拉一遍流（1~3s），也永远当不了交叉的 B。
+   *
+   * 做法：这首**真的听了 ≥8 秒**之后，在后台用插件自己的取址链路下一份 + 解码，
+   *      塞进 `S.recentBufs`。代价是一次 ~6MB 的下载（这份内容本来就会被重放一遍），
+   *      换来「切回来秒开」+「能参与交叉」。
+   *
+   * ⚠️ 必须走和预载**同一套试听校验**：付费/VIP 曲目 320k 接口只给 64s 片段，
+   *   把片段塞进缓存 = 下次直接播半首。宁可放弃，也不能播半首。
+   * 逃生开关：`window.__gpPromote = false`。
+   */
+  var PROMOTE_AFTER_SEC = 8;
+
+  function promoteEnabled() {
+    try {
+      if (typeof window !== "undefined" && window && window.__gpPromote === false) return false;
+    } catch (e) {}
+    return true;
+  }
+
+  /** 这首「真听了」多少毫秒（暂停期间不计，playClockStart/Stop 维护） */
+  function livePlayedMs() {
+    return Number(S.playedMs || 0) + (S.playStartedAt ? performance.now() - S.playStartedAt : 0);
+  }
+
+  /** 后台把某首下载 + 解码成 AudioBuffer（带试听校验）；**不碰预载槽** */
+  function fetchDecoded(trackId) {
+    var ginfo = null;
+    var cached = cacheGetBytes(trackId);
+    var p = cached
+      ? Promise.resolve(cached)
+      : resolveUrl(trackId)
+          .catch(function (e) {
+            // 2.10 保持上游语义（失败就放弃）；3.x 退到免签名 320k 接口
+            if (!isNcm3()) throw e;
+            return resolveUrl320(trackId);
+          })
+          .then(function (u) {
+            if (!u) throw new Error("没拿到地址");
+            return fetchBytes(u, null);
+          });
+    return p
+      .then(function (buf) {
+        var ctx = ensureCtx();
+        if (!ctx) throw new Error("没有 AudioContext");
+        try {
+          ginfo = gaplessInfo(buf);
+        } catch (e) {}
+        cachePutBytes(trackId, buf); // decode 会 detach → 先留副本
+        return ctx.decodeAudioData(buf);
+      })
+      .then(function (ab) {
+        if (!isNcm3() || !ab) return ab;
+        return resolveDurationMs(trackId)
+          .catch(function () {
+            return 0;
+          })
+          .then(function (dtMs) {
+            if (dtMs && ab.duration && dtMs / 1000 - ab.duration > 3) {
+              throw new Error(
+                "解码时长 " + ab.duration.toFixed(1) + "s 短于实际 " + (dtMs / 1000).toFixed(1) + "s（试听片段），不补"
+              );
+            }
+            return ab;
+          });
+      })
+      .then(function (ab) {
+        if (ab) noteTrim(trackId, ginfo, ab);
+        return ab;
+      });
+  }
+
+  function maybePromoteStream() {
+    if (!promoteEnabled()) return;
+    if (S.promoteBusy) return;
+    if (!S.stream || !S.ready || S.paused || !S.el) return;
+    var tid = S.curTrackId;
+    if (tid === null || tid === undefined) return;
+    var played = livePlayedMs();
+    if (played < PROMOTE_AFTER_SEC * 1000) return;
+    if (recentGet(tid)) return; // 缓冲已经在手里，不用补
+    if (hasCachedBytes(tid)) return; // 字节有了 → 下次预载直接解码，别现在再下一份
+    S.promoteBusy = tid;
+    var t0 = performance.now();
+    log("[promote] 流式那首已听 " + (played / 1000).toFixed(1) + "s → 后台补成缓冲 ｜ track=" + tid);
+    fetchDecoded(tid)
+      .then(function (ab) {
+        if (!ab) return;
+        recentPut(tid, ab);
+        log(
+          "[promote] ★ 已补成缓冲（切回来秒开，也能当交叉的 B）｜ track=" + tid + " ｜ " +
+            mb(ab.length * ab.numberOfChannels * 4) + " ｜ 耗时 " + (performance.now() - t0).toFixed(0) + "ms"
+        );
+      })
+      .catch(function (e) {
+        log("[promote] 放弃（不影响播放）｜ track=" + tid + " ｜ " + (e && e.message));
+      })
+      .then(function () {
+        if (S.promoteBusy === tid) S.promoteBusy = null;
+      });
+  }
+
   function readLocal(path) {
     return Promise.resolve()
       .then(function () {
@@ -2200,6 +2722,398 @@
         if (r && typeof r.arrayBuffer === "function") return r.arrayBuffer();
         throw new Error("readFile 返回类型不认识");
       });
+  }
+
+  /* ==================== v1.2.0 · 首尾裁剪（P0：MP3 priming / padding）==================== */
+
+  /**
+   * 为什么需要它（Spotify 那套 gapless 里最容易漏掉的一层）：
+   *   MP3 是有损帧格式，编码器会在**开头补一段静音**（encoder delay / priming），
+   *   在**结尾补填充**（padding）。解码出来是「静音 + 音乐 + 静音」，
+   *   直接把两首首尾相接，接缝处就多出 **~25ms 空白** —— 比原来的 195ms 小得多，
+   *   所以「听不出来」，但它确实还不是 0。FLAC 样本数精确，天然没有这段。
+   *
+   * ★★ 决定实现方式的关键事实：**Chromium 自己可能已经裁过了**。
+   *   它底层是 ffmpeg，ffmpeg 的 mp3 解复用会读 LAME 标签并设置 skip_samples，
+   *   解码时就把开头那段丢掉了。所以「照 LAME 声明值硬裁」有可能**把真音乐裁掉**。
+   *   → 本实现**不猜**：用解码后的波形自己验（开头/结尾是不是真静音），
+   *     LAME 声明值只用来定上限、并打一行 `Δ=` 日志与「理论时长」对拍。
+   *
+   * 三道保险：
+   *   ① 只裁**真静音**（|x| < 1e-4 ≈ -80 dBFS）。安静的前奏/气声不会被吃掉；
+   *   ② 每边封顶：有 LAME 头 40ms（encoder 13ms + decoder 约 12ms，再留余量），
+   *      没有 LAME 头 20ms；FLAC 不裁（样本精确，多出来的是作者自己的静音）；
+   *   ③ `window.__gpTrim = false` 一键关掉，**改了立刻生效，不用出包**。
+   *
+   * 时间轴约定（改这块代码前先读）：
+   *   `S.trim.start/end` 是「缓冲时间轴」上的裁剪量；`S.duration` 与 `position()` /
+   *   `startOffset` 一律用**可听时间轴**（= 缓冲时间轴 - trim.start）。
+   *   所以 `startSource(offset)` 必须把 offset 换算成 `offset + trim.start` 才交给 start()。
+   */
+
+  var TRIM_MAX_START = 0.04; // 开头最多裁 40ms（有 LAME 声明时）
+  var TRIM_MAX_END = 0.04; // 结尾最多裁 40ms
+  var TRIM_MAX_UNKNOWN = 0.02; // 没有 gapless 信息时，每边只敢裁 20ms
+  var TRIM_SILENCE = 1e-4; // 「真静音」阈值（≈ -80 dBFS）
+  var TRIM_MIN = 0.0005; // 小于 0.5ms 视为没裁，免得日志里全是 0.1ms 的噪音
+  var TRIM_CACHE_MAX = 64; // 裁剪结果缓存条数上限（每首 ~40 字节，防无限增长）
+
+  /** MPEG 版本（2 bit）→ 采样率表；索引非法时该位置为 0（= 保留/非法） */
+  var MP3_SR = { "3": [44100, 48000, 32000], "2": [22050, 24000, 16000], "0": [11025, 12000, 8000] };
+
+  function trimEnabled() {
+    try {
+      if (typeof window !== "undefined" && window && window.__gpTrim === false) return false;
+    } catch (e) {}
+    return true;
+  }
+
+  /**
+   * ★ v1.2.1：作品自身的首尾静音要不要一起裁？**默认不裁**。
+   *   理由（真机 1.2.0 首跑日志）：这台机器上 ffmpeg 已经把 MP3 的编码器填充裁干净了
+   *   （所有曲目 Δ=0.0ms、首=0.0ms），此时波形里还能探到的静音属于作品本身 ——
+   *   Spotify 的 gapless 只裁填充，不动作品内容，所以这里默认只裁「填充」那一档。
+   *   想要「连作品静音也削掉」（接缝更紧）→ 控制台 `window.__gpTrimPad = true`。
+   */
+  var TRIM_PAD_DEFAULT = false;
+
+  function trimPadEnabled() {
+    try {
+      if (typeof window !== "undefined" && window && typeof window.__gpTrimPad === "boolean") {
+        return window.__gpTrimPad;
+      }
+    } catch (e) {}
+    return TRIM_PAD_DEFAULT;
+  }
+
+  function zeroTrim() {
+    return { start: 0, end: 0 };
+  }
+
+  /**
+   * 从 MP3 字节里读 LAME 的 delay / padding（单位：采样）。找不到 → null。
+   *
+   * 结构（公开规范，别自己拍脑袋）：
+   *   ID3v2（可选）→ 第一个 MPEG 帧头 → 帧内 "Xing"/"Info"
+   *   → flags 后的可选字段（frames / bytes / TOC(100B) / quality）
+   *   → LAME 标签 → 标签 +21 起 3 字节 = delay(12bit) + padding(12bit)
+   *     delay   = (b21 << 4) | (b22 >>> 4)
+   *     padding = ((b22 & 0x0F) << 8) | b23
+   */
+  function parseMp3Gapless(u8) {
+    var n = u8.length;
+    var i = 0;
+    // 跳过 ID3v2（"ID3" + 版本 2B + flags + 同步安全整数大小 4B）
+    if (n > 10 && u8[0] === 0x49 && u8[1] === 0x44 && u8[2] === 0x33) {
+      var sz = ((u8[6] & 0x7f) << 21) | ((u8[7] & 0x7f) << 14) | ((u8[8] & 0x7f) << 7) | (u8[9] & 0x7f);
+      i = 10 + sz + (u8[5] & 0x10 ? 10 : 0); // flags & 0x10 → 还有 10 字节 footer
+      if (i < 0 || i >= n) return null;
+    }
+    // 找第一个帧同步 0xFFEx（ID3 里可能塞了封面，所以不能只看偏移 0）
+    var frame = -1;
+    var limit = Math.min(n - 4, i + 65536);
+    for (var k = i; k < limit; k++) {
+      if (u8[k] === 0xff && (u8[k + 1] & 0xe0) === 0xe0) {
+        frame = k;
+        break;
+      }
+    }
+    if (frame < 0) return null;
+
+    var h1 = u8[frame + 1];
+    var h2 = u8[frame + 2];
+    var verBits = (h1 >> 3) & 3; // 3=MPEG1 / 2=MPEG2 / 0=MPEG2.5 / 1=保留
+    var srTab = MP3_SR[String(verBits)];
+    if (!srTab) return null;
+    var sr = srTab[(h2 >> 2) & 3];
+    if (!sr) return null;
+    var spf = verBits === 3 ? 1152 : 576; // MPEG1 Layer III = 1152，MPEG2/2.5 = 576
+
+    // 帧内找 "Xing"/"Info"（帧头 4B 之后是 side info，最多再往后 200B）
+    var x = -1;
+    var xEnd = Math.min(n - 8, frame + 200);
+    for (var j = frame + 4; j < xEnd; j++) {
+      if (u8[j] === 0x58 && u8[j + 1] === 0x69 && u8[j + 2] === 0x6e && u8[j + 3] === 0x67) {
+        x = j; // "Xing"
+        break;
+      }
+      if (u8[j] === 0x49 && u8[j + 1] === 0x6e && u8[j + 2] === 0x66 && u8[j + 3] === 0x6f) {
+        x = j; // "Info"
+        break;
+      }
+    }
+    if (x < 0) return null;
+
+    var p = x + 4;
+    var flags = ((u8[p] << 24) | (u8[p + 1] << 16) | (u8[p + 2] << 8) | u8[p + 3]) >>> 0;
+    p += 4;
+    var frames = 0;
+    if (flags & 1) {
+      frames = ((u8[p] << 24) | (u8[p + 1] << 16) | (u8[p + 2] << 8) | u8[p + 3]) >>> 0;
+      p += 4;
+    }
+    if (flags & 2) p += 4; // bytes
+    if (flags & 4) p += 100; // TOC
+    if (flags & 8) p += 4; // quality
+    if (p + 24 > n) return null;
+
+    // LAME 标签第一个字节是编码器名（"LAME"/"Lavc"/"GOGO"…）→ 必须是可打印 ASCII
+    if (u8[p] < 0x20 || u8[p] > 0x7e) return null;
+    var delay = (u8[p + 21] << 4) | (u8[p + 22] >> 4);
+    var padding = ((u8[p + 22] & 0x0f) << 8) | u8[p + 23];
+    if (delay > 4000 || padding > 4000) return null; // 明显是别的数据，别信
+
+    return {
+      codec: "mp3",
+      sr: sr,
+      delay: delay,
+      padding: padding,
+      // 理论样本数：帧数 × 每帧样本 - 首尾补的。只用于日志对拍，不参与裁剪决策
+      samples: frames ? frames * spf - delay - padding : 0,
+    };
+  }
+
+  /** FLAC：STREAMINFO 里有精确样本数 → 天生无缝，返回它只为了日志对拍 */
+  function parseFlacInfo(u8) {
+    if (u8.length < 42) return null;
+    if (u8[0] !== 0x66 || u8[1] !== 0x4c || u8[2] !== 0x61 || u8[3] !== 0x43) return null; // "fLaC"
+    var b = 18; // 4("fLaC") + 4(块头) + 10(min/max block/frame size) = STREAMINFO 的第 10 字节
+    var sr = (u8[b] << 12) | (u8[b + 1] << 4) | (u8[b + 2] >> 4);
+    var total =
+      (u8[b + 3] & 0x0f) * 4294967296 +
+      ((u8[b + 4] << 24) >>> 0) +
+      (u8[b + 5] << 16) +
+      (u8[b + 6] << 8) +
+      u8[b + 7];
+    if (!sr || !total) return null;
+    return { codec: "flac", sr: sr, delay: 0, padding: 0, samples: total };
+  }
+
+  /** 把各种形态的字节统一成 Uint8Array（拿不到 → null） */
+  function asBytes(bytes) {
+    if (!bytes) return null;
+    try {
+      if (typeof Uint8Array !== "undefined" && bytes instanceof Uint8Array) return bytes;
+      if (typeof ArrayBuffer !== "undefined" && bytes instanceof ArrayBuffer) return new Uint8Array(bytes);
+      if (bytes.buffer instanceof ArrayBuffer) {
+        return new Uint8Array(bytes.buffer, bytes.byteOffset || 0, bytes.byteLength || 0);
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  /** 解析 gapless 信息：FLAC 先认（"fLaC" 在偏移 0，ID3 封面里的假 "fLaC" 骗不到它） */
+  function gaplessInfo(bytes) {
+    var u8 = asBytes(bytes);
+    if (!u8 || u8.length < 64) return null;
+    try {
+      return parseFlacInfo(u8) || parseMp3Gapless(u8);
+    } catch (e) {
+      log("[trim] ★ 解析异常 ｜ " + (e && e.message));
+      return null;
+    }
+  }
+
+  /** 取每个声道的 Float32 数据；拿不到（验证台的假 buffer / 老实现）→ null */
+  function channelData(ab) {
+    if (!ab || typeof ab.getChannelData !== "function") return null;
+    var ch = ab.numberOfChannels || 1;
+    var out = [];
+    try {
+      for (var c = 0; c < ch; c++) {
+        var d = ab.getChannelData(c);
+        if (!d || typeof d.length !== "number") return null;
+        out.push(d);
+      }
+    } catch (e) {
+      return null;
+    }
+    return out.length ? out : null;
+  }
+
+  /** 开头连续真静音的长度（秒），最多看到 maxSec */
+  function silenceHead(ab, maxSec) {
+    var fin = channelData(ab);
+    if (!fin) return 0;
+    var sr = ab.sampleRate || 44100;
+    var ch = fin.length;
+    var n = Math.min(fin[0].length, Math.ceil(Math.max(maxSec, 0) * sr));
+    var i = 0;
+    for (; i < n; i++) {
+      var loud = false;
+      for (var c = 0; c < ch; c++) {
+        var v = fin[c][i];
+        if (v > TRIM_SILENCE || v < -TRIM_SILENCE) {
+          loud = true;
+          break;
+        }
+      }
+      if (loud) break;
+    }
+    return i / sr;
+  }
+
+  /** 结尾连续真静音的长度（秒），最多看到 maxSec */
+  function silenceTail(ab, maxSec) {
+    var fin = channelData(ab);
+    if (!fin) return 0;
+    var sr = ab.sampleRate || 44100;
+    var ch = fin.length;
+    var total = fin[0].length;
+    var n = Math.min(total, Math.ceil(Math.max(maxSec, 0) * sr));
+    var i = 0;
+    for (; i < n; i++) {
+      var idx = total - 1 - i;
+      var loud = false;
+      for (var c = 0; c < ch; c++) {
+        var v = fin[c][idx];
+        if (v > TRIM_SILENCE || v < -TRIM_SILENCE) {
+          loud = true;
+          break;
+        }
+      }
+      if (loud) break;
+    }
+    return i / sr;
+  }
+
+  /**
+   * 把「解析出来的声明值」+「解码后的真实波形」合成两份裁剪量：
+   *
+   *   enc = 编码器/解码器残留的填充（**必须裁**，不然接缝处是空白）
+   *   pad = 作品自身的首尾静音（**默认不裁**，见 TRIM_PAD_DEFAULT）
+   *
+   * 为什么要分开：真机日志（v1.2.0 首跑）显示这台机器上 ffmpeg **已经把填充裁干净了**
+   * （所有曲目 Δ=0.0ms、首=0.0ms），此时波形里还能探到的静音就是作品自己的 ——
+   * 把它也削掉虽然让接缝更紧，但已经越过了 Spotify gapless 的语义（它只削填充）。
+   * 所以默认只裁 enc，pad 留一个开关（`window.__gpTrimPad = true`）。
+   */
+  function fitTrim(info, ab) {
+    var zero = zeroTrim();
+    if (!ab) return { enc: zero, pad: zero, note: "没有 buffer", deltaMs: null };
+    if (info && info.codec === "flac") {
+      return {
+        enc: zeroTrim(),
+        pad: zeroTrim(),
+        note: "FLAC 样本精确（" + info.samples + "），不裁",
+        deltaMs: null,
+      };
+    }
+    var hasLame = !!(info && info.codec === "mp3" && (info.delay || info.padding));
+    var capS = hasLame ? TRIM_MAX_START : TRIM_MAX_UNKNOWN;
+    var capE = hasLame ? TRIM_MAX_END : TRIM_MAX_UNKNOWN;
+    // 多扫 5ms：静音正好等于上限时也要能探到边界，否则会把「刚好 40ms」误判成「>=40ms」
+    var foundS = Math.min(silenceHead(ab, capS + 0.005), capS);
+    var foundE = Math.min(silenceTail(ab, capE + 0.005), capE);
+    if (foundS < TRIM_MIN) foundS = 0;
+    if (foundE < TRIM_MIN) foundE = 0;
+    if (ab.duration - foundS - foundE < 1) {
+      return { enc: zeroTrim(), pad: zeroTrim(), note: "太短，不裁", deltaMs: null };
+    }
+
+    // ★ Δ = 解码时长 - LAME 理论时长：≈0 → 解码器已经裁过；≈(delay+padding) → 没裁
+    var deltaMs = null;
+    if (info && info.samples && info.sr) deltaMs = (ab.duration - info.samples / info.sr) * 1000;
+
+    var encS = 0, encE = 0, padS = 0, padE = 0, note;
+    if (!hasLame) {
+      // 没有声明值 → 无法区分，只能把「探到的静音」当成残留填充（上限 20ms/边）
+      encS = foundS;
+      encE = foundE;
+      note = "无 gapless 信息 → 按波形裁残留（每边 ≤" + TRIM_MAX_UNKNOWN * 1000 + "ms）";
+    } else if (deltaMs !== null && Math.abs(deltaMs) < 3) {
+      encS = 0;
+      encE = 0;
+      padS = foundS;
+      padE = foundE;
+      note = "解码器已裁（Δ=" + deltaMs.toFixed(1) + "ms）→ 探到的都是作品静音";
+    } else {
+      var wantS = info.delay / info.sr;
+      var wantE = info.padding / info.sr;
+      encS = Math.min(foundS, wantS);
+      padS = foundS - encS;
+      encE = Math.min(foundE, wantE);
+      padE = foundE - encE;
+      note =
+        "解码器未裁（Δ=" + (deltaMs === null ? "?" : deltaMs.toFixed(1) + "ms") + "）→ 按声明值裁填充";
+    }
+    return {
+      enc: { start: encS, end: encE },
+      pad: { start: padS, end: padE },
+      note: note,
+      deltaMs: deltaMs,
+    };
+  }
+
+  /**
+   * 算一首歌的首尾裁剪 → 记进 `S.trimCache[trackId]` → 打一行 `[trim]` 日志。
+   * `info` 是**解码前**从字节里解析出来的 gapless 信息（可为 null：拿不到字节 / 没有 LAME 头）。
+   *
+   * ⚠️ 为什么让调用方先解析、而不是传字节进来：`decodeAudioData` 对 ArrayBuffer 是
+   *    **转移所有权**的（解码完原 buffer 就 detach，再读会抛），所以解析必须发生在 decode 之前。
+   */
+  function noteTrim(trackId, info, ab) {
+    if (!ab) return zeroTrim();
+    var c = S.trimCache || (S.trimCache = {});
+    if (!trimEnabled()) {
+      c[trackId] = zeroTrim();
+      log("[trim] 已关闭（window.__gpTrim=false）｜ track=" + trackId);
+      return zeroTrim();
+    }
+    var fit = fitTrim(info, ab);
+    var padOn = trimPadEnabled();
+    var tr = {
+      start: fit.enc.start + (padOn ? fit.pad.start : 0),
+      end: fit.enc.end + (padOn ? fit.pad.end : 0),
+    };
+    c[trackId] = { start: tr.start, end: tr.end };
+
+    // 缓存别无限长（真机一次会话可能听过上百首）
+    var keys = [];
+    for (var k in c) {
+      if (Object.prototype.hasOwnProperty.call(c, k)) keys.push(k);
+    }
+    for (var i = 0; i < keys.length - TRIM_CACHE_MAX; i++) delete c[keys[i]];
+
+    var ms = function (v) {
+      return (v * 1000).toFixed(1);
+    };
+    log(
+      "[trim] track=" +
+        trackId +
+        " ｜ 编码=" +
+        ((info && info.codec) || "?") +
+        (info && info.codec === "mp3" ? " ｜ LAME delay=" + info.delay + " pad=" + info.padding : "") +
+        " ｜ " +
+        fit.note +
+        (fit.deltaMs === null ? "" : " ｜ Δ=" + fit.deltaMs.toFixed(1) + "ms") +
+        (info && info.samples && info.sr ? " ｜ 理论=" + (info.samples / info.sr).toFixed(3) + "s" : "") +
+        " ｜ 解码=" +
+        ab.duration.toFixed(3) +
+        "s ｜ 填充=首" +
+        ms(fit.enc.start) +
+        " 尾" +
+        ms(fit.enc.end) +
+        "ms（必裁）｜ 作品静音=首" +
+        ms(fit.pad.start) +
+        " 尾" +
+        ms(fit.pad.end) +
+        "ms" +
+        (padOn ? "（已裁）" : "（不裁，__gpTrimPad 未开）") +
+        " ｜ 可听=" +
+        (ab.duration - tr.start - tr.end).toFixed(3) +
+        "s"
+    );
+    return { start: tr.start, end: tr.end };
+  }
+
+  /** 取某首的裁剪量（没算过 / 没就绪 → 0，行为与旧版一致） */
+  function trimOf(trackId) {
+    var c = S.trimCache;
+    if (!c || trackId === null || trackId === undefined) return zeroTrim();
+    var t = c[trackId];
+    if (!t) return zeroTrim();
+    return { start: Number(t.start) || 0, end: Number(t.end) || 0 };
   }
 
   /** 缓冲就绪：落状态、发 onLoad / onPlayProgress，再决定「起播」还是「等 UI」 */
@@ -2233,14 +3147,22 @@
     }
     S.stream = false;
     S.buffer = ab;
-    S.duration = ab.duration;
+    // ★★ v1.2.0：可听时长 = 解码时长 - 首尾填充；`trim` 按 trackId 从缓存取（预载时已算好）
+    var tr = trimOf(S.curTrackId);
+    S.trim = tr;
+    S.duration = Math.max(0.05, ab.duration - tr.start - tr.end);
     S.pausedAt = 0;
     S.ready = true;
     S.loadedTrackId = S.curTrackId; // ★ 标记「这一首已经就绪」
+    // ★ v1.2.1：留一份「刚刚播过」的引用（最多 2 首）——
+    //   真机上「切走再切回来」会重新下载 + 解码一整首，而缓冲其实刚在手里。
+    recentPut(S.curTrackId, ab);
     // ★ v0.2.9：不再有「开机续播」—— 记忆只记「哪首歌」，不记「播到哪儿」。
     log(
       "[load] ★★ 就绪" + (tag ? "（" + tag + "）" : "") + " ｜ 时长=" +
-        ab.duration.toFixed(2) + "s ｜ " + ab.numberOfChannels + "ch @" + ab.sampleRate +
+        S.duration.toFixed(2) + "s（解码 " + ab.duration.toFixed(2) + "s，裁首 " +
+        (tr.start * 1000).toFixed(1) + "ms / 尾 " + (tr.end * 1000).toFixed(1) + "ms）｜ " +
+        ab.numberOfChannels + "ch @" + ab.sampleRate +
         " ｜ 内存=" + mb(ab.length * ab.numberOfChannels * 4) + " MB"
     );
     afterReady();
@@ -2261,6 +3183,7 @@
     S.paused = true;
     S.pausedAt = 0;
     S.duration = 0;
+    S.trim = null; // ★ v1.2.0：这一首的裁剪量等 onBufferReady 时按 trackId 取
     S.buffer = null;
     S.lastEmitPos = -1;
     S.playedMs = 0;
@@ -2299,6 +3222,17 @@
     if (pre) {
       log("[preload] ★★ 命中！跳过下载 + 解码");
       onBufferReady(token, pre, "预载命中");
+      return;
+    }
+
+    // ★ v1.2.1：刚刚播过的那一首又回来了 → 缓冲还在，跳过下载 + 解码
+    var rb = recentGet(trackId);
+    if (rb) {
+      log(
+        "[load] ★ 最近缓冲命中（同一首切回来）→ 跳过下载 + 解码 ｜ " +
+          mb(rb.length * rb.numberOfChannels * 4)
+      );
+      onBufferReady(token, rb, "最近缓冲命中");
       return;
     }
 
@@ -2352,8 +3286,14 @@
       if (!ctx) throw new Error("没有 AudioContext");
       log("[load] 开始解码…");
       var t = performance.now();
+      // ★ v1.2.0：先解析 gapless 信息（decode 会转移 buffer 所有权），解码后再按波形验裁
+      var ginfo = null;
+      try {
+        ginfo = gaplessInfo(buf);
+      } catch (e) {}
       return ctx.decodeAudioData(buf).then(function (ab) {
         log("[load] ★ 解码完成 ｜ " + (performance.now() - t).toFixed(0) + "ms");
+        noteTrim(S.curTrackId, ginfo, ab); // normalLoad 没有 trackId 参数 → 用「当前曲目」
         return ab;
       });
     })
@@ -2761,7 +3701,14 @@
   /* ==================== 启动 ==================== */
 
   plugin.onLoad(function () {
-    log("=== GaplessPlayer v" + VERSION + " (缓冲 + 流式) 启动 ===");
+    log("=== GaplessPlayer v" + VERSION + " (缓冲 + 流式 + 首尾裁剪" + (xfadeSeconds() > 0 ? " + 交叉淡入淡出" : "") + ") 启动 ===");
+    loadXfade(); // ★ v1.3.0：读回上次设的交叉时长
+    try {
+      log(
+        "[xfade] 交叉淡入淡出=" + (xfadeSeconds() > 0 ? xfadeSeconds().toFixed(1) + "s（等功率）" : "关") +
+          " ｜ 开启方式：控制台 window.__gpXfade = 3（0~12s，会记住）"
+      );
+    } catch (e) {}
     try {
       log("[env] origin=" + location.origin + " ｜ AudioContext=" + typeof AudioContext + " ｜ legacyNativeCmder=" + typeof legacyNativeCmder);
       log("[env] betterncm.isMRBNCM(前)=" + String(betterncm.isMRBNCM));
@@ -2826,6 +3773,8 @@
       if (!S.ready) return;
       // ★ v0.4.1：每 100ms 看一眼该不该「提前把下一首排到结束采样上」（真无缝）
       maybeScheduleSeamless();
+      // ★ v1.3.1：流式那首听够一会儿就后台补成缓冲（切回来秒开，也能当交叉的 B）
+      maybePromoteStream();
       // ★ v0.4.1：live 窗口（A 已播完、B 已在响、UI 还没 load）→ **抑制进度**：
       //   此刻 S.audioId 还是 A 的，但 position() 已经是 B 的（从 0 起）→ 发出去会让进度条闪。
       if (S.sched && S.sched.phase === "live") return;

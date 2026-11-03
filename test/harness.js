@@ -100,12 +100,41 @@ function createEnv(hooks) {
     state: "running",
     destination: { __node: "destination" },
     createGain() {
+      // ★ v1.3.0：参数要能记录自动化事件（交叉淡入淡出就是靠 setValueCurveAtTime）
+      const param = {
+        value: 1,
+        events: [], // { type:"curve"|"set", t, dur, curve }
+        setValueAtTime(v, t) {
+          param.events.push({ type: "set", v, t });
+          param.value = v;
+        },
+        setValueCurveAtTime(curve, t, dur) {
+          // 与真实现一致：区间内已有事件（含重叠的曲线）就抛 —— 这样才测得出「先 cancel」那条
+          for (const e of param.events) {
+            const eT = e.t || 0;
+            const eEnd = e.type === "curve" ? eT + e.dur : eT;
+            if (eEnd > t && eT < t + dur) {
+              const err = new Error("overlapping automation event");
+              err.name = "NotSupportedError";
+              throw err;
+            }
+          }
+          param.events.push({ type: "curve", curve, t, dur, at: t, len: dur });
+          param.value = curve[curve.length - 1];
+        },
+        cancelScheduledValues(t) {
+          param.events = param.events.filter((e) => (e.t || 0) < t);
+        },
+      };
       const g = {
-        gain: { value: 1 },
+        gain: param,
         connect() {},
         disconnect() {},
       };
-      ctx.__gain = g;
+      // ★ ctx.__gain 永远指向**第一个**建的 gain（= 插件的主音量总线），
+      //   后面的（每个 source 自己的、流式元素的）进 __gains，方便交叉淡入淡出的用例去找。
+      if (!ctx.__gain) ctx.__gain = g;
+      (ctx.__gains = ctx.__gains || []).push(g);
       return g;
     },
     createAnalyser() {
@@ -130,9 +159,9 @@ function createEnv(hooks) {
         onended: null,
         connect() {},
         disconnect() {},
-        start(at, off) {
-          s.__started = { at, off };
-          started.push({ at, off, node: s });
+        start(at, off, dur) {
+          s.__started = { at, off, dur };
+          started.push({ at, off, dur, node: s });
         },
         stop() {
           stopped.push(s);
@@ -142,6 +171,11 @@ function createEnv(hooks) {
     },
     decodeAudioData(buf) {
       decoded.push(buf ? buf.byteLength : -1);
+      // ★ v1.2.0：允许用例注入「假 AudioBuffer」（要测首尾裁剪，就得能控制波形与时长）
+      if (hooks && typeof hooks.decode === "function") {
+        const r = hooks.decode(buf);
+        if (r) return Promise.resolve(r);
+      }
       return Promise.resolve({
         duration: 200,
         numberOfChannels: 2,
@@ -267,7 +301,7 @@ function createEnv(hooks) {
       status: 200,
       type: "basic",
       headers: { get: () => "audio/mpeg" },
-      arrayBuffer: () => Promise.resolve(new ArrayBuffer(1024 * 1024)),
+      arrayBuffer: () => Promise.resolve(hooks && hooks.bytes ? hooks.bytes : new ArrayBuffer(1024 * 1024)),
     };
     return new Promise((resolve, reject) => {
       if (signal && signal.aborted) {
@@ -1764,7 +1798,7 @@ async function main() {
    */
   async function seamlessEnv(mode, opts) {
     opts = opts || {};
-    const e = createEnv();
+    const e = createEnv(opts.hooks);
     if (mode) e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode }));
     if (opts.eapiUrl) e.eapi.url = opts.eapiUrl;
     e.boot();
@@ -2182,7 +2216,8 @@ async function main() {
    * @param jsonBody  player/url 接口的返回
    * @param durMs     可选：song/detail 的权威时长；不给就按 size/br 自洽推算
    */
-  function env3x(jsonBody, durMs) {
+  function env3x(jsonBody, durMs, opts) {
+    opts = opts || {};
     const d0 = (jsonBody && jsonBody.data && jsonBody.data[0]) || {};
     const implied = d0.size && d0.br ? Math.round((d0.size / (d0.br / 8)) * 1000) : 158600;
     const dur = durMs || implied;
@@ -2194,11 +2229,13 @@ async function main() {
         const a0 = args && args[0];
         const first = Array.isArray(a0) ? (a0[0] || {}) : (a0 || {});
         const u = String(first.url || "");
-        if (u.indexOf("/api/song/detail") >= 0) {
-          cb({ blob: JSON.stringify({ songs: [{ id: 0, duration: dur }] }) });
-        } else {
-          cb({ blob: JSON.stringify(jsonBody) });
-        }
+        const body = u.indexOf("/api/song/detail") >= 0
+          ? { blob: JSON.stringify({ songs: [{ id: 0, duration: dur }] }) }
+          : { blob: JSON.stringify(jsonBody) };
+        // ★ opts.defer：把回包推迟一个微任务 —— 用来制造「真并发」，
+        //   验证 `once()` 确实把同一个 id 的两次请求合并了（同步回答的话它们根本不会重叠）。
+        if (opts.defer) Promise.resolve().then(() => cb(body));
+        else cb(body);
       },
     });
     e.APP_CONF.appver = "3.1.42.205594";
@@ -2304,6 +2341,606 @@ async function main() {
     eq(el.src, "http://cdn.example/retry.mp3", "★★ 媒体错误后改用自有 320k 地址重挂");
     ok(countLog(e80, "改用自有地址重试") >= 1, "★★ 日志写明走了重试");
   }
+  /* ---------- 81. v1.2.0 P0：MP3 首尾裁剪 ---------- */
+
+  /**
+   * 合成一个「带 Xing + LAME 标签」的 MP3 字节串 —— 只为了让解析器有东西可读，
+   * 不是有效的音频（不需要是：裁剪解析只看头部结构）。
+   * 结构：帧头 4B + side info 32B + "Xing" + flags + frames + bytes + TOC(100B)
+   *       + quality(4B) + LAME 标签（delay/padding 在标签 +21 起 3 字节）。
+   */
+  function makeLameMp3(opts) {
+    const delay = opts.delay;
+    const padding = opts.padding;
+    const frames = opts.frames || 1000;
+    const buf = new Uint8Array(512);
+    let p = 0;
+    // MPEG1 / Layer III / 128kbps / 44.1kHz / 立体声
+    buf[p++] = 0xff;
+    buf[p++] = 0xfb;
+    buf[p++] = 0x90;
+    buf[p++] = 0x00;
+    p += 32; // side info
+    "Xing".split("").forEach((c) => (buf[p++] = c.charCodeAt(0)));
+    const put32 = (v) => {
+      buf[p++] = (v >>> 24) & 0xff;
+      buf[p++] = (v >>> 16) & 0xff;
+      buf[p++] = (v >>> 8) & 0xff;
+      buf[p++] = v & 0xff;
+    };
+    put32(0x0f); // flags: frames | bytes | TOC | quality
+    put32(frames);
+    put32(123456); // bytes
+    p += 100; // TOC
+    put32(0); // quality
+    const lame = p;
+    "LAME3.100".split("").forEach((c) => (buf[p++] = c.charCodeAt(0)));
+    p = lame + 21;
+    buf[p++] = (delay >> 4) & 0xff;
+    buf[p++] = ((delay & 0x0f) << 4) | ((padding >> 8) & 0x0f);
+    buf[p++] = padding & 0xff;
+    return buf.buffer;
+  }
+
+  /** 合成一个「开头/结尾各一段真静音、中间是有声音」的假 AudioBuffer */
+  function mkBuf(opts) {
+    const sr = opts.sr || 44100;
+    const duration = opts.duration;
+    const n = Math.round(duration * sr);
+    const head = Math.round((opts.head || 0) * sr);
+    const tail = Math.round((opts.tail || 0) * sr);
+    const data = new Float32Array(n);
+    for (let i = head; i < n - tail; i++) data[i] = i % 2 ? 0.5 : -0.5; // 满幅方波 = 绝不可能是静音
+    return {
+      duration: duration,
+      sampleRate: sr,
+      numberOfChannels: 1,
+      length: n,
+      getChannelData() {
+        return data;
+      },
+    };
+  }
+
+  /** 合成一个最小 FLAC（"fLaC" + STREAMINFO，sr=44100、total=132300） */
+  function makeFlacInfo() {
+    const b = new Uint8Array(128); // 真实 FLAC 都有几 KB；这里只要过「长度 >= 64」的解析门槛
+    "fLaC".split("").forEach((c, i) => (b[i] = c.charCodeAt(0)));
+    b[4] = 0x00; // 块类型 0 = STREAMINFO（且是最后一个块）
+    b[7] = 34; // 块长度
+    b[18] = 0x0a; // sr = (0x0a<<12)|(0xc4<<4)|(0x4) = 44100
+    b[19] = 0xc4;
+    b[20] = 0x40;
+    b[21] = 0x00; // total samples 36bit = 132300
+    b[22] = 0x00;
+    b[23] = 0x02;
+    b[24] = 0x04;
+    b[25] = 0xcc;
+    return b.buffer;
+  }
+
+  section("81. ★★ v1.2.0/v1.2.1 P0：MP3 首尾裁剪（填充必裁 / 作品静音默认不裁）");
+  {
+    // 一套自洽的数值：解码全长 = 帧数 × 1152；理论可听 = 全长 - delay - padding。
+    // 这样「解码器没裁」那一档的期望值是精确的（可听时长 == 理论时长）。
+    const SR = 44100, SPF = 1152, FRAMES = 1000, DELAY = 576, PAD = 1000;
+    const LAME = makeLameMp3({ delay: DELAY, padding: PAD, frames: FRAMES });
+    const FULL = (FRAMES * SPF) / SR; // ≈26.122s（含首尾填充）
+    const AUDIBLE = (FRAMES * SPF - DELAY - PAD) / SR; // ≈26.087s（理论可听）
+    const DS = DELAY / SR; // ≈13.1ms
+    const PE = PAD / SR; // ≈22.7ms
+
+    /** 跑到「预载命中 → 已起播」，并让日志落盘 */
+    async function playWith(env, url) {
+      env.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+      env.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+      await flush();
+      await flush();
+      env.channel.call("audioplayer.load", null, ["1000_1_3136952023-x", { songId: 1000, musicurl: url }]);
+      await flush();
+      env.channel.call("audioplayer.play", () => {}, ["1000_1_3136952023-x", "t|resume|T"]);
+      await flush();
+      env.flushTimers();
+    }
+
+    // ---- (a) 解码器没裁（Δ ≈ delay+padding）→ 填充必须裁，可听 == 理论 ----
+    {
+      const ea = createEnv({ bytes: LAME, decode: () => mkBuf({ duration: FULL, head: DS, tail: PE }) });
+      ea.boot();
+      await flush();
+      await playWith(ea, "http://cdn.example/t1.mp3");
+
+      const ld = ea.last("Load");
+      ok(
+        Math.abs(argAt(ld, 1).duration - AUDIBLE) < 0.002,
+        "★★ 可听时长 == LAME 理论时长（" + Number(argAt(ld, 1).duration).toFixed(3) + "s）"
+      );
+      ok(countLog(ea, "解码器未裁") >= 1, "★★ 判定为「解码器未裁」→ 按声明值裁填充");
+      ok(countLog(ea, "（必裁）") >= 1, "★★ 日志把「填充」标成必裁");
+      const s = lastOf(ea.started);
+      ok(
+        Math.abs(s.off - DS) < 0.002,
+        "★★ start 从填充之后起播（off≈13.1ms，实际 " + Number(s.off).toFixed(4) + "）"
+      );
+      ok(
+        Math.abs(s.dur - AUDIBLE) < 0.002,
+        "★★ start 的 duration 只到「可听末尾」（实际 " + Number(s.dur).toFixed(4) + "）"
+      );
+    }
+
+    // ---- (b) 解码器已裁（Δ≈0）+ 作品静音 → 默认**不裁**（忠实 Spotify 的 gapless 语义） ----
+    {
+      const eb = createEnv({ bytes: LAME, decode: () => mkBuf({ duration: AUDIBLE, head: 0.04, tail: 0.03 }) });
+      eb.boot();
+      await flush();
+      await playWith(eb, "http://cdn.example/t2.mp3");
+      const ld = eb.last("Load");
+      ok(Math.abs(argAt(ld, 1).duration - AUDIBLE) < 0.002, "★★ 作品静音默认不裁 → 时长不变（一点真内容都不吃）");
+      ok(countLog(eb, "作品静音=首40.0 尾30.0ms（不裁") >= 1, "★★ 日志写明「探到的是作品静音，不裁」");
+      const s = lastOf(eb.started);
+      eq(s.off, 0, "★★ start 仍从 0 开始");
+    }
+
+    // ---- (b2) 打开 __gpTrimPad → 作品静音也一起削掉（想要更紧的接缝） ----
+    {
+      const eb2 = createEnv({ bytes: LAME, decode: () => mkBuf({ duration: AUDIBLE, head: 0.04, tail: 0.03 }) });
+      eb2.win.__gpTrimPad = true;
+      eb2.boot();
+      await flush();
+      await playWith(eb2, "http://cdn.example/t2b.mp3");
+      const ld = eb2.last("Load");
+      ok(
+        Math.abs(argAt(ld, 1).duration - (AUDIBLE - 0.07)) < 0.002,
+        "★★ __gpTrimPad=true → 作品静音也裁（" + Number(argAt(ld, 1).duration).toFixed(3) + "s）"
+      );
+      ok(countLog(eb2, "（已裁）") >= 1, "★★ 日志标明作品静音已裁");
+      const s = lastOf(eb2.started);
+      ok(Math.abs(s.off - 0.04) < 0.002, "★★ start 从 40ms 处起（" + Number(s.off).toFixed(4) + "）");
+    }
+
+    // ---- (c) 没有 LAME 头 → 只按波形裁，且每边最多 20ms ----
+    {
+      const ec = createEnv({ bytes: new ArrayBuffer(512), decode: () => mkBuf({ duration: 3, head: 0.03, tail: 0.03 }) });
+      ec.boot();
+      await flush();
+      ec.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+      ec.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+      await flush();
+      await flush();
+      ec.channel.call("audioplayer.load", null, [
+        "1000_1_3136952023-x",
+        { songId: 1000, musicurl: "http://cdn.example/t3.mp3" },
+      ]);
+      await flush();
+      const ld = ec.last("Load");
+      ok(Math.abs(argAt(ld, 1).duration - 2.96) < 0.002, "★★ 无 gapless 信息 → 每边只裁 20ms（实际 " + Number(argAt(ld, 1).duration).toFixed(3) + "）");
+      ec.flushTimers();
+      ok(countLog(ec, "无 gapless 信息") >= 1, "★ 日志说明了「没有 gapless 信息」");
+    }
+
+    // ---- (d) FLAC 样本精确 → 一点都不裁（多出来的静音是作者自己的） ----
+    {
+      const ed = createEnv({ bytes: makeFlacInfo(), decode: () => mkBuf({ duration: 3, head: 0.03, tail: 0.03 }) });
+      ed.boot();
+      await flush();
+      ed.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+      ed.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+      await flush();
+      await flush();
+      ed.channel.call("audioplayer.load", null, [
+        "1000_1_3136952023-x",
+        { songId: 1000, musicurl: "http://cdn.example/t4.flac" },
+      ]);
+      await flush();
+      const ld = ed.last("Load");
+      eq(Number(argAt(ld, 1).duration), 3, "★★ FLAC 不裁（样本数精确）");
+      ed.flushTimers();
+      ok(countLog(ed, "FLAC 样本精确") >= 1, "★★ 日志写明 FLAC 样本精确");
+    }
+
+    // ---- (e) 逃生开关 ----
+    {
+      const ee = createEnv({ bytes: LAME, decode: () => mkBuf({ duration: 3, head: 0.026, tail: 0.02 }) });
+      ee.win.__gpTrim = false;
+      ee.boot();
+      await flush();
+      ee.channel.call("player.addListElement", null, [JSON.stringify(LIST)]);
+      ee.channel.call("player.setCurrentPlay", null, ["1000_1_3136952023"]);
+      await flush();
+      await flush();
+      ee.channel.call("audioplayer.load", null, [
+        "1000_1_3136952023-x",
+        { songId: 1000, musicurl: "http://cdn.example/t5.mp3" },
+      ]);
+      await flush();
+      ee.flushTimers();
+      const ld = ee.last("Load");
+      eq(Number(argAt(ld, 1).duration), 3, "★★ __gpTrim=false → 完全不裁");
+      ok(countLog(ee, "已关闭（window.__gpTrim=false）") >= 1, "★★ 日志写明了被开关关掉");
+    }
+
+    // ---- (f) 预约下一首时必须带【B 自己的】裁剪量，不能套用 A 的 ----
+    {
+      const ef = await seamlessEnv("playorder", {
+        hooks: { bytes: LAME, decode: () => mkBuf({ duration: 200, head: DS, tail: PE }) },
+      });
+      ok(countLog(ef, "预载就绪（下一首）｜ track=2000") >= 1, "（前提）2000 已预载就绪");
+      const bdur = 200 - DS - PE; // 200 - 13.1ms - 22.7ms
+      const n0 = ef.started.length;
+      setLeft(ef, 1.0);
+      ef.tick();
+      await flush();
+      eq(ef.started.length, n0 + 1, "★★ 多排了一个 source（B）");
+      const s = lastOf(ef.started);
+      ok(
+        Math.abs(s.off - DS) < 0.002,
+        "★★ B 从自己的「可听起点」起播（off≈13.1ms，实际 " + Number(s.off).toFixed(4) + "）"
+      );
+      ok(Math.abs(s.dur - bdur) < 0.01, "★★ B 的 duration 也裁过（实际 " + Number(s.dur).toFixed(3) + "）");
+      ok(Math.abs(s.at - (0.02 + bdur)) < 0.05, "★★ 接缝时刻 = A 的「可听结束」（实际 " + Number(s.at).toFixed(3) + "）");
+    }
+  }
+
+  section("82. ★★ v1.2.1 并发去重：同一个 id 的取址 / 时长只打一次");
+  {
+    const BODY = { data: [{ url: "http://cdn.example/320.mp3", br: 320000, size: 6000000, type: "mp3" }] };
+    // ★ defer：让原生网络层「晚一个微任务」才回包 —— 这样 setCurrentPlay 的抢解析
+    //   与 startPreload 的预载会**真的重叠**（同步回包的话根本测不出并发去重）。
+    const e82 = env3x(BODY, 165000, { defer: true });
+    e82.eapi.available = false; // 3.x 上 LibEAPIRequest 找不到请求函数 → 必然走 320k 免签名接口
+    e82.boot();
+    await flush();
+    e82.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(e82, 1000);
+    await flush();
+    await flush();
+    e82.flushTimers();
+
+    /** 原生网络层收到的、含某个片段且针对某个 trackId 的请求数 */
+    const netCount = (needle, tid) =>
+      e82.nativeCalls.filter((c) => {
+        if (c.name !== "network.fetch") return false;
+        const a0 = c.args && c.args[0];
+        const first = Array.isArray(a0) ? a0[0] || {} : a0 || {};
+        const u = String(first.url || "");
+        return u.indexOf(needle) >= 0 && u.indexOf("[" + tid + "]") >= 0;
+      }).length;
+
+    eq(netCount("/api/song/enhance/player/url", 1000), 1, "★★ 曲目 1000 的 320k 接口只打一次（并发合并）");
+    eq(netCount("/api/song/detail", 1000), 1, "★★ 曲目 1000 的 song/detail 也只打一次");
+  }
+
+  section("83. ★★ v1.2.1 不重复下载：字节缓存 + 最近缓冲复用");
+  {
+    // (a) 字节缓存：同一首被「换槽 → 换回来」时不再下载
+    const e83 = createEnv();
+    e83.boot();
+    await flush();
+    e83.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    e83.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+    await flush();
+    await flush(); // 预载 1000 就绪 → 字节进缓存
+    e83.channel.call("player.setCurrentPlay", null, [idOf(2000)]);
+    await flush(); // 预载槽被换成 2000
+    e83.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+    await flush();
+    await flush();
+    e83.flushTimers();
+    ok(
+      countLog(e83, "字节缓存命中 → 跳过取址 + 下载 ｜ track=1000") >= 1,
+      "★★ 再次预载同一首 → 命中字节缓存（跳过取址 + 下载）"
+    );
+    eq(countLog(e83, "[trim] track=1000"), 2, "★ 但确实重新解码了一次（字节缓存只省下载，不省解码）");
+
+    // (b) 最近缓冲：搬回「刚播过」的那首 → 既不下载也不解码
+    const e83b = createEnv();
+    e83b.win.__gpBytesCache = false; // 关掉字节缓存，单独验「最近缓冲」
+    e83b.boot();
+    await flush();
+    e83b.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+    await playTrack(e83b, 1000); // 播第一首（解码一次）
+    await playTrack(e83b, 2000); // 切走
+    const nDec = e83b.decoded.length;
+    await playTrack(e83b, 1000); // 切回「刚播过的」那首
+    await flush();
+    e83b.flushTimers();
+    ok(
+      countLog(e83b, "复用刚播过的缓冲（不下载 / 不解码）｜ track=1000") >= 1,
+      "★★ 切回刚播过的歌 → 直接复用缓冲（预载都不启动下载）"
+    );
+    eq(e83b.decoded.length, nDec, "★★ 一个字节都没再解码（decoded 计数没变）");
+    ok(e83b.all("Load").length >= 3, "★ onLoad 照常发出（UI 不会觉得卡住）");
+  }
+
+  section("84. ★★★ v1.3.0 P2：等功率交叉淡入淡出（0~12s，Spotify 的 crossfade）");
+  {
+    /** 找出「带自动化曲线」的 gain 节点 */
+    const curveNodes = (e) =>
+      (e.ctx.__gains || [])
+        .map((g) => ({ node: g, ev: g.gain.events.filter((x) => x.type === "curve") }))
+        .filter((x) => x.ev.length > 0);
+    const isFalling = (ev) => ev.curve[0] > ev.curve[ev.curve.length - 1];
+    const isRising = (ev) => ev.curve[0] < ev.curve[ev.curve.length - 1];
+    // ★ 变异体可能让「预约」根本没发生 → 这些取值必须**不抛错**，
+    //   否则验证台会「崩了」（退出码 2）而不是干净报红，报告就没法看了。
+    const evOf = (x) => (x && x.ev && x.ev[0]) || {};
+    const curveOf = (x) => (x && x.ev && x.ev[0] && x.ev[0].curve) || [];
+    const gainOf = (x) => (x && x.node && x.node.gain) || { value: null };
+    const nodeOfX = (x) => (x && x.node) || null;
+
+    // ---- (a) 默认 0s：绝对不能自己冒出交叉（Spotify 出厂也是关的） ----
+    {
+      const e = await seamlessEnv("playorder");
+      eq(e.win.__gpXfade, undefined, "（前提）没有设 __gpXfade");
+      setLeft(e, 1.0);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[sched] 预约") >= 1, "★★ 默认仍然照常预约（硬接）");
+      eq(countLog(e, "交叉=关"), 1, "★★ 日志写明「交叉=关」");
+      eq(curveNodes(e).length, 0, "★★ 一条自动化曲线都没排");
+      ok(Math.abs(Number(lastOf(e.started).at) - 200.02) < 0.05, "★★ B 还是排在 A 的结束采样上");
+    }
+
+    // ---- (b) __gpXfade=3：窗口变宽 + B 提前 3s + 两条等功率曲线 ----
+    {
+      const e = await seamlessEnv("playorder");
+      e.win.__gpXfade = 3;
+      setLeft(e, 3.2); // ★ 3.2s：旧版本（窗口只有 1.5s）根本进不来
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "★ 交叉预约") >= 1, "★★ 窗口跟着变宽（3s 的交叉必须提前 3s 就排）");
+      ok(countLog(e, "交叉=3.00s（等功率）") >= 1, "★★ 日志写明 3.00s 等功率");
+      const t0 = 200.02 - 3;
+      ok(Math.abs(Number(lastOf(e.started).at) - t0) < 0.02, "★★ B 提前 3s 起播（" + Number(lastOf(e.started).at).toFixed(3) + "）");
+
+      const nodes = curveNodes(e);
+      eq(nodes.length, 2, "★★ 恰好两条曲线（A 淡出 + B 淡入）");
+      const out = nodes.find((x) => isFalling(x.ev[0]));
+      const inn = nodes.find((x) => isRising(x.ev[0]));
+      ok(!!out && !!inn, "★★ 一条往下（淡出）一条往上（淡入）");
+      const oEv = evOf(out);
+      const iEv = evOf(inn);
+      ok(
+        Math.abs((oEv.t === undefined ? -999 : oEv.t) - t0) < 0.02 &&
+          Math.abs((iEv.t === undefined ? -999 : iEv.t) - t0) < 0.02,
+        "★★ 两条曲线同一时刻开始"
+      );
+      eq(oEv.dur, 3, "★★ 淡出曲线时长 = 交叉时长");
+      eq(iEv.dur, 3, "★★ 淡入曲线时长 = 交叉时长");
+      const oCurve = curveOf(out);
+      const iCurve = curveOf(inn);
+      const mid = Math.max(0, Math.floor(oCurve.length / 2) - 1);
+      ok(Math.abs((oCurve[mid] || 0) - 0.707) < 0.05, "★★ 淡出中点 ≈ -3dB（" + Number(oCurve[mid] || 0).toFixed(3) + "）");
+      ok(Math.abs((iCurve[mid] || 0) - 0.707) < 0.05, "★★ 淡入中点 ≈ -3dB（等功率，不是线性的 0.5）");
+      ok(nodeOfX(out) !== e.ctx.__gain && nodeOfX(inn) !== e.ctx.__gain, "★★ 曲线没挂在主音量总线上（否则会改用户音量）");
+      ok(!!nodeOfX(out) && nodeOfX(out) !== nodeOfX(inn), "★★ 两条曲线各挂各的节点");
+      eq(String(e.localStorage.getItem("gaplessPlayer.xfade")), "3", "★★ 设置被记住（重启后还在）");
+
+      // ---- (e) 交接之后：B 的 gain 必须被接管（否则下一轮交叉会打在空气上） ----
+      e.ctx.currentTime = 200.02;
+      enderOf(e.started, 0)(); // A 播完 → 无缝交接
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "自然播完 → 无缝交接") >= 1, "（前提）交接发生了");
+      e.channel.call("audioplayer.load", null, [
+        "2000_1_3136952023-x",
+        { songId: 2000, musicurl: "http://cdn.example/seam2.flac" },
+      ]);
+      await flush();
+      // UI 的 play 到了 → 认领结束（S.sched 才会被清掉，下一轮才能再排）
+      e.channel.call("audioplayer.play", () => {}, ["2000_1_3136952023-x", "t|resume|T"]);
+      await flush();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "预载就绪（下一首）｜ track=3000") >= 1, "（前提）3000 已预载就绪");
+
+      const bEnd = t0 + 200; // B 从 t0 起、时长 200
+      e.ctx.currentTime = bEnd - 3.2;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "A=2000 → B=3000") >= 1, "★★ 第二轮交叉照样排得上（A=2000 → B=3000）");
+      const bNodeNow = curveNodes(e).find((x) => nodeOfX(x) === nodeOfX(inn));
+      ok(
+        !!bNodeNow && bNodeNow.ev.some((x) => isFalling(x) && x.t > 390),
+        "★★ 第二轮把「淡出」打在了 B 自己的 gain 上（交接带过来的增益节点）"
+      );
+    }
+
+    // ---- (c) 只剩 1s 时设 12s → 自动缩短成「剩多少用多少」 ----
+    {
+      const e = await seamlessEnv("playorder");
+      e.win.__gpXfade = 12;
+      setLeft(e, 1.0);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "交叉预约") >= 1, "★ 剩 1s 也能排（xf 把窗口从 1.5s 撑到 12.4s）");
+      ok(countLog(e, "交叉=0.95s") >= 1, "★★ 交叉自动缩到 0.95s（不是硬接，也不是排到过去）");
+      ok(Math.abs(Number(lastOf(e.started).at) - (200.02 - 0.95)) < 0.02, "★ B 在 0.95s 前起播");
+    }
+
+    // ---- (d) 上限 12s + 暂停时把增益复位（A 不能永远留在小声） ----
+    {
+      const e = await seamlessEnv("playorder");
+      e.win.__gpXfade = 99; // 超上限
+      setLeft(e, 12.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "交叉=12.00s") >= 1, "★★ 交叉时长被夹到 12s（Spotify 的上限）");
+      const nodes = curveNodes(e);
+      const out = nodes.find((x) => isFalling(x.ev[0]));
+      const inn = nodes.find((x) => isRising(x.ev[0]));
+      ok(!!out && !!inn, "（前提）两条曲线都在");
+      const bNode = lastOf(e.started).node;
+
+      e.channel.call("audioplayer.pause", null, []);
+      await flush();
+      eq(gainOf(out).value, 1, "★★ 暂停后 A 的增益复位到 1（否则会一直小声播）");
+      eq(gainOf(inn).value, 0, "★★ B 的增益被拉回 0");
+      ok(bNode !== undefined && e.stopped.indexOf(bNode) >= 0, "★★ 排上的 B 被停掉（不会到点自己响）");
+    }
+
+    // ---- (f) 太短的值直接当关（0.3s 没有意义） ----
+    {
+      const e = await seamlessEnv("playorder");
+      e.win.__gpXfade = 0.3;
+      setLeft(e, 1.0);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "交叉=关"), 1, "★★ < 0.5s 视为关（不排曲线）");
+      eq(curveNodes(e).length, 0, "★★ 一条曲线都不排");
+    }
+
+    // ---- (g) A 走流式时也能淡出（曲线打在元素那一路的 gain 上） ----
+    {
+      const e = await streamSeamEnv("playorder");
+      ok(countLog(e, "预载就绪（下一首）｜ track=2000") >= 1, "（前提）2000 已预载就绪");
+      e.win.__gpXfade = 3;
+      const now = e.ctx.currentTime; // 距结束 3.0s → 交叉被压到 2.95s（留 0.05s 余量）
+      e.audio.last.currentTime = 197.0;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "★ 交叉预约") >= 1, "★★ 流式那一首也能排交叉");
+      ok(countLog(e, "来源=流式") >= 1, "★★ 日志标明来源是流式");
+      const nodes = curveNodes(e);
+      eq(nodes.length, 2, "★★ 仍是两条曲线");
+      const out = nodes.find((x) => isFalling(x.ev[0]));
+      const inn = nodes.find((x) => isRising(x.ev[0]));
+      ok(!!out && !!inn, "★★ 一条淡出一条淡入");
+      // 排除法：增益节点只可能有三个 —— 总线、元素那一路、B 那一路。
+      // 淡出既然不是总线也不是 B，那就只能是元素那一路（= 流式的 gain）。
+      const others = (e.ctx.__gains || []).filter((g) => g !== e.ctx.__gain && g !== nodeOfX(inn));
+      eq(others.length, 1, "（前提）除总线与 B 之外只剩一个 gain（元素那一路）");
+      ok(nodeOfX(out) === others[0], "★★ 淡出打在了流式元素自己的 gain 上");
+      ok(Math.abs(evOf(inn).t - (now + 0.05)) < 0.06, "★★ B 提前约 3s 起播（曲线从 " + Number(evOf(inn).t).toFixed(3) + " 开始）");
+      ok(Math.abs(evOf(inn).dur - 2.95) < 0.06, "★★ 交叉时长被压到 2.95s（剩 3.0s，留 0.05 余量）");
+    }
+  }
+
+  section("85. ★★ v1.3.1 把流式那首补成缓冲（缓存不再只覆盖缓冲路径）");
+  {
+    /** 起一首流式并让它播起来（不建播放列表 → 不触发预载） */
+    async function streamPlay(e, idStr, url) {
+      e.boot();
+      await flush();
+      streamLoad(e, idStr, url);
+      e.audio.last.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush();
+      e.channel.call("audioplayer.play", () => {}, [idStr + "-x", "t|resume|T"]);
+      await flush();
+      e.flushTimers();
+    }
+
+    // ---- (a) 听够 8s → 后台补成缓冲；之后切回来不再拉流 ----
+    {
+      const e = streamEnv();
+      await streamPlay(e, idOf(1000), "http://cdn.example/s1.flac");
+      eq(countLog(e, "[promote]"), 0, "（前提）刚起播不补");
+
+      e.advance(9000); // 真听了 9 秒
+      const f0 = e.fetchLog.length;
+      e.tick();
+      await flush();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "★ 已补成缓冲") >= 1, "★★ 听够 8s → 后台补成缓冲");
+      ok(countLog(e, "补成缓冲（切回来秒开，也能当交叉的 B）｜ track=1000") >= 1, "★★ 补的正是这一首（1000）");
+      ok(e.fetchLog.length > f0, "★ 确实下载了一份（这份内容本来也会被重放一遍）");
+
+      // 切走再切回来：应该命中「最近缓冲」，不再走流式
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(2000)]);
+      await flush();
+      streamLoad(e, idOf(2000), "http://cdn.example/s2.flac");
+      e.audio.last.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush();
+      e.channel.call("audioplayer.play", () => {}, [idOf(2000) + "-x", "t|resume|T"]);
+      await flush();
+
+      const loads0 = e.audio.last.__loads;
+      const dec0 = e.decoded.length;
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-y",
+        { songId: 1000, musicurl: "http://cdn.example/s1-again.flac" },
+      ]);
+      await flush();
+      e.flushTimers();
+      // ⚠️ 断言必须点名「复用刚播过的缓冲」这条路径：只写「不重新拉流」的话，
+      //   就算补完没进 recentBufs，也会从**字节缓存**重新解码一遍而照样通过（变异体测不出来）。
+      ok(countLog(e, "复用刚播过的缓冲（不下载 / 不解码）") >= 1, "★★ 切回来走的是「最近缓冲复用」（不是字节缓存重解码）");
+      eq(e.decoded.length, dec0, "★★ 一次解码都没有（真的复用了内存里的那份）");
+      eq(e.audio.last.__loads, loads0, "★★ 元素一次 load 都没再调（没有重新拉流）");
+    }
+
+    // ---- (b) 只听 5s → 不补（不为「路过」付一次下载） ----
+    {
+      const e = streamEnv();
+      await streamPlay(e, idOf(1000), "http://cdn.example/s3.flac");
+      e.advance(5000);
+      const f0 = e.fetchLog.length;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[promote]"), 0, "★★ 不到 8s → 完全不补");
+      eq(e.fetchLog.length, f0, "★★ 一个字节都没多下");
+    }
+
+    // ---- (c) 逃生开关 ----
+    {
+      const e = streamEnv();
+      e.win.__gpPromote = false;
+      await streamPlay(e, idOf(1000), "http://cdn.example/s4.flac");
+      e.advance(9000);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[promote]"), 0, "★★ __gpPromote=false → 不补");
+    }
+
+    // ---- (d) 缓冲路径不参与（它本来就有 AudioBuffer） ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush();
+      e.advance(9000);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[promote]"), 0, "★★ 缓冲路径已经在 recentBufs 里了，不用补");
+    }
+
+    // ---- (e) 3.x 试听片段 → 绝不把「半首」塞进缓存 ----
+    {
+      const BODY = { data: [{ url: "http://cdn.example/clip.mp3", br: 320000, size: 8200000, type: "mp3" }] };
+      const e = env3x(BODY, 205000); // 权威时长 205s，而解码出来只有 200s → 片段
+      delete e.win.__gpStream; // 走流式才谈得上「补成缓冲」
+      e.eapi.available = false;
+      await streamPlay(e, idOf(1000), "http://cdn.example/s5.mp3");
+      e.advance(9000);
+      e.tick();
+      await flush();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "试听片段"), "★★ 片段被识别");
+      ok(countLog(e, "放弃（不影响播放）｜ track=1000") >= 1, "★★ 宁可不补，也不把半首塞进缓存");
+      ok(countLog(e, "★ 已补成缓冲") === 0, "★★ 没有补成");
+    }
+  }
+
   /* ---------- 汇总 ---------- */
   console.log("\n====================");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");

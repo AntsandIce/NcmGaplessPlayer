@@ -158,7 +158,8 @@ const MUTATIONS = [
   {
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
-    find: 'var VERSION = "1.0.0";',
+    // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
+    find: 'var VERSION = "1.3.1";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -426,15 +427,18 @@ const MUTATIONS = [
   {
     name: "v0.4.1: 时间窗失效（还剩 5 分钟也敢排）",
     file: "main.js",
-    find: "    if (left < 0.3 || left > 1.5) return;",
-    replace: "    if (false) return; // 变异：时间窗失效",
+    // ⚠️ v1.3.0 起窗口是 `max(1.5, xf+0.4)`（开了交叉要更早排），不再写死 1.5
+    find: "      if (left < 0.3 || left > winMax) return;",
+    replace: "      if (false) return; // 变异：时间窗失效",
     expect: "62",
   },
   {
     name: "v0.4.1: 模式闸门失效（随机 / 单曲循环也照样预约）",
     file: "main.js",
-    find: "    var mode = readPlayMode();\n    if (mode !== null) {\n      if (mode !== \"playonce\" && mode !== \"playorder\") return;\n    } else if (S.seqStreak < 2) {\n      return;\n    }",
-    replace: "    var mode = readPlayMode(); // 变异：模式闸门失效",
+    // ⚠️ 3.x 分支给这道闸门加了 `hitStreak` 例外，锚点是「例外那一行」——
+    //   把它删掉 = 随机模式下也一律预约（正是这条变异的语义）。
+    find: "        if (!(isNcm3() && (S.hitStreak || 0) >= 1)) return;",
+    replace: "        /* 变异：随机模式也照样预约 */",
     expect: "62",
   },
   {
@@ -508,6 +512,127 @@ const MUTATIONS = [
     find: "      if (sc.startCtxTime > S.ctx.currentTime + 0.03) {",
     replace: "      if (false) { // 变异：估晚了也不管",
     expect: "76",
+  },
+  {
+    name: "v1.2.0: 裁剪量恒为 0（等于没做 P0，接缝处仍带 ~25ms 静音）",
+    file: "main.js",
+    find: "    var fit = fitTrim(info, ab);",
+    replace: '    var fit = { enc: { start: 0, end: 0 }, pad: { start: 0, end: 0 }, note: "变异：不裁", deltaMs: null };',
+    expect: "81",
+  },
+  {
+    name: "v1.2.0: 不看波形、硬按声明上限裁（解码器已裁过时会把真音乐切掉）",
+    file: "main.js",
+    find: "    var foundS = Math.min(silenceHead(ab, capS + 0.005), capS);",
+    replace: "    var foundS = capS; // 变异：不验波形",
+    expect: "81",
+  },
+  {
+    name: "v1.2.0: startSource 忘了把 trim 加回缓冲偏移（时间轴整体后移 ~26ms）",
+    file: "main.js",
+    find: "    var bufAt = off + tr.start;",
+    replace: "    var bufAt = off; // 变异：不加 trim",
+    expect: "81",
+  },
+  {
+    name: "v1.2.0: 预约 B 时不带 B 的裁剪量（B 开头那 26ms 静音又回来了）",
+    file: "main.js",
+    find: "      src.start(bStart, btrim.start, bdur);",
+    replace: "      src.start(bStart, 0, buf.duration); // 变异：不裁 B",
+    expect: "81",
+  },
+  {
+    name: "v1.2.1: 作品静音也默认裁（越过 Spotify 的 gapless 语义，切掉作品内容）",
+    file: "main.js",
+    find: "  var TRIM_PAD_DEFAULT = false;",
+    replace: "  var TRIM_PAD_DEFAULT = true; // 变异：默认也裁作品静音",
+    expect: "81",
+  },
+  {
+    name: "v1.2.1: 并发去重失效（同一 id 的取址/时长各打两遍）",
+    file: "main.js",
+    find: "    if (INFLIGHT[key]) return INFLIGHT[key];",
+    replace: "    /* 变异：不去重 */",
+    expect: "82",
+  },
+  {
+    name: "v1.2.1: 字节缓存永不命中（同一首反复预载时白下 5~6MB）",
+    file: "main.js",
+    find: "    var e = BYTES_CACHE[trackId];",
+    replace: "    var e = null; // 变异：缓存永不命中",
+    expect: "83",
+  },
+  {
+    name: "v1.2.1: 最近缓冲不复用（切回刚播过的歌又下一遍 + 重解一遍）",
+    file: "main.js",
+    find: "    var reuse = recentGet(trackId);",
+    replace: "    var reuse = null; // 变异：不复用",
+    expect: "83",
+  },
+  {
+    name: "v1.3.0: 交叉时长永远读成 0（P2 整个失效，退化成硬接）",
+    file: "main.js",
+    find: "    var xf = xfadeSeconds();",
+    replace: "    var xf = 0; // 变异：不做交叉",
+    expect: "84",
+  },
+  {
+    name: "v1.3.0: 用线性淡入淡出代替等功率（中点塌 -3dB，听起来音量掉一截）",
+    file: "main.js",
+    find: "      a[i] = rising ? Math.sin(th) : Math.cos(th);",
+    replace: "      a[i] = rising ? i / (XFADE_POINTS - 1) : 1 - i / (XFADE_POINTS - 1); // 变异：线性",
+    expect: "84",
+  },
+  {
+    name: "v1.3.0: 交叉曲线挂在主音量总线上（会改掉用户设的音量）",
+    file: "main.js",
+    find: "    var gB = newSourceGain();",
+    replace: "    var gB = S.gain; // 变异：直接用总线",
+    expect: "84",
+  },
+  {
+    name: "v1.3.0: 停 source 时不复位增益（A 会一直留在淡出后的小声状态）",
+    file: "main.js",
+    // ★ 一次性干掉整条复位链路（stopSource + cancelSched + abortSeamless 都在用它）——
+    //   只删一处的话另一处还会兜住，变异的语义就变成「冗余代码」，测不出来。
+    find: "  function restoreGain(node, v) {\n    if (!node || !node.gain) return;",
+    replace: "  function restoreGain(node, v) {\n    if (true) return; // 变异：不复位",
+    expect: "84",
+  },
+  {
+    name: "v1.3.0: 交接后不接管 B 的 gain（下一轮交叉打不到正在响的那一路）",
+    file: "main.js",
+    find: "      S.srcGain = sc.gain || null;",
+    replace: "      S.srcGain = null; // 变异：不接管",
+    expect: "84",
+  },
+  {
+    name: "v1.3.1: 流式那首不补成缓冲（切回来仍然重新拉流，缓存只覆盖缓冲路径）",
+    file: "main.js",
+    find: "    if (!S.stream || !S.ready || S.paused || !S.el) return;",
+    replace: "    if (true) return; // 变异：不补",
+    expect: "85",
+  },
+  {
+    name: "v1.3.1: 不等 8 秒就补（路过一首也付一次 6MB 下载）",
+    file: "main.js",
+    find: "    if (played < PROMOTE_AFTER_SEC * 1000) return;",
+    replace: "    if (false) return; // 变异：不等",
+    expect: "85",
+  },
+  {
+    name: "v1.3.1: 补完不放进 recentBufs（等于白下）",
+    file: "main.js",
+    find: "        recentPut(tid, ab);",
+    replace: "        /* 变异：不入缓存 */",
+    expect: "85",
+  },
+  {
+    name: "v1.3.1: 试听片段也塞进缓存（下次直接播半首）",
+    file: "main.js",
+    find: '              throw new Error(\n                "解码时长 " + ab.duration.toFixed(1) + "s 短于实际 " + (dtMs / 1000).toFixed(1) + "s（试听片段），不补"\n              );',
+    replace: "              /* 变异：片段也照收 */",
+    expect: "85",
   },
 ];
 
@@ -614,6 +739,9 @@ async function main() {
     process.exit(1);
   }
   console.log("全部变异都被抓住 ✅");
+  // ★ 必须显式清零：每一轮跑的验证台在「该红」时会把 process.exitCode 置 1，
+  //   而最后一轮本来就是故意红的 → 不清零的话，全部抓住也会退出码 1（CI 里就是假失败）。
+  process.exitCode = 0;
 }
 
 main().catch((e) => {
