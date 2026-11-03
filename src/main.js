@@ -2103,7 +2103,12 @@
       try { j = JSON.parse(txt); } catch (e) {}
       var d = j && j.data && j.data[0];
       if (!d || !d.url) throw new Error("320k 接口没给 url ｜ " + txt.slice(0, 120));
-      log("[preload] 320k 接口 ★ br=" + d.br + " ｜ size=" + d.size + " ｜ type=" + d.type);
+      log("[preload] 320k 接口 ★ br=" + d.br + " ｜ size=" + d.size + " ｜ type=" + d.type +
+        " ｜ fee=" + d.fee + " ｜ payed=" + d.payed + " ｜ flag=" + d.flag +
+        (d.freeTrialInfo ? " ｜ 试听片段=" + JSON.stringify(d.freeTrialInfo) : ""));
+      // ★ 付费/VIP 曲目该接口只给**试听片段**（freeTrialInfo 非空，实测有 64s 的），
+      //   预载它会在片段结束时断掉 —— 直接放弃，让客户端用它的 token 播整首。
+      if (d.freeTrialInfo) throw new Error("只有试听片段（freeTrialInfo），放弃预载");
       return d.url;
     });
   }
