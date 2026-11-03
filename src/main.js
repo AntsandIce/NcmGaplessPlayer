@@ -1247,12 +1247,26 @@
   }
 
   /** 走 LibEAPIRequest 查某首歌的播放地址 */
+  // ★ 3.1.42 兼容补丁：LibEAPIRequest 可能比本插件晚就绪（插件按 slug 字母序加载）
+  //   这里等它就绪（最多 6s）再取地址，避免 preload 首轮直接失败。
+  function waitLib(ms) {
+    return new Promise(function (resolve) {
+      var t0 = Date.now();
+      (function tick() {
+        var lib = null;
+        try { lib = (typeof loadedPlugins !== "undefined" && loadedPlugins && loadedPlugins.LibEAPIRequest) || null; } catch (e) {}
+        var ok = !!(lib && typeof lib.eapiRequest === "function" &&
+          (typeof lib.isRequestAvailable !== "function" || lib.isRequestAvailable()));
+        if (ok || Date.now() - t0 > ms) return resolve(lib);
+        setTimeout(tick, 120);
+      })();
+    });
+  }
+
   function resolveUrl(trackId) {
+    return waitLib(6000).then(function (libReady) {
     return new Promise(function (resolve, reject) {
-      var lib = null;
-      try {
-        lib = (typeof loadedPlugins !== "undefined" && loadedPlugins && loadedPlugins.LibEAPIRequest) || null;
-      } catch (e) {}
+      var lib = libReady;
       if (!lib || typeof lib.eapiRequest !== "function") {
         reject(new Error("LibEAPIRequest 不在（未安装 / 未启用）"));
         return;
@@ -1312,6 +1326,7 @@
           fallbackDownload();
         },
       });
+    });
     });
   }
 
@@ -1453,11 +1468,7 @@
     S.preloadState = "fetching";
     var t0 = performance.now();
     log("[preload] 开始预载（" + (why || "?") + "）｜ track=" + trackId);
-    slot.promise = resolveUrl(trackId)
-      .then(function (url) {
-        if (tk !== S.preloadToken) return null;
-        return fetchBytes(url, ac ? ac.signal : null);
-      })
+    slot.promise = acquireAudio(trackId, ac)
       .then(function (buf) {
         if (!buf || tk !== S.preloadToken) return null;
         S.preloadState = "decoding";
@@ -1957,6 +1968,70 @@
 
   /* ==================== 加载 ==================== */
 
+    /* ===== 3.1.42 兼容补丁：原生网络层取流 ===== */
+  function outerUrlFor(trackId) {
+    return "https://music.163.com/song/media/outer/url?id=" + trackId + ".mp3";
+  }
+  function strToBuf(s) {
+    var a = new Uint8Array(s.length);
+    for (var i = 0; i < s.length; i++) a[i] = s.charCodeAt(i) & 0xff;
+    return a.buffer;
+  }
+  function toArrayBuffer(res) {
+    var cands = [res, res && res.blob, res && res.data, res && res.body, res && res.buffer, res && res.content, res && res.bytes, res && res.result];
+    for (var i = 0; i < cands.length; i++) {
+      var v = cands[i];
+      if (!v) continue;
+      if (typeof v === "string") { if (v.length) return Promise.resolve(strToBuf(v)); continue; }
+      if (v instanceof ArrayBuffer) return Promise.resolve(v);
+      if (typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(v)) return Promise.resolve(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength));
+      if (typeof Blob !== "undefined" && v instanceof Blob) return v.arrayBuffer();
+      if (typeof v.arrayBuffer === "function") { try { return Promise.resolve(v.arrayBuffer()); } catch (e) {} }
+      if (typeof v.byteLength === "number" && typeof v.length === "number") { try { return Promise.resolve(new Uint8Array(v).buffer); } catch (e) {} }
+      if (typeof v.length === "number" && v.length > 0 && typeof v[0] === "number") { try { return Promise.resolve(new Uint8Array(v).buffer); } catch (e) {} }
+    }
+    return Promise.resolve(null);
+  }
+  function nativeFetchBytes(url, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var timer = setTimeout(function () {
+        if (!done) { done = true; reject(new Error("原生网络超时")); }
+      }, timeoutMs || 25000);
+      function fin(err, val) {
+        if (done) return;
+        done = true; clearTimeout(timer);
+        if (err) reject(err); else resolve(val);
+      }
+      try {
+        channel.call("network.fetch", function (res) {
+          try {
+            log("[nafetch] 返回类型=" + Object.prototype.toString.call(res) + " ｜ keys=" + (res && typeof res === "object" ? Object.keys(res).slice(0, 6).join(",") : "?"));
+          } catch (e) {}
+          toArrayBuffer(res)
+            .then(function (buf) {
+              if (!buf || !buf.byteLength) { fin(new Error("原生网络没返回字节")); return; }
+              log("[nafetch] ★ " + mb(buf.byteLength) + " MB ｜ " + String(url).slice(0, 70));
+              fin(null, buf);
+            })
+            .catch(function (e) { fin(e); });
+        }, [{ url: url }]);
+      } catch (e) { fin(e); }
+    });
+  }
+
+  function acquireAudio(trackId, ac) {
+    return resolveUrl(trackId)
+      .then(function (url) { return fetchBytes(url, ac ? ac.signal : null); })
+      .catch(function (e) {
+        log("[preload] API 取址不可用（" + (e && e.message) + "）→ 改用 outer/url 直链");
+        return fetchBytes(outerUrlFor(trackId), ac ? ac.signal : null)
+          .catch(function (e2) {
+            log("[preload] 直链失败（" + (e2 && e2.message) + "）→ 原生网络兜底");
+            return nativeFetchBytes(outerUrlFor(trackId));
+          });
+      });
+  }
   function fetchBytes(url, signal) {
     var t0 = performance.now();
     // ★ v0.2.5：带上 signal，作废时才能真正把连接掐掉（不传就退回旧的裸 fetch）
