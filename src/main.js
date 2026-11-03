@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.5.1";
+  var VERSION = "1.5.2";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -2336,10 +2336,17 @@
 
     // ★ v1.5.1：B 的**入点** —— 用 B 自己的拍点选「从哪一拍进」，顺手跳过开头的空气声。
     //   只在有交叉时才有意义（没交叉就是 A 播完 B 从 0 开始，跳过头就成"吃歌"了）。
+    // ★ v1.5.2：没有交叉（干净风格）时也做一件小事 —— 跳过 B 开头的**真静音**
+    //   （只跳空白，不做拍点对齐：没有交叉就没有拍点关系，多吃一个整拍等于白吃歌）。
     var entry = { offset: btrim.start, skip: 0, reason: "未启用" };
-    if (fadeSec > 0 && autoMixEnabled()) {
+    if (autoMixEnabled()) {
       try {
-        entry = pickBEntry(gB2, btrim, bdur, buf);
+        entry = fadeSec > 0
+          ? pickBEntry(gB2, btrim, bdur, buf)
+          : pickBEntry(null, btrim, bdur, buf, { silenceOnly: true });
+        if (entry.skip <= 0.02) {
+          entry = { offset: btrim.start, skip: 0, reason: entry.reason };
+        }
       } catch (e) {
         log("[automix] ★ 选入点失败（不影响播放）｜ " + (e && e.message));
       }
@@ -4041,13 +4048,17 @@
   var BEAT_PICKUP_MAX = 6; // 最多跳过这么长的前奏
   var BEAT_PICKUP_TOL = 0.06; // 起点已经「贴着拍」的容差
 
-  function pickBEntry(grid, btrim, bdur, ab) {
+  function pickBEntry(grid, btrim, bdur, ab, opts) {
     var start = (btrim && btrim.start) || 0;
     var len = Number(bdur) || 0;
-    if (!grid || !(grid.bpm > 0) || !(len > 1)) {
+    var silenceOnly = !!(opts && opts.silenceOnly); // ★ v1.5.2：只跳空白，不做拍点对齐
+    if (!(len > 1)) {
+      return { offset: start, skip: 0, reason: "时长无效" };
+    }
+    if (!silenceOnly && (!grid || !(grid.bpm > 0))) {
       return { offset: start, skip: 0, reason: "无拍点网格" };
     }
-    var beat = grid.beatSec;
+    var beat = grid ? grid.beatSec : 0;
     var cap = Math.min(BEAT_PICKUP_MAX, len * 0.5);
 
     // ① 开头的空白。⚠️ 只跳「量得完」的空白：silenceHead 扫到上限就返回上限，
@@ -4063,6 +4074,22 @@
     } catch (e) {
       gap = 0;
     }
+
+    // ★ v1.5.2：没有任何交叉（干净风格）时也做一件事 —— 把 B 开头的**真静音**跳掉。
+    //   否则 A 播完接上来的就是 1~2 秒空气，听感上等于留了个洞（而这跟"无缝"的初衷正相反）。
+    //   ⚠️ 此时**不做拍点对齐**：没有交叉就没有拍点关系，多吃一个整拍等于白吃歌。
+    if (silenceOnly) {
+      if (gapCapped) return { offset: start, skip: 0, reason: "开头空白比上限还长 → 不跳" };
+      if (gap < 0.1) return { offset: start, skip: 0, reason: "开头没有空白" };
+      // gap 已经在上面的 gapCapped 检查里保证「量得完且 ≤ cap」，这里不必再夹一次（夹了反而是死代码）
+      var offS = start + gap;
+      return {
+        offset: offS,
+        skip: offS - start,
+        reason: "跳过 " + gap.toFixed(2) + "s 开头空白",
+      };
+    }
+
     var from = start + Math.max(0, gap - 0.05);
 
     // ② 第一个 ≥ from 的拍点；如果 from 本来就贴着上一拍，就用 from（不为对齐吃一个整拍）
@@ -4607,9 +4634,20 @@
     var hit = (S.stats.hitPreload || 0) + (S.stats.hitRecent || 0);
     var hitText = plays ? Math.round((hit / plays) * 100) + "%（" + hit + "/" + plays + "）" : "—";
 
+    // ★ v1.5.2：把「拍点对齐」的默认状态摆出来（默认就是开的，别让人以为是关的）
+    var beatText = "关";
+    if (autoMixEnabled()) {
+      var bn = 0;
+      var bc = S.beatCache || {};
+      for (var bk in bc) {
+        if (Object.prototype.hasOwnProperty.call(bc, bk)) bn++;
+      }
+      beatText = "开（已分析 " + bn + " 段）";
+    }
+
     return (
-      "引擎=" + eng + " ｜ 过渡=" + trans + " ｜ 缓存=" + (S.recentBufs || []).length + " 首/" +
-      sizeText(recentBytes()) + " ｜ 预载命中=" + hitText
+      "引擎=" + eng + " ｜ 过渡=" + trans + " ｜ 拍点=" + beatText + " ｜ 缓存=" +
+      (S.recentBufs || []).length + " 首/" + sizeText(recentBytes()) + " ｜ 预载命中=" + hitText
     );
   }
 
@@ -4633,44 +4671,132 @@
     return true;
   }
 
-  /* ---- 面板（纯 DOM 拼接，不引外部样式；客户端是 CEF，注入 fixed 元素即可） ---- */
+  /* ---- 面板（自绘 DOM + 一次性注入样式；不依赖客户端 CSS，也不引外部文件） ---- */
 
-  var panel = { box: null, status: null, btn: null };
+  var panel = { box: null, btn: null, css: null, timer: 0 };
 
-  function domMake(tag, css, text) {
+  var PANEL_CSS = [
+    ".gp-card{position:fixed;right:16px;bottom:64px;z-index:2147483000;width:312px;box-sizing:border-box;",
+    "background:rgba(28,30,36,.96);color:#e8eaf0;border:1px solid rgba(255,255,255,.08);border-radius:14px;",
+    "padding:14px 14px 10px;font:12px/1.55 -apple-system,'Segoe UI',system-ui,sans-serif;",
+    "box-shadow:0 18px 48px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.04);",
+    "backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}",
+    ".gp-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}",
+    ".gp-brand{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13px;letter-spacing:.2px}",
+    ".gp-ver{font-size:10px;font-weight:500;color:#8b93a7;background:rgba(255,255,255,.06);",
+    "border:1px solid rgba(255,255,255,.07);border-radius:999px;padding:1px 7px}",
+    ".gp-x{all:unset;cursor:pointer;width:22px;height:22px;line-height:20px;text-align:center;border-radius:7px;",
+    "color:#8b93a7;font-size:16px;transition:background .15s,color .15s}",
+    ".gp-x:hover{background:rgba(255,255,255,.09);color:#fff}",
+    ".gp-status{display:block;color:#98a0b4;background:rgba(255,255,255,.04);border-radius:10px;",
+    "padding:8px 10px;margin-bottom:12px;font-size:11px;line-height:1.7;word-break:break-all}",
+    ".gp-sec{margin-bottom:12px}",
+    ".gp-cap{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;color:#7d8598;margin:0 0 7px 2px}",
+    ".gp-seg{display:flex;background:rgba(255,255,255,.05);border-radius:10px;padding:3px;gap:3px}",
+    ".gp-seg>button{all:unset;flex:1;text-align:center;cursor:pointer;padding:6px 0;border-radius:8px;",
+    "font-size:12px;color:#a8b0c2;transition:background .15s,color .15s,box-shadow .15s}",
+    ".gp-seg>button:hover{color:#fff;background:rgba(255,255,255,.06)}",
+    ".gp-seg>button.on{background:#3d6ef5;color:#fff;box-shadow:0 2px 10px rgba(61,110,245,.4)}",
+    ".gp-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:5px 2px}",
+    ".gp-row>span:first-child{color:#c6cbd8}",
+    ".gp-val{color:#8b93a7;font-variant-numeric:tabular-nums}",
+    ".gp-range{width:100%;height:22px;margin:2px 0 6px;-webkit-appearance:none;background:transparent}",
+    ".gp-range::-webkit-slider-runnable-track{height:4px;border-radius:2px;background:rgba(255,255,255,.13)}",
+    ".gp-range::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;margin-top:-5px;",
+    "border-radius:50%;background:#fff;box-shadow:0 1px 6px rgba(0,0,0,.5);transition:transform .12s}",
+    ".gp-range:active::-webkit-slider-thumb{transform:scale(1.15)}",
+    ".gp-sel{all:unset;cursor:pointer;color:#e8eaf0;background:rgba(255,255,255,.07);border-radius:8px;",
+    "padding:5px 9px;font-size:12px}",
+    ".gp-sw{position:relative;display:inline-block;width:34px;height:20px;border-radius:999px;cursor:pointer;",
+    "background:rgba(255,255,255,.14);transition:background .18s}",
+    ".gp-sw>i{position:absolute;top:3px;left:3px;width:14px;height:14px;border-radius:50%;background:#fff;",
+    "transition:transform .18s;box-shadow:0 1px 3px rgba(0,0,0,.4)}",
+    ".gp-sw.on{background:#3d6ef5}",
+    ".gp-sw.on>i{transform:translateX(14px)}",
+    ".gp-btn{all:unset;cursor:pointer;color:#c6cbd8;background:rgba(255,255,255,.07);border-radius:8px;",
+    "padding:5px 10px;font-size:12px;transition:background .15s,color .15s}",
+    ".gp-btn:hover{background:rgba(255,255,255,.13);color:#fff}",
+    ".gp-diag{margin-top:4px;border-top:1px solid rgba(255,255,255,.07);padding-top:8px}",
+    ".gp-diag>summary{cursor:pointer;color:#7d8598;font-size:11px;letter-spacing:.4px;list-style:none}",
+    ".gp-diag>summary::-webkit-details-marker{display:none}",
+    ".gp-foot{display:flex;justify-content:space-between;align-items:center;color:#6f7689;",
+    "font-size:10px;margin-top:8px}",
+    ".gp-fab{position:fixed;right:14px;bottom:16px;width:30px;height:30px;border-radius:12px;",
+    "z-index:2147482999;display:flex;align-items:center;justify-content:center;cursor:pointer;",
+    "color:#a8b0c2;font-size:15px;background:rgba(32,34,42,.72);border:1px solid rgba(255,255,255,.1);",
+    "opacity:.5;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);",
+    "transition:opacity .18s,transform .18s,border-color .18s,background .18s}",
+    ".gp-fab:hover{opacity:1;transform:translateY(-1px);border-color:rgba(255,255,255,.22)}",
+    ".gp-fab.on{opacity:1;color:#fff;background:#3d6ef5;border-color:#3d6ef5}",
+  ].join("");
+
+  function ensurePanelCss() {
+    if (panel.css) return;
+    try {
+      if (typeof document === "undefined" || !document || !document.head) return;
+      var st = document.createElement("style");
+      st.setAttribute("data-gaplessplayer", "style");
+      st.textContent = PANEL_CSS;
+      document.head.appendChild(st);
+      panel.css = st;
+    } catch (e) {}
+  }
+
+  function el(tag, cls, text) {
     var n = document.createElement(tag);
-    if (css) n.style.cssText = css;
+    if (cls) n.className = cls;
     if (text !== undefined && text !== null) n.textContent = String(text);
     return n;
   }
 
-  var CSS_BTN =
-    "cursor:pointer;border:1px solid #3a3d47;background:#2a2d36;color:#e8e8ea;border-radius:6px;" +
-    "padding:4px 8px;font:12px system-ui,Segoe UI,sans-serif;margin:0 6px 6px 0";
-  var CSS_ROW = "display:flex;align-items:center;justify-content:space-between;margin:6px 0;gap:8px";
-  var CSS_LABEL = "color:#9aa0ad;font:12px system-ui,Segoe UI,sans-serif;white-space:nowrap";
+  function rowEl(label, right) {
+    var r = el("div", "gp-row");
+    r.appendChild(el("span", null, label));
+    if (typeof right === "string") r.appendChild(el("span", "gp-val", right));
+    else if (right) r.appendChild(right);
+    return r;
+  }
+
+  /** 拨动开关（比默认 checkbox 好看，也统一了各处交互） */
+  function toggleEl(initial, onChange) {
+    var sw = el("span", "gp-sw");
+    sw.appendChild(el("i"));
+    sw.__on = !!initial;
+    if (sw.__on) sw.className = "gp-sw on";
+    sw.onclick = function () {
+      sw.__on = !sw.__on;
+      sw.className = "gp-sw" + (sw.__on ? " on" : "");
+      try {
+        onChange(sw.__on);
+      } catch (e) {}
+      refreshPanel();
+    };
+    return sw;
+  }
 
   function refreshPanel() {
     if (!panel.box) return;
     try {
       if (panel.status) panel.status.textContent = statusLine();
-      // 风格高亮
-      if (panel.styleBtns) {
-        for (var i = 0; i < panel.styleBtns.length; i++) {
-          var b = panel.styleBtns[i];
-          var on = (xfadeStyle() || ("auto:" + styleFromMode())) === b.__style ||
-            (xfadeStyle() === null && b.__style === styleFromMode());
-          b.style.background = on ? "#3d6ef5" : "#2a2d36";
-          b.style.borderColor = on ? "#3d6ef5" : "#3a3d47";
+      var styleNow = xfadeStyle();
+      var autoNow = styleFromMode();
+      for (var i = 0; i < (panel.styleBtns || []).length; i++) {
+        var b = panel.styleBtns[i];
+        var on = styleNow === null ? b.__style === autoNow : b.__style === styleNow;
+        b.className = on ? "on" : "";
+      }
+      var xf = effectiveXfade();
+      if (panel.range) {
+        panel.range.value = String(xf.sec);
+        if (panel.rangeLabel) {
+          panel.rangeLabel.textContent = xf.sec > 0 ? xf.sec.toFixed(1) + "s" : "关";
         }
       }
-      if (panel.range) {
-        var xf = effectiveXfade();
-        panel.range.value = String(xf.sec);
-        panel.rangeLabel.textContent = xf.sec > 0 ? xf.sec.toFixed(1) + "s（" + xf.source + "）" : "关（" + xf.source + "）";
+      if (panel.curve) panel.curve.value = xf.curve;
+      if (panel.eqSw) panel.eqSw.className = "gp-sw" + (xf.eq ? " on" : "");
+      if (panel.cacheText) {
+        panel.cacheText.textContent = (S.recentBufs || []).length + " 首 · " + sizeText(recentBytes());
       }
-      if (panel.curve) panel.curve.value = effectiveXfade().curve;
-      if (panel.eq) panel.eq.checked = effectiveXfade().eq;
     } catch (e) {}
   }
 
@@ -4679,6 +4805,7 @@
       if (panel.box && panel.box.parentNode) panel.box.parentNode.removeChild(panel.box);
     } catch (e) {}
     panel.box = null;
+    if (panel.btn) panel.btn.className = "gp-fab";
   }
 
   function openPanel() {
@@ -4688,47 +4815,47 @@
         closePanel();
         return true;
       }
-      var box = domMake(
-        "div",
-        "position:fixed;right:16px;bottom:64px;z-index:2147483000;width:300px;background:#20222a;color:#e8e8ea;" +
-          "border:1px solid #3a3d47;border-radius:10px;padding:12px;font:12px/1.6 system-ui,Segoe UI,sans-serif;" +
-          "box-shadow:0 10px 30px rgba(0,0,0,.55)"
-      );
+      ensurePanelCss();
+      var box = el("div", "gp-card");
       box.setAttribute("data-gaplessplayer", "panel");
-      var head = domMake("div", "display:flex;justify-content:space-between;align-items:center;margin-bottom:6px");
-      head.appendChild(domMake("b", "", "GaplessPlayer " + VERSION));
-      var x = domMake("span", "cursor:pointer;color:#9aa0ad;padding:0 4px", "×");
+
+      /* ---- 标题 ---- */
+      var head = el("div", "gp-head");
+      var brand = el("div", "gp-brand");
+      brand.appendChild(el("span", null, "GaplessPlayer"));
+      brand.appendChild(el("span", "gp-ver", VERSION));
+      head.appendChild(brand);
+      var x = el("button", "gp-x", "×");
       x.onclick = function () {
         closePanel();
       };
       head.appendChild(x);
       box.appendChild(head);
 
-      panel.status = domMake("div", "color:#9aa0ad;margin-bottom:8px;word-break:break-all", statusLine());
+      /* ---- 状态 ---- */
+      panel.status = el("div", "gp-status", statusLine());
       box.appendChild(panel.status);
 
-      // 过渡风格
-      box.appendChild(domMake("div", CSS_LABEL, "过渡风格"));
-      var row = domMake("div", "margin:4px 0 8px 0");
+      /* ---- 过渡风格 ---- */
+      var sec1 = el("div", "gp-sec");
+      sec1.appendChild(el("div", "gp-cap", "过渡风格"));
+      var seg = el("div", "gp-seg");
       panel.styleBtns = [];
       ["clean", "light", "dj"].forEach(function (k) {
-        var b = domMake("button", CSS_BTN, STYLE_PRESETS[k].label);
+        var b = el("button", null, STYLE_PRESETS[k].label);
         b.__style = k;
         b.onclick = function () {
           applyStyle(k);
         };
         panel.styleBtns.push(b);
-        row.appendChild(b);
+        seg.appendChild(b);
       });
-      box.appendChild(row);
+      sec1.appendChild(seg);
 
-      // 时长
-      var r1 = domMake("div", CSS_ROW);
-      r1.appendChild(domMake("span", CSS_LABEL, "交叉时长"));
-      panel.rangeLabel = domMake("span", CSS_LABEL, "");
-      r1.appendChild(panel.rangeLabel);
-      box.appendChild(r1);
-      var range = domMake("input", "width:100%;margin-bottom:8px");
+      var r1 = rowEl("交叉时长", "");
+      panel.rangeLabel = r1.lastChild;
+      sec1.appendChild(r1);
+      var range = el("input", "gp-range");
       range.type = "range";
       range.min = "0";
       range.max = "12";
@@ -4738,14 +4865,11 @@
         refreshPanel();
       };
       panel.range = range;
-      box.appendChild(range);
+      sec1.appendChild(range);
 
-      // 曲线
-      var r2 = domMake("div", CSS_ROW);
-      r2.appendChild(domMake("span", CSS_LABEL, "曲线"));
-      var sel = domMake("select", "background:#2a2d36;color:#e8e8ea;border:1px solid #3a3d47;border-radius:6px");
+      var sel = el("select", "gp-sel");
       ["equal", "linear", "s-line", "r_s-line", "exp", "step"].forEach(function (c) {
-        var o = domMake("option", "", c);
+        var o = el("option", null, c);
         o.value = c;
         sel.appendChild(o);
       });
@@ -4756,113 +4880,116 @@
         refreshPanel();
       };
       panel.curve = sel;
-      r2.appendChild(sel);
-      box.appendChild(r2);
+      sec1.appendChild(rowEl("曲线", sel));
 
-      // 几个布尔项
-      function checkboxRow(label, getter, setter) {
-        var r = domMake("div", CSS_ROW);
-        r.appendChild(domMake("span", CSS_LABEL, label));
-        var c = domMake("input");
-        c.type = "checkbox";
-        c.checked = !!getter();
-        c.onchange = function () {
-          setter(c.checked);
-          refreshPanel();
-        };
-        r.appendChild(c);
-        box.appendChild(r);
-        return c;
-      }
-      panel.eq = checkboxRow(
-        "高通扫频",
-        function () {
-          return effectiveXfade().eq;
-        },
+      panel.eqSw = toggleEl(
+        effectiveXfade().eq,
         function (v) {
           try {
             window.__gpXfadeEq = !!v;
           } catch (e) {}
         }
       );
-      panel.trimPad = checkboxRow(
-        "裁作品静音",
-        function () {
-          return trimPadEnabled();
-        },
-        function (v) {
-          try {
-            window.__gpTrimPad = !!v;
-          } catch (e) {}
-        }
-      );
-      panel.promote = checkboxRow(
-        "流式补缓冲",
-        function () {
-          return promoteEnabled();
-        },
-        function (v) {
-          try {
-            window.__gpPromote = !!v;
-          } catch (e) {}
-        }
-      );
+      sec1.appendChild(rowEl("高通扫频", panel.eqSw));
+      box.appendChild(sec1);
 
-      // 缓存
-      var r3 = domMake("div", CSS_ROW);
-      var cacheText = domMake("span", CSS_LABEL, "");
-      var clearBtn = domMake("button", CSS_BTN, "清空缓存");
+      /* ---- 行为 ---- */
+      var sec2 = el("div", "gp-sec");
+      sec2.appendChild(el("div", "gp-cap", "播放行为"));
+      sec2.appendChild(
+        rowEl(
+          "拍点对齐",
+          toggleEl(autoMixEnabled(), function (v) {
+            try {
+              window.__gpAutoMix = !!v;
+            } catch (e) {}
+            log("[ui] 拍点对齐 → " + (v ? "开" : "关"));
+          })
+        )
+      );
+      sec2.appendChild(
+        rowEl(
+          "流式补缓冲",
+          toggleEl(promoteEnabled(), function (v) {
+            try {
+              window.__gpPromote = !!v;
+            } catch (e) {}
+          })
+        )
+      );
+      sec2.appendChild(
+        rowEl(
+          "裁作品静音",
+          toggleEl(trimPadEnabled(), function (v) {
+            try {
+              window.__gpTrimPad = !!v;
+            } catch (e) {}
+          })
+        )
+      );
+      box.appendChild(sec2);
+
+      /* ---- 缓存 ---- */
+      var sec3 = el("div", "gp-sec");
+      sec3.appendChild(el("div", "gp-cap", "缓存"));
+      panel.cacheText = el("span", "gp-val", (S.recentBufs || []).length + " 首 · " + sizeText(recentBytes()));
+      var clearBtn = el("button", "gp-btn", "清空");
       clearBtn.onclick = function () {
         clearCaches();
         refreshPanel();
       };
-      r3.appendChild(cacheText);
+      sec3.appendChild(rowEl("最近缓冲", panel.cacheText));
+      var r3 = el("div", "gp-row");
+      r3.appendChild(el("span", null, "字节缓存"));
       r3.appendChild(clearBtn);
-      box.appendChild(r3);
-      panel.cacheText = cacheText;
+      sec3.appendChild(r3);
+      box.appendChild(sec3);
 
-      // 诊断（折叠）
-      var diag = domMake("details", "margin-top:8px;color:#9aa0ad");
-      diag.appendChild(domMake("summary", "cursor:pointer", "诊断"));
+      /* ---- 诊断（折叠） ---- */
+      var diag = el("details", "gp-diag");
+      diag.appendChild(el("summary", null, "诊断"));
       [
-        ["强制缓冲路径", "__gpStream", false],
-        ["关掉预约", "__gpSeamless", false],
-        ["整条交回原生", "__gpNativeAll", false],
-        ["automix 探针", "__gpProbe", false],
-        ["拍点对齐（Automix）", "__gpAutoMix", true],
+        ["强制缓冲路径", "__gpStream"],
+        ["关掉预约", "__gpSeamless"],
+        ["整条交回原生", "__gpNativeAll"],
+        ["automix 探针", "__gpProbe"],
       ].forEach(function (it) {
-        var r = domMake("div", CSS_ROW);
-        r.appendChild(domMake("span", CSS_LABEL, it[0]));
-        var c = domMake("input");
-        c.type = "checkbox";
-        c.onchange = function () {
-          try {
-            if (it[2]) window[it[1]] = c.checked;
-            else window[it[1]] = c.checked ? true : undefined;
-          } catch (e) {}
-        };
-        r.appendChild(c);
-        diag.appendChild(r);
+        diag.appendChild(
+          rowEl(
+            it[0],
+            toggleEl(false, function (v) {
+              try {
+                window[it[1]] = v ? true : undefined;
+              } catch (e) {}
+            })
+          )
+        );
       });
-      var logBtn = domMake("button", CSS_BTN, "复制日志路径");
+      var logBtn = el("button", "gp-btn", "复制日志路径");
       logBtn.onclick = function () {
         try {
           if (navigator.clipboard) navigator.clipboard.writeText(LOG);
         } catch (e) {}
       };
+      var foot = el("div", "gp-foot");
+      foot.appendChild(el("span", null, "日志：" + LOG));
+      diag.appendChild(foot);
       diag.appendChild(logBtn);
       box.appendChild(diag);
 
       document.body.appendChild(box);
       panel.box = box;
+      if (panel.btn) panel.btn.className = "gp-fab on";
 
-      // 每秒刷一次状态（便宜：只有文本节点）
       if (!panel.timer) {
         panel.timer = setInterval(function () {
           if (!panel.box) return;
           try {
             if (panel.status) panel.status.textContent = statusLine();
-            if (panel.cacheText) panel.cacheText.textContent = "缓存 " + (S.recentBufs || []).length + " 首 / " + sizeText(recentBytes());
+            if (panel.cacheText) {
+              panel.cacheText.textContent =
+                (S.recentBufs || []).length + " 首 · " + sizeText(recentBytes());
+            }
           } catch (e) {}
         }, 1000);
       }
@@ -4874,32 +5001,21 @@
     }
   }
 
-  /** 右下角一个小圆钮（很淡，hover 才明显）；`window.__gpHideButton = true` 可隐藏 */
+  /** 右下角一颗小圆钮（很淡，hover 才明显）；`window.__gpHideButton = true` 可隐藏 */
   function initPanel() {
     try {
       if (typeof document === "undefined" || !document || typeof document.createElement !== "function") return;
       if (window.__gpHideButton) return;
       if (panel.btn) return;
-      var b = domMake(
-        "div",
-        "position:fixed;right:14px;bottom:18px;width:26px;height:26px;border-radius:50%;z-index:2147482999;" +
-          "background:#2a2d36;color:#9aa0ad;border:1px solid #3a3d47;text-align:center;line-height:26px;" +
-          "font:12px system-ui;cursor:pointer;opacity:.35;transition:opacity .2s;user-select:none",
-        "G"
-      );
+      ensurePanelCss();
+      var b = el("div", "gp-fab", "♪");
       b.title = "GaplessPlayer 设置";
-      b.onmouseenter = function () {
-        b.style.opacity = "1";
-      };
-      b.onmouseleave = function () {
-        b.style.opacity = ".35";
-      };
       b.onclick = function () {
         openPanel();
       };
       document.body.appendChild(b);
       panel.btn = b;
-      log("[ui] 设置面板按钮已注入（右下角「G」；window.__gpHideButton = true 可隐藏）");
+      log("[ui] 设置面板按钮已注入（右下角「♪」；window.__gpHideButton = true 可隐藏）");
     } catch (e) {
       log("[ui] ★ 注入按钮失败 ｜ " + (e && e.message));
     }

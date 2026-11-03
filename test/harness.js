@@ -502,6 +502,7 @@ function createEnv(hooks) {
     "APP_CONF",
     "Audio",
     "console",
+    "document",
     src
   );
 
@@ -527,7 +528,9 @@ function createEnv(hooks) {
     loadedPlugins,
     APP_CONF,
     FakeAudio,
-    { log() {}, warn() {}, error() {} }
+    { log() {}, warn() {}, error() {} },
+    // ★ v1.5.2：默认没有 DOM（面板会安静跳过）；需要测面板时用 createEnv({ document: fakeDoc() })
+    hooks && hooks.document ? hooks.document : undefined
   );
 
   return {
@@ -3514,6 +3517,146 @@ async function main() {
       // 期望 pos ≈ 交叉时长(3s) + 入点(≈1.2s)；丢掉入点的话会正好是 3.0s
       ok(pos > 3.4, "★★ 交接后进度从入点开始（pos=" + pos.toFixed(2) + "s ≈ 3 + 入点，不是 3）");
     }
+
+    // ---- (c) 干净风格（没有交叉）也跳过 B 开头的空白，但不做拍点对齐 ----
+    {
+      const e = await seamlessEnv("playorder", {
+        hooks: { decode: () => mkClickGap({ bpm: 120, gap: 1.2, secs: 200 }) },
+      });
+      eq(e.win.gaplessPlayer.xfade().sec, 0, "（前提）顺序播放 + 智能默认 = 干净风格（0s 交叉）");
+      setLeft(e, 1.0); // 0s 交叉时预约窗口更窄（winMax=1.5）
+      const n1 = e.started.length;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(e.started.length, n1 + 1, "（前提）照常预约了 B");
+      ok(countLog(e, "[automix] B 入点") >= 1, "★★ 没有交叉时也会选入点");
+      ok(countLog(e, "开头空白") >= 1, "★★ 只跳空白，不做拍点对齐");
+      const s2 = lastOf(e.started);
+      ok(Number(s2.off) > 1.0, "★★ B 从空白之后开始（off=" + Number(s2.off).toFixed(2) + "s）");
+      ok(Number(s2.dur) < 199, "★★ 可播时长相应变短（dur=" + Number(s2.dur).toFixed(1) + "s）");
+    }
+  }
+
+  section("91. ★★★ v1.5.2 设置面板（自绘 DOM / 分段控件 / 拨动开关）");
+  {
+    /* 极简假 DOM：只覆盖面板真正用到的那点 API（appendChild / className / textContent / onclick…） */
+    function makeDoc() {
+      function node(tag) {
+        const n = {
+          tagName: tag,
+          className: "",
+          textContent: "",
+          value: "",
+          checked: false,
+          children: [],
+          attrs: {},
+          _parent: null,
+          appendChild(c) {
+            c._parent = n;
+            n.children.push(c);
+            return c;
+          },
+          removeChild(c) {
+            n.children = n.children.filter((x) => x !== c);
+            if (c) c._parent = null;
+            return c;
+          },
+          setAttribute(k, v) {
+            n.attrs[k] = v;
+          },
+          get lastChild() {
+            return n.children[n.children.length - 1] || null;
+          },
+          get parentNode() {
+            return n._parent;
+          },
+        };
+        return n;
+      }
+      const body = node("body");
+      const head = node("head");
+      return { body, head, createElement: node, querySelector: () => null };
+    }
+
+    const doc = makeDoc();
+    const e = createEnv({ document: doc });
+    e.boot();
+    await flush();
+    e.flushTimers();
+
+    // ---- 右下角按钮 + 样式只注入一次 ----
+    eq(doc.body.children.length, 1, "★★ 右下角按钮注入（1 个元素）");
+    eq(doc.body.children[0].className, "gp-fab", "★★ 用的是新的圆角图标按钮");
+    eq(String(doc.body.children[0].textContent), "♪", "★★ 图标是 ♪");
+    eq(doc.head.children.length, 1, "★★ 面板样式注入到 head");
+    const css = String((doc.head.children[0] || {}).textContent || "");
+    ok(css.indexOf(".gp-card") >= 0 && css.indexOf(".gp-sw") >= 0, "★★ 样式里有卡片与拨动开关");
+    ok(css.indexOf(".gp-seg>button.on") >= 0, "★★ 分段控件的选中态样式也在");
+
+    const api = e.win.gaplessPlayer;
+    eq(api.openPanel(), true, "★★ openPanel() 打开面板");
+    eq(doc.body.children.length, 2, "★★ 卡片挂到 body");
+    const card = doc.body.children[1] || { children: [], className: "", textContent: "" };
+    eq(card.className, "gp-card", "★★ 卡片类是 gp-card");
+    eq(doc.body.children[0].className, "gp-fab on", "★★ 打开时按钮高亮");
+    eq(doc.head.children.length, 1, "★★ 样式不重复注入");
+
+    const walk = (n, out) => {
+      out.push(n);
+      (n.children || []).forEach((c) => walk(c, out));
+      return out;
+    };
+    const all = walk(card, []);
+    const texts = all.map((n) => String(n.textContent || "")).join("|");
+    ok(/GaplessPlayer/.test(texts) && /1\.5\.2/.test(texts), "★★ 标题带版本号");
+    ok(/引擎=/.test(texts), "★★ 状态行在面板里");
+    ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
+    ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
+    ok(/诊断/.test(texts), "★★ 诊断还是折叠的");
+
+    // ---- 分段控件：点 DJ 立刻生效并高亮 ----
+    const segBtns = all.filter(
+      (n) => n.tagName === "button" && ["干净", "轻过渡", "DJ"].indexOf(String(n.textContent)) >= 0
+    );
+    eq(segBtns.length, 3, "★★ 三个风格按钮（分段控件）");
+    segBtns[2].onclick();
+    eq(api.xfade().source, "style:dj", "★★ 点 DJ → 立刻生效");
+    eq(segBtns[2].className, "on", "★★ 选中的那个高亮");
+    eq(segBtns[0].className, "", "★★ 其余不高亮");
+
+    // ---- 拨动开关：拍点对齐默认开，点一下关、再点开 ----
+    const toggles = all.filter((n) => /^gp-sw/.test(n.className));
+    ok(toggles.length >= 4, "★★ 拨动开关若干（" + toggles.length + " 个）");
+    // 按「行的标签」定位开关（顺序不可靠：扫频开关在行为开关之前）
+    const rowOf = (label) =>
+      all.filter(
+        (n) => n.className === "gp-row" && n.children[0] && String(n.children[0].textContent) === label
+      )[0];
+    const beatRow = rowOf("拍点对齐") || { children: [] };
+    const beatSw = beatRow.children[1] || { className: "", onclick() {} };
+    eq(beatSw.className, "gp-sw on", "★★ 「拍点对齐」那一行的开关默认是开");
+    eq(beatSw.className, "gp-sw on", "★★ 「拍点对齐」默认就是开");
+    beatSw.onclick();
+    eq(e.win.__gpAutoMix, false, "★★ 点一下 → 关");
+    eq(beatSw.className, "gp-sw", "★★ 视觉同步（不再是 on）");
+    e.flushTimers(); // 日志是攒着写的，断言前得先冲一遍
+    ok(countLog(e, "[ui] 拍点对齐 → 关") >= 1, "★★ 有关闭日志");
+    beatSw.onclick();
+    eq(e.win.__gpAutoMix, true, "★★ 再点一下 → 开");
+
+    // ---- 滑杆：拖一下就是显式时长 ----
+    const range = all.filter((n) => n.tagName === "input" && n.className === "gp-range")[0];
+    ok(!!range, "★★ 有时长滑杆");
+    range.value = "6";
+    range.oninput();
+    eq(api.xfade().source, "explicit", "★★ 拖滑杆 → 变成显式时长（优先级最高）");
+    eq(api.xfade().sec, 6, "★★ 值 = 6s");
+
+    // ---- 再点一次收起 ----
+    eq(api.openPanel(), true, "★★ 再调 openPanel() 收起");
+    eq(doc.body.children.length, 1, "★★ 卡片被移除");
+    eq(doc.body.children[0].className, "gp-fab", "★★ 按钮恢复不高亮");
   }
 
   /* ---------- 汇总 ---------- */

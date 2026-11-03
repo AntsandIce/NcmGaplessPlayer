@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.5.1";',
+    find: 'var VERSION = "1.5.2";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -735,8 +735,8 @@ const MUTATIONS = [
   {
     name: "v1.5.1: B 的入点永远从 0 开始（前奏/空白照吃不误）",
     file: "main.js",
-    find: "        entry = pickBEntry(gB2, btrim, bdur, buf);",
-    replace: "        entry = { offset: btrim.start, skip: 0, reason: '变异' };",
+    find: "          ? pickBEntry(gB2, btrim, bdur, buf)",
+    replace: "          ? { offset: btrim.start, skip: 0, reason: '变异' }",
     expect: "90",
   },
   {
@@ -759,6 +759,49 @@ const MUTATIONS = [
     find: "      S.startOffset = sc.startOffset || 0; // ★ v1.5.1：B 可能从半拍/空白之后进场",
     replace: "      S.startOffset = 0; // 变异：丢掉入点",
     expect: "90",
+  },
+  {
+    name: "v1.5.2: 拍点对齐默认关（还得手动开）",
+    file: "main.js",
+    find: '      if (typeof window !== "undefined" && window && window.__gpAutoMix === false) return false;',
+    replace: "      return false; // 变异：默认关",
+    expect: "91",
+  },
+  {
+    name: "v1.5.2: 状态行不显示拍点状态（默认开这件事看不见）",
+    file: "main.js",
+    find: '      beatText = "开（已分析 " + bn + " 段）";',
+    replace: '      beatText = "关"; // 变异：不显示',
+    expect: "91",
+  },
+  {
+    name: "v1.5.2: 分段控件不高亮（不知道现在选的哪档）",
+    file: "main.js",
+    find: '        b.className = on ? "on" : "";',
+    replace: '        b.className = ""; // 变异：不高亮',
+    expect: "91",
+  },
+  {
+    name: "v1.5.2: 拨动开关点了不回调（样子货）",
+    file: "main.js",
+    find: "        onChange(sw.__on);",
+    replace: "        /* 变异：不回调 */",
+    expect: "91",
+  },
+  {
+    name: "v1.5.2: 干净风格就不管开头空白了（接缝处留个洞）",
+    file: "main.js",
+    find: "          : pickBEntry(null, btrim, bdur, buf, { silenceOnly: true });",
+    replace: "          : { offset: btrim.start, skip: 0, reason: '变异' };",
+    expect: "90",
+  },
+
+  {
+    name: "v1.5.2: 面板样式没注入（回到浏览器默认控件）",
+    file: "main.js",
+    find: '      ensurePanelCss();\n      var b = el("div", "gp-fab", "♪");',
+    replace: '      var b = el("div", "gp-fab", "♪");',
+    expect: "91",
   },
 ];
 
