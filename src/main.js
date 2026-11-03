@@ -610,8 +610,11 @@
         S.elRetryToken = token;
         var tid = S.curTrackId;
         log("[stream] 3.x：加密 token 不可播 → 改用自有地址重试 ｜ track=" + tid);
-        resolveUrl320(tid)
-          .catch(function () { return outerUrlFor(tid); })
+        var pu2 = S.proactiveUrl;
+        var urlP = (pu2 && pu2.promise && pu2.trackId === tid)
+          ? pu2.promise.then(function (u) { return u || outerUrlFor(tid); })
+          : resolveUrl320(tid).catch(function () { return outerUrlFor(tid); });
+        urlP
           .then(function (u) {
             if (token !== S.loadToken) return;
             try {
@@ -692,6 +695,15 @@
 
     /** 真正把 src 挂上去。返回 false = 失败（调用方负责退回缓冲路径） */
     function apply(u) {
+      // ★ 3.x：若 setCurrentPlay 时预解析的地址**已经到手**，直接用（随机模式下省掉 token 试错那一圈）；
+      //   还没到就先用 token（不阻塞起播），失败后由 onErr 复用同一个 promise 重试。
+      if (isNcm3()) {
+        var pu = S.proactiveUrl;
+        if (pu && pu.url && pu.trackId === trackIdOf(token)) {
+          log("[stream] 3.x：用预解析地址直接起播（省掉 token 试错）");
+          u = pu.url;
+        }
+      }
       if (token !== S.loadToken) return true; // 已经过期 → 当作已处理
       try {
         el.pause();
@@ -2577,6 +2589,20 @@
           if (S.__endTimer) { clearTimeout(S.__endTimer); S.__endTimer = 0; }
           S.__advancedAt = Date.now();
           S.__endFallbackGen = (S.__endFallbackGen || 0) + 1;
+          // ★ 3.x 抢时间：setCurrentPlay 比 audioplayer.load 早 ~80~110ms，
+          //   现在就把地址解析好 → load 一到就能直接用，省掉「加密 token 先失败再重试」那一圈
+          //   （随机播放没有预载可命中，这几百毫秒就是全部收益）。
+          if (isNcm3()) {
+            try {
+              var __tid = tid;
+              var __slot = { trackId: __tid, url: null, promise: null };
+              __slot.promise = resolveUrl320(__tid).then(function (u) {
+                if (u) __slot.url = u;
+                return u;
+              }).catch(function () { return null; });
+              S.proactiveUrl = __slot;
+            } catch (e) {}
+          }
           // ★ v0.2.10：修掉「索引 / 下一首 是上一首的」这个会误导排查的日志 bug —— 显式传 tid。
           //   （`S.curTrackId = tid` 在这行之后才执行，v0.2.7 起就是这样。）
           var nx = nextTrack(tid);
