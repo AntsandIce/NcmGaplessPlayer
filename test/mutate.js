@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.3.2";',
+    find: 'var VERSION = "1.3.3";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -654,6 +654,27 @@ const MUTATIONS = [
     find: "    if (!probeOn()) return cb;",
     replace: "    if (true) return cb; // 变异：不记录",
     expect: "86",
+  },
+  {
+    name: "v1.3.3: ctx 起不来也硬按住原生（开机直接哑，还得点播放）",
+    file: "main.js",
+    find: "    if (ctxBlocked) {",
+    replace: "    if (false) { // 变异：不兜底",
+    expect: "87",
+  },
+  {
+    name: "v1.3.3: 手势到了不交回引擎（永远停在原生死扛）",
+    file: "main.js",
+    find: "      S.deferNative = false;",
+    replace: "      /* 变异：不交回 */",
+    expect: "87",
+  },
+  {
+    name: "v1.3.3: 接管第一首时不停原生（双声）",
+    file: "main.js",
+    find: "        if (S.nativeRunning) pauseNative();",
+    replace: "        /* 变异：不停原生 */",
+    expect: "87",
   },
 ];
 

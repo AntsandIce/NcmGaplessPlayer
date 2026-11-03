@@ -1,8 +1,60 @@
-# GaplessPlayer 开发日志（0.1.0 → 1.3.2）
+# GaplessPlayer 开发日志（0.1.0 → 1.3.3）
 
 > 面向使用者的安装与使用说明见 [README](../README.md)。
 
 ---
+
+## ★ v1.3.3 —— autoplay 兜底：不带启动参数也不用点播放
+
+### 问题出在哪
+
+`AudioContext` 在**首次用户手势之前**一直是 `suspended`，`resume()` 也只能挂在手势上
+（Chromium 的 autoplay 策略）。于是真机上的现象是：
+
+```
+[play] ctx.resume() ｜ state=suspended
+[play] source.start ｜ at=0.020 ｜ … ｜ ctxTime=0.000     ← ctx 时钟根本没走
+```
+
+source 照常 start，但整个图不出声（`ctxTime=0.000` 就是证据）。用户听到的就是「没声音」，
+直到随手点一下 —— 所以 README 里一直挂着「建议加 `--autoplay-policy=no-user-gesture-required`」。
+
+**JS 绕不过这个策略**（能绕的话这策略就没意义了）。所以换思路：
+
+### 做法：起不来就先让原生播，第一次点按后接管
+
+| 状态 | 含义 | 行为 |
+|---|---|---|
+| `S.deferNative` | 还没拿到手势 | 音频命令（load/play/pause/seek/setVolume）**整条放行给原生**；非音频命令照常处理（记列表、预载） |
+| `S.nativeRunning` | 原生正在响 | 音频命令照样放行 —— **但 `load` 除外**：接管就是靠它把我们拉进播放 |
+| 手势到达 | 任意 `pointerdown/mousedown/keydown/touchstart` | `ctx.resume()` + `deferNative=false`；下一次 `load` 进来时先 `pauseNative()` 再走我们自己的引擎 |
+
+三个细节值得记：
+
+1. **`load` 必须排除在放行之外**。第一版写成「`nativeRunning` 时音频命令一律放行」——
+   结果 `load` 也放行了，`pauseNative()` 永远不执行，接管瞬间双声，验证台当场报红
+   （第 87 段「接管后 load 被我们拦下」）。
+2. **契约自答要让位**。`getPlayedTime / getPlaybackInfo` 平时由我们自答（修跳歌），
+   但原生死扛阶段必须交回原生 —— 否则会答「播到 0 秒」，把客户端骗得再判一次结束。
+   守卫：`!S.deferNative && !S.nativeRunning`。
+3. **不能在拿到手势时立刻按住原生**。那样会把用户正在听的歌掐断；正确姿势是
+   「原生把这第一首放完，下一首 `load` 到了再按住」——中间没有一段静音或双声。
+
+### 代价（写进 README 的已知限制）
+
+不开启动参数时，**本次启动的第一首是原生播的**：那一首没有无缝/交叉。从第二首开始照旧。
+想要第一首也无缝 → 用带参数的快捷方式（`AudioContext` 一开就是 running）。
+
+### 验收
+
+```
+node test/harness.js  → 通过 431 项，失败 0 项（新增第 87 段 16 项）
+node test/mutate.js   → 变异点 90 个，抓住 90 个，漏网 0 个
+```
+
+第 87 段覆盖：suspended 时不按住原生（开机不哑）/ 自动播的 load 放行给原生且不下载 /
+契约不自答 / 手势后 resume + 交回引擎 / 接管时先按住原生再播 /
+ctx 能起时行为完全不变（照旧按住原生、照旧拦截）。
 
 ## ★ v1.3.2 —— 交叉曲线可选 + 高通扫频 + automix 探针（P3 的前哨）
 

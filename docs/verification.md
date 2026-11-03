@@ -300,6 +300,29 @@ window.__gpXfadeCurve = "step"     // 硬切式
 
 ---
 
+## 4f. autoplay 兜底（v1.3.3）
+
+不带 `--autoplay-policy` 启动时，`AudioContext` 在首次点按前一直是 `suspended`，JS 绕不过去，
+所以插件改成「起不来就先让原生播」：
+
+```
+[autoplay] ★ AudioContext 起不来（state=suspended）→ 先让**原生**播放器播；第一次点按（点哪里都算）后交回 Web Audio。本次启动的第一首没有无缝/交叉。
+[autoplay] 已挂上「第一次点按」监听（任何点击/按键都算）
+[autoplay] 收到手势 → AudioContext.resume() ｜ state=suspended
+[autoplay] ★ 交回 Web Audio 引擎（原生这一首继续放完，下一首起由我们接管）
+```
+
+### 怎么确认它在工作
+
+1. 日志里出现 `[autoplay] ★ AudioContext 起不来` → 说明这次启动没带参数、走了兜底；
+2. 此时**没有** `[env] 已命令原生播放器暂停`（否则就是又哑了）；
+3. 随便点一下窗口 → 出现「交回 Web Audio 引擎」；之后的切歌日志恢复正常（`[sched] 预约` 等）。
+
+如果日志里**没有** `[autoplay]` 那行，说明 `AudioContext` 一开就是 `running`
+（带了启动参数），一切照旧、从第一首就无缝。
+
+---
+
 ## 5. 排查建议
 
 - 关键日志：`[sched] 预约 / 认领`、`[end] ★ 自然播完 → 无缝交接`、`[preload] 320k 接口`、`[nafetch]`。
@@ -308,5 +331,5 @@ window.__gpXfadeCurve = "step"     // 硬切式
   2. 看有没有 `[sched] 预约`：没有 = 门槛没过（模式 / 预测 / 时间窗）；
   3. 看 `[preload]` 是否出现 `320k 接口`，失败会自动退 128k。
 - 一次结束推进两首：确认 `getPlayedTime` / `getPlaybackInfo` 被插件接管（结束窗口内应有「自答」记录）。
-- 上线验证：`node test/harness.js` → `通过 415 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86）。
-  变异测试：`node test/mutate.js` → `变异点 87 个，抓住 87 个，漏网 0 个`。
+- 上线验证：`node test/harness.js` → `通过 431 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86、autoplay 兜底 87）。
+  变异测试：`node test/mutate.js` → `变异点 90 个，抓住 90 个，漏网 0 个`。

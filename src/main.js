@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.3.2";
+  var VERSION = "1.3.3";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -413,6 +413,12 @@
     srcFilter: null, // ★ v1.3.2：同一路的「高通」（交叉时做扫频淡出，平时 20Hz = 直通）
     mediaGain: null, // 流式元素那一路的增益（同上）
     mediaFilter: null, // ★ v1.3.2：流式元素那一路的高通
+    /* ---- v1.3.3：autoplay 兜底 ---- */
+    deferNative: false, // 还没拿到用户手势 → 音频命令整条放行给原生
+    nativeRunning: false, // 原生正在响（接管那一首要先把原生按住）
+    gestureSeen: false, // 是否已经拿到过用户手势
+    __rawCall: null, // 原始 channel.call（绕开拦截用）
+    __armedGesture: false, // 手势监听是否已挂（防止重复挂）
     /* ---- v0.4.0 流式路径（<audio>）---- */
     el: null, // ★ 持久的 <audio>：createMediaElementSource 对同一元素只能调一次 → 全生命周期复用
     mediaSrc: null, // MediaElementSource → 接进 S.gain
@@ -3535,8 +3541,91 @@
     }
   }
 
+  /* ==================== v1.3.3 · autoplay 兜底（不带启动参数也不用点播放）==================== */
+
+  /**
+   * 问题：Chromium 的 autoplay 策略让 `AudioContext` 在**首次用户手势之前**一直是 `suspended`，
+   *   `resume()` 也只能挂在手势上。于是就出现「每次启动都要先点一次播放」——
+   *   按 README 加 `--autoplay-policy=no-user-gesture-required` 能解决，但那是让用户改快捷方式。
+   *
+   * ★ JS 里**没有办法**绕过这个策略（能绕的话这策略就没意义了）。所以换个思路：
+   *   起不来的时候**先让原生播放器播**（它走 C++ 音频引擎，不受网页策略限制），
+   *   等用户第一次点按（点哪里都算）→ 再 `ctx.resume()` 并交回我们的引擎。
+   *
+   * 结果：不加任何启动参数也不用点「播放」，只是**第一首是原生播的**（那一首没有无缝/交叉），
+   *   从下一首开始照旧全部由我们接管。
+   *
+   * 两个关键状态：
+   *   S.deferNative  = 还没拿到手势 → 音频命令整条放行给原生
+   *   S.nativeRunning = 原生正在响（接管的第一首 load 到了要先把原生按住，否则双声）
+   */
+
+  /** 原始 `channel.call`（绕开我们自己的拦截） */
+  function rawCall(name, cb, args) {
+    var fn = S.__rawCall;
+    if (typeof fn !== "function") {
+      log("[env] ★ 没有原始 channel.call，命令发不出去 ｜ " + name);
+      return;
+    }
+    try {
+      fn.call(channel, name, cb || function () {}, args || []);
+    } catch (e) {
+      log("[env] ★ rawCall(" + name + ") 失败 ｜ " + (e && e.message));
+    }
+  }
+
+  /** 把原生播放器按住（避免和我们的 Web Audio 叠成双声道） */
+  function pauseNative() {
+    rawCall("audioplayer.pause", function () {}, ["", ""]);
+    S.nativeRunning = false;
+    log("[env] 已命令原生播放器暂停");
+  }
+
+  /**
+   * 等第一次用户手势。
+   * ★ 一旦拿到手势就把 ctx 拉起来（哪怕不是在放音频 —— 早拉起来后续切歌才不会有静默）；
+   *   如果此时还在「原生死扛」阶段，就交出接管权，让下一次 `load` 由我们的引擎播。
+   */
+  function armTakeover() {
+    if (S.__armedGesture) return;
+    S.__armedGesture = true;
+    var EVENTS = ["pointerdown", "mousedown", "keydown", "touchstart"];
+    function onGesture() {
+      for (var i = 0; i < EVENTS.length; i++) {
+        try {
+          window.removeEventListener(EVENTS[i], onGesture, true);
+        } catch (e) {}
+      }
+      S.gestureSeen = true;
+      try {
+        if (S.ctx && S.ctx.state === "suspended") {
+          var pr = S.ctx.resume();
+          if (pr && pr.catch) pr.catch(function () {});
+          log("[autoplay] 收到手势 → AudioContext.resume() ｜ state=" + S.ctx.state);
+        }
+      } catch (e) {}
+      if (!S.deferNative) return;
+      S.deferNative = false;
+      log("[autoplay] ★ 交回 Web Audio 引擎（原生这一首继续放完，下一首起由我们接管）");
+      // 提前把「当前曲目 / 下一首」预下起来，争取接管那一首就能无缝
+      try {
+        maybePreload();
+      } catch (e) {}
+    }
+    for (var i = 0; i < EVENTS.length; i++) {
+      try {
+        window.addEventListener(EVENTS[i], onGesture, true);
+      } catch (e) {}
+    }
+    log("[autoplay] 已挂上「第一次点按」监听（任何点击/按键都算）");
+  }
+
   function handle(name, cb, args) {
     args = args || [];
+    // ★ v1.3.3：还在「原生死扛」阶段（或原生正在响）→ 音频命令一律放行给原生。
+    //   ⚠️ 这条必须在所有拦截逻辑**之前**，否则我们会把命令截下来、原生却还在放 → 双声/失控。
+    //   ⚠️ `load` 要排除在外：接管的第一首就是靠它把我们拉进播放（进去之后第一件事是按住原生）。
+    if (AUDIO_CMDS[name] && (S.deferNative || (S.nativeRunning && name !== "audioplayer.load"))) return false;
     // ★★ 3.x 事件契约重写：getPlayedTime / getPlaybackInfo 由**我们自己**按引擎真实状态回答。
     //   原生播放器被我们按住（暂停/未加载），对「新曲目的 playId」只会回
     //     {playedTime:0, result:false} → 客户端据此再判一次「结束」→ 跳歌 / ping-pong。
@@ -3544,7 +3633,8 @@
     //     请求 args[0] = { playId: "<trackId>_<sid>" }
     //     getPlayedTime  期望 → { playedAudioTime, playedTime, result }
     //     getPlaybackInfo期望 → { playId, playedTime, playedPercent, result, deviceAudioFormat, playAudioFormat, ... }
-    if (isNcm3() && (name === "audioplayer.getPlaybackInfo" || name === "audioplayer.getPlayedTime")) {
+    if (!S.deferNative && !S.nativeRunning && isNcm3() &&
+        (name === "audioplayer.getPlaybackInfo" || name === "audioplayer.getPlayedTime")) {
       try {
         var __q = (args && args[0]) || {};
         var __qid = typeof __q.playId === "string" ? __q.playId : "";
@@ -3584,6 +3674,8 @@
     switch (name) {
       case "audioplayer.load":
         log("[cmd] ▶ load ｜ audioId=" + args[0]);
+        // ★ v1.3.3：接管的第一首 —— 原生还在放它，不按住就会和我们叠成双声道
+        if (S.nativeRunning) pauseNative();
         introspectRegistry("收到 load");
         loadSong(args[0], args[1]);
         return true; // 照 LFP：不回调
@@ -3984,17 +4076,27 @@
       log("[env] 初始音量 = " + S.volume);
     } catch (e) {}
 
-    // 把原生播放器按住（照 LFP 的做法），否则会和我们的 Web Audio 叠成双声道
+    // 把原生播放器按住（照 LFP 的做法），否则会和我们的 Web Audio 叠成双声道。
+    // ★ v1.3.3：改成「先看 AudioContext 能不能起」——起不来就先让原生播（见下）。
     try {
-      var native = channel.call;
-      native.call(channel, "audioplayer.pause", function () {}, ["", ""]);
-      log("[env] 已命令原生播放器暂停");
-    } catch (e) {
-      log("[env] 按住原生播放器失败 ｜ " + (e && e.message));
+      S.__rawCall = channel.call; // 原始通道（pauseNative / rawCall 用，绕开自己的拦截）
+    } catch (e) {}
+
+    ensureCtx();
+    var ctxBlocked = !!(S.ctx && S.ctx.state === "suspended");
+    armTakeover();
+    if (ctxBlocked) {
+      S.deferNative = true;
+      S.nativeRunning = true;
+      log(
+        "[autoplay] ★ AudioContext 起不来（state=suspended）→ 先让**原生**播放器播；" +
+          "第一次点按（点哪里都算）后交回 Web Audio。本次启动的第一首没有无缝/交叉。"
+      );
+    } else {
+      pauseNative();
     }
 
     installInterceptor();
-    ensureCtx();
 
     // 启动 3 秒后看一眼 UI 的处理器注册表（那时 UI 已经起来了）
     setTimeout(function () {

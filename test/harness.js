@@ -97,8 +97,7 @@ function createEnv(hooks) {
   const ctx = {
     sampleRate: 48000,
     currentTime: 0,
-    state: "running",
-    destination: { __node: "destination" },
+    state: "running",    destination: { __node: "destination" },
     createGain() {
       // ★ v1.3.0：参数要能记录自动化事件（交叉淡入淡出就是靠 setValueCurveAtTime）
       const param = {
@@ -215,6 +214,8 @@ function createEnv(hooks) {
       return Promise.resolve();
     },
   };
+  // ★ v1.3.3：模拟「autoplay 策略把 AudioContext 卡在 suspended」（不带启动参数的真机就是这样）
+  if (hooks && hooks.suspended) ctx.state = "suspended";
 
   /* ---- 假 performance（可控时钟，用来验证 playedTime 累计）---- */
   const perf = {
@@ -3103,6 +3104,80 @@ async function main() {
       ok(countLog(eOn, "[probe] audioplayer.load ｜ ★ 形状变了") >= 1, "★★ 明确标出「形状变了」");
       ok(countLog(eOn, "mix_strategy:str(") >= 1, "★★ 新字段（mix_strategy）一眼可见 —— 这就是 automix 接上时的信号");
     }
+  }
+
+  section("87. ★★★ v1.3.3 autoplay 兜底：不带启动参数也不用点播放（先让原生播，第一次点按后接管）");
+  {
+    // ---- (a) ctx 卡在 suspended → 开机不按住原生，音频命令整条放行 ----
+    const e = createEnv({ suspended: true });
+    e.boot();
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[autoplay] ★ AudioContext 起不来") >= 1, "★★ 识别出 autoplay 被挡（ctx=suspended）");
+    eq(
+      e.startupCalls.some((c) => c.name === "audioplayer.pause"),
+      false,
+      "★★ 开机**没有**按住原生播放器（否则就没声了）"
+    );
+    ok(countLog(e, "已挂上「第一次点按」监听") >= 1, "★★ 挂上了「第一次点按」监听");
+
+    // 客户端自己自动播 → 命令放行给原生（我们不拦、也就不下载）
+    streamLoad(e, "1000_1_3136952023", "http://cdn.example/auto.flac");
+    await flush();
+    e.flushTimers();
+    ok(
+      e.nativeCalls.some((c) => c.name === "audioplayer.load"),
+      "★★ 自动播的 load 被放行给原生（这一首由原生播，用户不用点播放）"
+    );
+    eq(e.fetchLog.length, 0, "★★ 我们一行都没下载（没有接管）");
+    eq(countLog(e, "[cmd] ▶ load"), 0, "★★ 也没进我们的 load 分支");
+
+    // 契约自答必须让位给原生（否则会答「播到 0 秒」把客户端骗了）
+    const pt = [];
+    e.channel.call("audioplayer.getPlayedTime", (r) => pt.push(r), [{ playId: "1000_1_3136952023" }]);
+    eq(pt.length, 0, "★★ getPlayedTime 没有自答（原生死扛阶段交给原生）");
+    ok(
+      e.nativeCalls.some((c) => c.name === "audioplayer.getPlayedTime"),
+      "★★ 放行到了原生"
+    );
+
+    // ---- (b) 第一次点按 → 拉起 ctx + 交回引擎；下一次 load 由我们播 ----
+    e.fireGesture();
+    await flush();
+    e.flushTimers();
+    eq(e.ctx.state, "running", "★★ 手势后 AudioContext 被 resume（state=running）");
+    ok(countLog(e, "★ 交回 Web Audio 引擎") >= 1, "★★ 交回我们的引擎");
+
+    const f0 = e.fetchLog.length;
+    e.channel.call("audioplayer.load", null, [
+      "2000_1_3136952023-x",
+      { songId: 2000, musicurl: "http://cdn.example/takeover.flac" },
+    ]);
+    await flush();
+    await flush();
+    e.flushTimers();
+    ok(countLog(e, "[cmd] ▶ load") >= 1, "★★ 接管后 load 被我们拦下");
+    ok(e.fetchLog.length > f0, "★★ 走了我们自己的链路（下载 + 解码）");
+    ok(
+      e.nativeCalls.some((c) => c.name === "audioplayer.pause"),
+      "★★ 接管时先把原生按住（否则双声）"
+    );
+
+    // ---- (c) 正常启动（ctx=running，比如带了启动参数）→ 行为完全不变 ----
+    const e2 = createEnv();
+    e2.boot();
+    await flush();
+    e2.flushTimers();
+    eq(countLog(e2, "[autoplay] ★ AudioContext 起不来"), 0, "★★ ctx 能起时不会有兜底日志");
+    eq(
+      e2.startupCalls.some((c) => c.name === "audioplayer.pause"),
+      true,
+      "★★ 照旧开机就按住原生"
+    );
+    streamLoad(e2, "1000_1_3136952023", "http://cdn.example/normal.flac");
+    await flush();
+    e2.flushTimers();
+    ok(countLog(e2, "[cmd] ▶ load") >= 1, "★★ 照旧由我们接管");
   }
 
   /* ---------- 汇总 ---------- */
