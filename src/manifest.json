@@ -9,7 +9,8 @@
   "type": "extension",
   "betterncm_version": ">=1.0.0",
   "loadAfter": [
-    "LibFrontendPlay"
+    "LibFrontendPlay",
+    "LibEAPIRequest"
   ],
   "requirements": [],
   "injects": {
@@ -30,5 +31,6 @@
         }
       ]
     }
-  }
+  },
+  "ncm3-compatible": true
 }
