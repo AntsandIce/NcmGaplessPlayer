@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.5.4";',
+    find: 'var VERSION = "1.5.5";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -866,6 +866,27 @@ const MUTATIONS = [
     find: "    if (probeBusy) {",
     replace: "    if (false) { // 变异：不挡",
     expect: "93",
+  },
+  {
+    name: "v1.5.5: 不挂 execsqldone 回调（结果永远回不来）",
+    file: "main.js",
+    find: 'legacyNativeCmder.appendRegisterCall("execsqldone", "storage", onDone);',
+    replace: "        /* 变异：不挂 */",
+    expect: "94",
+  },
+  {
+    name: "v1.5.5: 不按 reqId 过滤（别人查库的结果会串进我们日志）",
+    file: "main.js",
+    find: '      if (String(id) !== String(reqId)) return; // 只认我们自己这条（别人也在用同一个回调名）',
+    replace: "      /* 变异：不过滤 */",
+    expect: "94",
+  },
+  {
+    name: "v1.5.5: SQL 没发到 storage.execsql（发错命令名）",
+    file: "main.js",
+    find: '        "storage.execsql",',
+    replace: '        "storage.execsqldone",',
+    expect: "94",
   },
 ];
 

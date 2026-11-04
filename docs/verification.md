@@ -458,6 +458,28 @@ gaplessPlayer.status() ／ setStyle("dj") ／ xfade() ／ clearCache() ／ openP
 
 ---
 
+## 4l. C3 续：storage.execsql 探针（v1.5.5）
+
+`
+[sql] → "SELECT name FROM sqlite_master WHERE type='table'" ｜ reqId=gp…
+[sql] ← err=0 ｜ [{"name":"current"},{"name":"last"},…]        ← 通了
+`
+
+- gaplessPlayer.sqlTables() / gaplessPlayer.sqlq("SELECT …")（面板诊断里也有按钮）；
+- 结果靠 legacyNativeCmder.appendRegisterCall("execsqldone","storage",cb) 回来，
+  参数是 (reqId, errCode, value)，我们按 reqId 过滤，**不会**误接别人的查询结果；
+- ← 无响应（1500ms） = 通道对我们不开放 → C3 判死，回退「押注 + 预开流」。
+
+拿到表名后，下一步就是：
+
+`js
+gaplessPlayer.sqlq("SELECT resourceId, randomOrder FROM current ORDER BY randomOrder ASC")
+`
+
+—— 那就是客户端的随机顺序；算一下当前项在序列里的下一位，**随机播放也能无缝**。
+
+---
+
 ## 5. 排查建议
 
 - 关键日志：`[sched] 预约 / 认领`、`[end] ★ 自然播完 → 无缝交接`、`[preload] 320k 接口`、`[nafetch]`。
@@ -466,5 +488,5 @@ gaplessPlayer.status() ／ setStyle("dj") ／ xfade() ／ clearCache() ／ openP
   2. 看有没有 `[sched] 预约`：没有 = 门槛没过（模式 / 预测 / 时间窗）；
   3. 看 `[preload]` 是否出现 `320k 接口`，失败会自动退 128k。
 - 一次结束推进两首：确认 `getPlayedTime` / `getPlaybackInfo` 被插件接管（结束窗口内应有「自答」记录）。
-- 上线验证：`node test/harness.js` → `通过 575 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86、autoplay 兜底 87、风格/状态 88、拍点 89、B 入点 90、面板 91、预开流 92、C3 侦察 93）。
-  变异测试：`node test/mutate.js` → `变异点 117 个，抓住 117 个，漏网 0 个`。
+- 上线验证：`node test/harness.js` → `通过 588 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86、autoplay 兜底 87、风格/状态 88、拍点 89、B 入点 90、面板 91、预开流 92、C3 侦察 93、DB SQL 94）。
+  变异测试：`node test/mutate.js` → `变异点 120 个，抓住 120 个，漏网 0 个`。

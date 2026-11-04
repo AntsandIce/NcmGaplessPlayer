@@ -1,9 +1,61 @@
-# GaplessPlayer 开发日志（0.1.0 → 1.5.4）
+# GaplessPlayer 开发日志（0.1.0 → 1.5.5）
 
 > 面向使用者的安装与使用说明见 [README](../README.md)。
 
 ---
 
+## ★ v1.5.5 —— C3 实测结论 + 找到真正的 DB 通道
+
+### 探针实测（真机，随机播放，三次）
+
+```
+[next] nm.play.getNextSong   ← undefined
+[next] nm.play.getPlayerMode ← undefined
+[next] nm.play.getCurrentSong← undefined
+[next] Database.getAllBy     ← undefined
+[next] IndexedDB 共 1 个库: columnGrow（keyvaluepairs / local-forage-detect-blob-support）
+[next] registeredCalls 共 73~75 个 ｜ 相关: （无）
+[next] localStorage 共 193 个键（只有 playingInfo 等加密快照）
+```
+
+⚠️ `← undefined` ≠ `← 无响应`：**回调被立刻调用了、只是没有数据** → 原生侧不认识这些命令。
+所以「tinyapp 桥的 `nm.play.getNextSong`」与「IndexedDB 直读」两条路都封死；
+store 也没挂在 window 上（webpack 模块缓存闭包私有）。
+
+### 但挖到了正门：播放列表 DB 走通道命令
+
+```js
+channel.call("storage.execsql", cb, [reqId, sqlText])
+legacyNativeCmder.appendRegisterCall("execsqldone", "storage", function (reqId, errCode, value) {...})
+```
+
+而客户端的随机顺序就是「按 `randomOrder` 列排序」（切随机模式时整列重刷随机值）。
+⇒ 只要这条通道对我们开放，一条 `SELECT resourceId, randomOrder FROM …` 就能拿到**整个随机序列**。
+
+所以 1.5.5 加了两个只读入口：
+
+```js
+gaplessPlayer.sqlTables()        // 查 sqlite_master
+gaplessPlayer.sqlq("SELECT …")   // 任意只读 SQL
+```
+
+面板 → 诊断 → **C3 SQL（只读）** 同效。判定：`← err=0 ｜ [...表名...]` = 通；
+`← 无响应（1500ms）` = 对我们不开放（那 C3 就走不通，回退押注 + 预开流）。
+
+### 又删了一处冗余
+
+原本同时挂 `appendRegisterCall("execsqldone","storage",cb)` 和
+`channel.registerCall("storage.onexecsqldone",cb)` 两条回调路径 —— 客户端自己只用前者。
+留两条的后果是「删掉任一条行为都不变」，对应变异体永远抓不住 → 只留实际在用的那条。
+
+### 验收
+
+```
+node test/harness.js  → 通过 588 项，失败 0 项（新增第 94 段 13 项）
+node test/mutate.js   → 变异点 120 个，抓住 120 个，漏网 0 个
+```
+
+---
 ## ★ v1.5.4 —— C3 侦察：能不能问出「下一首是谁」
 
 随机播放做不到无缝，根因不是 DSP，而是**不知道下一首是谁**（客户端切歌前约 80ms 才决定）。

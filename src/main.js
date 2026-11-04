@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.5.4";
+  var VERSION = "1.5.5";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -2226,6 +2226,79 @@
    *   ③ 置信「顺序播放」：`NM_SETTING_PLAYER.mode` 能读到就**一票定音**；读不到退回 `seqStreak >= 2`
    *   ④ 距结束 [0.3, 1.5]s（由 100ms tick 命中）
    */
+  /* ==================== v1.5.5 · C3 续：直接查播放列表 DB（storage.execsql）==================== */
+
+  /**
+   * C3 第一轮探针的结论（真机 09:05 / 09:07 / 09:08 三次）：
+   *
+   *   nm.play.getNextSong / getPlayerMode / getCurrentSong → 全部 `undefined`
+   *     （渲染层的 channel.call 路由不到 tinyapp 桥的命令，这条路封死）
+   *   Database.getAllBy                                    → `undefined`（同上，名字也不对）
+   *   IndexedDB 只有 1 个库 `columnGrow`：keyvaluepairs / local-forage-detect-blob-support
+   *     （那是 localForage 的 KV，**不是**播放列表）
+   *   registeredCalls 里没有任何 next/random 相关处理器
+   *   localStorage 193 个键，没有随机序列/种子（只有 playingInfo 那种加密快照）
+   *
+   * 但静态分析找到了真正的路：客户端的播放列表 DB 走的是**通道命令**
+   *
+   *     channel.call("storage.execsql", cb, [reqId, sqlText])
+   *     legacyNativeCmder.appendRegisterCall("execsqldone", "storage", function (reqId, errCode, value) {...})
+   *
+   * 也就是说：只要这条通道对我们开放，我们就能**直接 SELECT 出 randomOrder**——
+   * 而客户端的随机顺序就是「按 randomOrder 排序」，于是「下一首是谁」完全可算。
+   *
+   * 这一段就是去验证这条通道。只读 SQL、不改数据；带了 reqId 过滤，不会误接别人的结果。
+   */
+
+  var sqlSeq = 0;
+
+  /** 发一条只读 SQL，把结果写进日志。返回 reqId（可用于在日志里对照） */
+  function probeSql(sql) {
+    var reqId = "gp" + Date.now() + "_" + ++sqlSeq;
+    var answered = false;
+    log("[sql] → " + briefJson(sql, 160) + " ｜ reqId=" + reqId);
+
+    function onDone(id, err, value) {
+      if (String(id) !== String(reqId)) return; // 只认我们自己这条（别人也在用同一个回调名）
+      if (answered) return;
+      answered = true;
+      log("[sql] ← err=" + err + " ｜ " + briefJson(value, 700));
+    }
+
+    try {
+      // 客户端自己就是这么注册的（name + 命名空间）；我们的 wrapper 会记录并转发给原生
+      if (typeof legacyNativeCmder !== "undefined" && legacyNativeCmder &&
+          typeof legacyNativeCmder.appendRegisterCall === "function") {
+        legacyNativeCmder.appendRegisterCall("execsqldone", "storage", onDone);
+      }
+    } catch (e) {
+      log("[sql] appendRegisterCall 失败 ｜ " + (e && e.message));
+    }
+
+    try {
+      channel.call(
+        "storage.execsql",
+        function (res) {
+          log("[sql] 直接回调 ← " + briefJson(res, 300));
+        },
+        [reqId, sql]
+      );
+    } catch (e) {
+      log("[sql] ★ channel.call 抛错 ｜ " + (e && e.message));
+    }
+
+    setTimeout(function () {
+      if (!answered) log("[sql] ← 无响应（1500ms）｜ 说明这条通道没给我们结果");
+    }, 1500);
+    return reqId;
+  }
+
+  /** 第一步：有哪些表（只读 sqlite_master） */
+  function probeSqlTables() {
+    log("[sql] ===== 查表名 =====");
+    return probeSql("SELECT name FROM sqlite_master WHERE type='table'");
+  }
+
   /* ==================== v1.5.4 · C3 侦察：能不能问出「下一首是谁」==================== */
 
   /**
@@ -5245,6 +5318,11 @@
           )
         );
       });
+      var sqlBtn = el("button", "gp-btn", "查 DB 表");
+      sqlBtn.onclick = function () {
+        probeSqlTables();
+      };
+      diag.appendChild(rowEl("C3 SQL（只读）", sqlBtn));
       var nextBtn = el("button", "gp-btn", "查下一首（侦察）");
       nextBtn.onclick = function () {
         probeNext();
@@ -5403,6 +5481,8 @@
         pickup: pickBEntry, // ★ v1.5.1：给 B 选入点
         preopen: preopenStream, // ★ v1.5.3：诊断用（也会走「元素在用就不动」的守卫）
         probeNext: probeNext, // ★ v1.5.4：C3 侦察（只读，查「下一首是谁」能不能问出来）
+        sqlq: probeSql, // ★ v1.5.5：直接向播放列表 DB 发只读 SQL
+        sqlTables: probeSqlTables, // ★ v1.5.5：先看有哪些表
         snapToBeat: snapToBeat,
         lastPlan: function () {
           return S.lastPlan;

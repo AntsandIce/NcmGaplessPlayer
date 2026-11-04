@@ -3611,7 +3611,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.5\.4/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.5\.5/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -3878,6 +3878,71 @@ async function main() {
       e.flushTimers();
       e.flushTimers();
       ok(countLog(e, "上一次侦察还没跑完") >= 1, "★★ 而且日志说清楚了原因");
+    }
+  }
+
+  section("94. ★★★ v1.5.5 C3 续：用 storage.execsql 直接查播放列表 DB");
+  {
+    // ---- (a) 发得出去：命令名与参数形态要对 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      ok(typeof api.sqlq === "function", "★★ 暴露了 gaplessPlayer.sqlq()");
+      ok(typeof api.sqlTables === "function", "★★ 也暴露了 sqlTables()");
+
+      const n0 = e.nativeCalls.length;
+      const reqId = api.sqlq("SELECT name FROM sqlite_master WHERE type='table'");
+      eq(typeof reqId, "string", "（前提）返回了 reqId");
+      const call = e.nativeCalls.slice(n0).filter((c) => c.name === "storage.execsql")[0] || { args: [[]] };
+      ok(!!call, "★★ 真的走到了 storage.execsql 这条通道（不是瞎猜的命令名）");
+      const args = call.args[0];
+      ok(Array.isArray(args) && String(args[0]) === reqId, "★★ 参数字段 [reqId, sql]：reqId 对得上");
+      ok(/sqlite_master/.test(String(args[1])), "★★ SQL 原样传过去了（" + String(args[1]).slice(0, 40) + "…）");
+    }
+
+    // ---- (b) 回得来：按 appendRegisterCall("execsqldone","storage",cb) 的约定接结果 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      const reqId = api.sqlq("SELECT 1");
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "← 无响应（1500ms）") >= 1, "★★ 没人应答时会明确记「无响应」（否则永远不知道卡在哪）");
+
+      // 模拟原生回调：客户端约定是 cb(reqId, errCode, value)
+      const rq = api.sqlq("SELECT 2");
+      const handlers = e.win.registeredCalls || {};
+      const key = "storage.onexecsqldone";
+      const arr = handlers[key] || [];
+      ok(arr.length >= 1, "★★ 回调挂到了 storage.onexecsqldone（共 " + arr.length + " 个）");
+      // 先把「别人」的结果喂进来，验证 reqId 过滤
+      arr.forEach((fn) => fn("别人的reqId", 0, [{ name: "不该出现" }]));
+      e.flushTimers();
+      e.flushTimers();
+      ok(!/不该出现/.test(e.logs()), "★★ 别人的结果被 reqId 过滤掉了");
+      // 再喂我们自己的
+      arr.forEach((fn) => fn(rq, 0, [{ name: "current" }, { name: "last" }]));
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "[sql] ← err=0") >= 1, "★★ 我们的结果被记下来了");
+      ok(/current/.test(e.logs()) && /last/.test(e.logs()), "★★ 表名进了日志（能直接看出有没有 current 表）");
+    }
+
+    // ---- (c) 不看 DOM/网络也能跑：sqlTables() 也是一条 query ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const n0 = e.nativeCalls.length;
+      e.win.gaplessPlayer.sqlTables();
+      const calls = e.nativeCalls.slice(n0).filter((c) => c.name === "storage.execsql");
+      eq(calls.length, 1, "★★ sqlTables() 只发一条 SQL");
+      const a0 = ((calls[0] || { args: [[]] }).args[0] || []);
+      ok(/sqlite_master/.test(String(a0[1])), "★★ 查的是 sqlite_master");
     }
   }
 
