@@ -1,9 +1,69 @@
-# GaplessPlayer 开发日志（0.1.0 → 1.5.3）
+# GaplessPlayer 开发日志（0.1.0 → 1.5.4）
 
 > 面向使用者的安装与使用说明见 [README](../README.md)。
 
 ---
 
+## ★ v1.5.4 —— C3 侦察：能不能问出「下一首是谁」
+
+随机播放做不到无缝，根因不是 DSP，而是**不知道下一首是谁**（客户端切歌前约 80ms 才决定）。
+这一版不改行为，只做侦察 —— 但静态分析阶段就已经挖到几条关键事实：
+
+### 静态发现的四条线索
+
+1. **随机顺序是"存起来的"，不是现掷骰子**：播放列表 DB 的每一行有个 `randomOrder` 列；
+   切到随机模式时会调 `refreshRandomPlayingList` → `Database.updateBy {modifyByIndex:{name:"randomOrder",type:"random"}}`
+   **整列重刷随机值**；点下一首时的顺序比较器就是按 `randomOrder` 排序（`f("randomOrder", …)`）。
+   ⇒ 只要能读到那张表（或读到一个装着它的快照），**整个随机序列都是已知的**。
+2. **渲染层还有个现成的「下一首随机结果」**：redux 动作 `setRandomNextInPlayingList`，
+   payload 里直接带着 `resourceId`（渲染层还会把 `randomOrder` 写回该项）。
+   ⇒ 能读到 store，就能直接拿到「下一次随机挑中的那首」。
+3. **native 侧有正经的查询命令**：`nm.play.getNextSong` / `nm.play.getPreviousSong` /
+   `nm.play.getCurrentSong` / `nm.play.getPlayerMode`（出现在客户端 tinyapp 桥的命令白名单里，
+   事件侧还有 `nm.play.songChanged` / `nm.play.modeChanged`）。
+   ⚠️ 但**渲染层 JS 从不调用它们**（全仓库只有白名单里那两处引用），所以
+   `channel.call` 能不能路由过去，只能实测。
+4. **store 没挂在 window 上**：webpack 运行时的模块缓存是闭包私有的
+   （`!function(e){…var f={}…}`，`f` 就是模块缓存），`window` 上只有 `APP_CONF` / `cef` / `channel` 这些。
+   ⇒ 「读 store」这条路需要额外手段，不能想当然。
+
+### 所以做了个探针（只读、幂等）
+
+`gaplessPlayer.probeNext()`（面板「诊断」里也有「查下一首（侦察）」按钮；开机设
+`window.__gpProbeNext = true` 会自动跑一次）。它一次性问五件事并逐条记日志：
+
+```
+[next] ===== C3 侦察开始（只读）=====
+[next] nm.play.getNextSong ← …（或「无响应（800ms）」）
+[next] nm.play.getPlayerMode ← …
+[next] nm.play.getCurrentSong ← …
+[next] Database.getAllBy ← …
+[next] IndexedDB 共 N 个库: …        ← 有库就会接着列每个库的表名
+[next]   <db> → 表: current, last
+[next] localStorage 共 N 个键
+[next] registeredCalls 共 N 个 ｜ 相关: …
+```
+
+判定表（拿到日志就能直接定下一步）：
+
+| 观察 | 结论 |
+|---|---|
+| `nm.play.getNextSong ← {…}` 有内容 | **最好情况**：随机也能无缝（提前拿到下一首 id → 提前取址/预载） |
+| `IndexedDB` 里有 `current` 表 | 直接用 IndexedDB 读 `randomOrder` 排序 → 自己算下一首（不依赖任何桥） |
+| `Database.getAllBy ← {…}` 有行 | 同上，但走客户端的 DB 命令 |
+| 全都「无响应」且没有 `current` 表 | 这条路封死 → 退回「押注/双槽预载」，或转向「流式灌块 + 猜」 |
+
+### 验收
+
+```
+node test/harness.js  → 通过 575 项，失败 0 项（新增第 93 段 17 项）
+node test/mutate.js   → 变异点 117 个，抓住 117 个，漏网 0 个
+```
+
+★ 探针代码全是 `typeof indexedDB === "undefined"` 之类的守卫：缺什么就记「不可用」，不许抛错
+（验证台就是缺 DOM / 缺 indexedDB 的环境，正好当「最坏情况」的回归）。
+
+---
 ## ★ v1.5.3 —— 没预载完也先「预开」下一首的流
 
 ### 前提回顾

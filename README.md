@@ -72,6 +72,7 @@
 | `window.__gpStream = false` | 强制走缓冲路径（排查跨域静音用） | 开 |
 | `window.__gpNativeAll = true` | 播放整条交回原生播放器（逃生） | 关 |
 | `window.__gpProbe = true` | automix 探针（诊断用，见 Releases 说明） | 关 |
+| `gaplessPlayer.probeNext()` | **C3 侦察**：查「下一首是谁」能不能问出来（只读；面板诊断里也有按钮） | — |
 
 也可以用脚本接口（面板就是用它们）：
 

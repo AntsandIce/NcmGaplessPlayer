@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.5.3";',
+    find: 'var VERSION = "1.5.4";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -838,6 +838,34 @@ const MUTATIONS = [
     find: "    if (S.stream) return false; // 元素在用",
     replace: "    if (false) return false; // 变异：不管",
     expect: "92",
+  },
+  {
+    name: "v1.5.4: 侦察不问 native 命令（永远得不到「下一首」）",
+    file: "main.js",
+    find: "    for (var i = 0; i < NEXT_CMDS.length; i++) askCmd(NEXT_CMDS[i]);",
+    replace: "    /* 变异：不问 */",
+    expect: "93",
+  },
+  {
+    name: "v1.5.4: 侦察不查 IndexedDB（漏掉最关键的一条路）",
+    file: "main.js",
+    find: "    probeIdb();",
+    replace: "    /* 变异：不查 */",
+    expect: "93",
+  },
+  {
+    name: "v1.5.4: 问了不记超时（分不清「没响应」和「没问」）",
+    file: "main.js",
+    find: "      if (!done) log(\"[next] \" + name + \" ← 无响应（800ms）\");",
+    replace: "      /* 变异：不记 */",
+    expect: "93",
+  },
+  {
+    name: "v1.5.4: 侦察可以重入（连点会刷一堆重复请求）",
+    file: "main.js",
+    find: "    if (probeBusy) {",
+    replace: "    if (false) { // 变异：不挡",
+    expect: "93",
   },
 ];
 

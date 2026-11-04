@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.5.3";
+  var VERSION = "1.5.4";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -2226,6 +2226,187 @@
    *   ③ 置信「顺序播放」：`NM_SETTING_PLAYER.mode` 能读到就**一票定音**；读不到退回 `seqStreak >= 2`
    *   ④ 距结束 [0.3, 1.5]s（由 100ms tick 命中）
    */
+  /* ==================== v1.5.4 · C3 侦察：能不能问出「下一首是谁」==================== */
+
+  /**
+   * 随机播放做不到无缝的**根因**不是 DSP，而是「不知道下一首是谁」：
+   *   - 客户端的随机顺序是**存起来的**（播放列表 DB 里每一行有个 `randomOrder`，播放时按它排序；
+   *     切随机模式时会整列重刷随机值）；
+   *   - 渲染层还有 `setRandomNextInPlayingList` 这个动作，把「下一次随机挑中的那首」写进 store。
+   *
+   * 但这些都是**客户端内部状态**：插件能不能读到，取决于桥/存储是否对我们开放。
+   * 所以这一段只做**侦察**（只读、不改任何行为），把几条可能的入口一次性问清楚：
+   *
+   *   ① 直接问 native：`nm.play.getNextSong` / `getPlayerMode` / `getCurrentSong`
+   *      （这几个名字是客户端 tinyapp 桥的命令白名单里的，看渲染层的 channel.call 能不能路由过去）
+   *   ② 问播放列表 DB：`Database.getAllBy { tableName: "current", orderBy: randomOrder }`
+   *   ③ 看 IndexedDB：库里有什么 database、每个库里有什么表（如果是 IndexedDB，我们就能直接读）
+   *   ④ 看 localStorage：有没有存着顺序/种子
+   *   ⑤ 看 registeredCalls：有没有 next/random 相关的处理器
+   *
+   * 结论怎么用：哪一条先给出可用数据，下一步就顺着那条做「提前知道下一首」。
+   */
+
+  var NEXT_CMDS = [
+    "nm.play.getNextSong",
+    "nm.play.getPlayerMode",
+    "nm.play.getCurrentSong",
+  ];
+
+  var probeBusy = false;
+
+  function briefJson(v, max) {
+    var lim = max || 220;
+    try {
+      if (v === null || v === undefined) return String(v);
+      if (typeof v === "string") return v.length > lim ? v.slice(0, lim) + "…(" + v.length + "B)" : v;
+      if (typeof v === "number" || typeof v === "boolean") return String(v);
+      var s = JSON.stringify(v);
+      if (s === undefined) return String(v);
+      return s.length > lim ? s.slice(0, lim) + "…(" + s.length + "B)" : s;
+    } catch (e) {
+      return "[不可序列化]";
+    }
+  }
+
+  /** 问一条命令：有回调就记结果，800ms 没动静就记「无响应」 */
+  function askCmd(name, args) {
+    var done = false;
+    try {
+      channel.call(
+        name,
+        function (res) {
+          done = true;
+          log("[next] " + name + " ← " + briefJson(res));
+        },
+        args || []
+      );
+    } catch (e) {
+      log("[next] " + name + " ｜ 调用抛错 ｜ " + (e && e.message));
+      return;
+    }
+    setTimeout(function () {
+      if (!done) log("[next] " + name + " ← 无响应（800ms）");
+    }, 800);
+  }
+
+  function probeStorage() {
+    try {
+      if (typeof localStorage === "undefined" || !localStorage) return;
+      var keys = [];
+      for (var i = 0; i < localStorage.length; i++) {
+        try {
+          keys.push(localStorage.key(i));
+        } catch (e) {}
+      }
+      log("[next] localStorage 共 " + keys.length + " 个键");
+      for (var j = 0; j < keys.length; j++) {
+        var k = keys[j];
+        if (!k) continue;
+        // 只打「看起来跟顺序/队列/模式有关」的，或者键总数不多时全打
+        if (keys.length > 40 && !/random|shuffle|order|queue|list|play|mode/i.test(k)) continue;
+        var v = null;
+        try {
+          v = localStorage.getItem(k);
+        } catch (e) {}
+        log("[next]   " + k + " = " + briefJson(v, 120));
+      }
+    } catch (e) {
+      log("[next] localStorage 探针抛错 ｜ " + (e && e.message));
+    }
+  }
+
+  function probeRegistry() {
+    try {
+      var RC =
+        (typeof registeredCalls !== "undefined" && registeredCalls) ||
+        (typeof window !== "undefined" && window && window.registeredCalls);
+      var keys = RC ? Object.keys(RC) : [];
+      var hit = [];
+      for (var i = 0; i < keys.length; i++) {
+        if (/next|random|shuffle|mode|queue|playlist/i.test(keys[i])) hit.push(keys[i]);
+      }
+      log("[next] registeredCalls 共 " + keys.length + " 个 ｜ 相关: " + (hit.length ? hit.join(", ") : "（无）"));
+    } catch (e) {}
+  }
+
+  function probeIdb() {
+    try {
+      if (typeof indexedDB === "undefined" || !indexedDB) {
+        log("[next] indexedDB 不可用（这个环境没有）");
+        return;
+      }
+      if (typeof indexedDB.databases !== "function") {
+        log("[next] indexedDB.databases() 不可用（Chromium < 71？）");
+        return;
+      }
+      var pr = indexedDB.databases();
+      if (!pr || typeof pr.then !== "function") {
+        log("[next] indexedDB.databases() 没返回 promise");
+        return;
+      }
+      pr.then(function (list) {
+        list = list || [];
+        var names = [];
+        for (var i = 0; i < list.length; i++) names.push(list[i] && list[i].name);
+        log("[next] IndexedDB 共 " + list.length + " 个库: " + names.join(", "));
+        // 前几个库报一下表名（只读：open 不加版本号，不会触发升级）
+        for (var j = 0; j < list.length && j < 6; j++) {
+          (function (nm) {
+            if (!nm) return;
+            try {
+              var rq = indexedDB.open(nm);
+              rq.onsuccess = function () {
+                try {
+                  var db = rq.result;
+                  var stores = [];
+                  var sn = (db && db.objectStoreNames) || [];
+                  for (var t = 0; t < sn.length; t++) stores.push(sn[t]);
+                  log("[next]   " + nm + " → 表: " + (stores.length ? stores.join(", ") : "（无）"));
+                  try {
+                    db.close();
+                  } catch (e) {}
+                } catch (e) {}
+              };
+              rq.onerror = function () {
+                log("[next]   " + nm + " → 打不开");
+              };
+            } catch (e) {}
+          })(names[j]);
+        }
+      }).catch(function (e) {
+        log("[next] indexedDB.databases() 失败 ｜ " + (e && e.message));
+      });
+    } catch (e) {
+      log("[next] indexedDB 探针抛错 ｜ " + (e && e.message));
+    }
+  }
+
+  /** C3 侦察入口：只读、幂等，随便点几下都不会有副作用 */
+  function probeNext() {
+    if (probeBusy) {
+      log("[next] 上一次侦察还没跑完，等一下");
+      return false;
+    }
+    probeBusy = true;
+    log("[next] ===== C3 侦察开始（只读）=====");
+    // ① native 命令
+    for (var i = 0; i < NEXT_CMDS.length; i++) askCmd(NEXT_CMDS[i]);
+    // ② 播放列表 DB（随机顺序就是 randomOrder 排序）
+    askCmd("Database.getAllBy", [
+      { tableName: "current", colNames: ["id", "resourceId", "randomOrder"], orderBy: [{ name: "randomOrder", order: "ASC" }] },
+    ]);
+    // ③④⑤ 本地可读的状态
+    probeIdb();
+    probeStorage();
+    probeRegistry();
+    log("[next] ===== 侦察请求已发出（等日志里的 ← 结果）=====");
+    setTimeout(function () {
+      probeBusy = false;
+    }, 1200);
+    return true;
+  }
+
   /* ==================== v1.5.3 · 提前预开流（B 没下完时缩短接缝空档）==================== */
 
   /**
@@ -5064,6 +5245,11 @@
           )
         );
       });
+      var nextBtn = el("button", "gp-btn", "查下一首（侦察）");
+      nextBtn.onclick = function () {
+        probeNext();
+      };
+      diag.appendChild(rowEl("Automix 侦察", nextBtn));
       var logBtn = el("button", "gp-btn", "复制日志路径");
       logBtn.onclick = function () {
         try {
@@ -5197,6 +5383,11 @@
     }
 
     installInterceptor();
+    if (window && window.__gpProbeNext) {
+      try {
+        probeNext();
+      } catch (e) {}
+    }
     initPanel(); // ★ v1.4.0：右下角「G」→ 设置面板（没有 document 时自动跳过）
     try {
       // ★ v1.4.0：给用户一个可脚本化的入口（控制台一行就能改）
@@ -5211,6 +5402,7 @@
         mixPlan: mixPlan,
         pickup: pickBEntry, // ★ v1.5.1：给 B 选入点
         preopen: preopenStream, // ★ v1.5.3：诊断用（也会走「元素在用就不动」的守卫）
+        probeNext: probeNext, // ★ v1.5.4：C3 侦察（只读，查「下一首是谁」能不能问出来）
         snapToBeat: snapToBeat,
         lastPlan: function () {
           return S.lastPlan;

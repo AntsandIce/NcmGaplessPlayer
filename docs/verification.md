@@ -427,6 +427,37 @@ gaplessPlayer.status() ／ setStyle("dj") ／ xfade() ／ clearCache() ／ openP
 
 ---
 
+## 4k. C3 侦察：问出「下一首是谁」（v1.5.4）
+
+在随机播放模式下跑一次探针，然后看 `[next]` 那几行。
+
+**怎么跑**（任选其一）：
+
+- 面板 → 诊断 → **查下一首（侦察）**；
+- 控制台 `gaplessPlayer.probeNext()`；
+- 开机自动跑：`window.__gpProbeNext = true`（改一行再重启，或让插件下次启动时读到）。
+
+**看什么**：
+
+```
+[next] nm.play.getNextSong ← …          ← 有内容 = 随机也能无缝（最好情况）
+[next] nm.play.getPlayerMode ← …
+[next] Database.getAllBy ← …
+[next] IndexedDB 共 N 个库: cloudmusic   ← 有库就会接着列表名
+[next]   cloudmusic → 表: current, last  ← 有 current = 可以直接读 randomOrder 自己算下一首
+[next] localStorage 共 N 个键
+[next] registeredCalls 共 N 个 ｜ 相关: …
+```
+
+- 全是 `← 无响应（800ms）` 且没有 `current` 表 → 这条路封死；
+- `nm.play.getNextSong` 有内容 → 直接用它；
+- 有 `current` 表 → 用 IndexedDB 读该表、按 `randomOrder` 排序（**这正是客户端的随机顺序**）；
+- `Database.getAllBy` 有行 → 同上，但走客户端命令。
+
+⚠️ 探针只读：不动播放、不改设置、不写任何存储。
+
+---
+
 ## 5. 排查建议
 
 - 关键日志：`[sched] 预约 / 认领`、`[end] ★ 自然播完 → 无缝交接`、`[preload] 320k 接口`、`[nafetch]`。
@@ -435,5 +466,5 @@ gaplessPlayer.status() ／ setStyle("dj") ／ xfade() ／ clearCache() ／ openP
   2. 看有没有 `[sched] 预约`：没有 = 门槛没过（模式 / 预测 / 时间窗）；
   3. 看 `[preload]` 是否出现 `320k 接口`，失败会自动退 128k。
 - 一次结束推进两首：确认 `getPlayedTime` / `getPlaybackInfo` 被插件接管（结束窗口内应有「自答」记录）。
-- 上线验证：`node test/harness.js` → `通过 558 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86、autoplay 兜底 87、风格/状态 88、拍点 89、B 入点 90、面板 91、预开流 92）。
-  变异测试：`node test/mutate.js` → `变异点 113 个，抓住 113 个，漏网 0 个`。
+- 上线验证：`node test/harness.js` → `通过 575 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86、autoplay 兜底 87、风格/状态 88、拍点 89、B 入点 90、面板 91、预开流 92、C3 侦察 93）。
+  变异测试：`node test/mutate.js` → `变异点 117 个，抓住 117 个，漏网 0 个`。

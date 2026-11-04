@@ -503,6 +503,7 @@ function createEnv(hooks) {
     "Audio",
     "console",
     "document",
+    "indexedDB",
     src
   );
 
@@ -530,7 +531,8 @@ function createEnv(hooks) {
     FakeAudio,
     { log() {}, warn() {}, error() {} },
     // ★ v1.5.2：默认没有 DOM（面板会安静跳过）；需要测面板时用 createEnv({ document: fakeDoc() })
-    hooks && hooks.document ? hooks.document : undefined
+    hooks && hooks.document ? hooks.document : undefined,
+    hooks && hooks.indexedDB ? hooks.indexedDB : undefined
   );
 
   return {
@@ -3609,7 +3611,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.5\.3/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.5\.4/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -3793,6 +3795,89 @@ async function main() {
       e.flushTimers();
       ok(countLog(e, "[stream] 清掉提前预开的流") >= 1, "★★ 换目标时清掉了预开的流");
       eq(srcOf(e), "", "★★ <audio> 的 src 也被撤了（不白占连接）");
+    }
+  }
+
+  section("93. ★★★ v1.5.4 C3 侦察：能不能问出「下一首是谁」");
+  {
+    // ---- (a) 没有 indexedDB / 没人应答：探针要跑完、要记「无响应」 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      ok(typeof api.probeNext === "function", "★★ 暴露了 gaplessPlayer.probeNext()");
+
+      const n0 = e.nativeCalls.length;
+      eq(api.probeNext(), true, "★★ 探针跑起来了");
+      const asked = e.nativeCalls.slice(n0).map((c) => c.name);
+      ok(asked.indexOf("nm.play.getNextSong") >= 0, "★★ 问了 nm.play.getNextSong");
+      ok(asked.indexOf("nm.play.getPlayerMode") >= 0, "★★ 也问了 nm.play.getPlayerMode");
+      ok(asked.indexOf("Database.getAllBy") >= 0, "★★ 也试了播放列表 DB（randomOrder 排序）");
+
+      e.flushTimers();
+      e.flushTimers(); // 日志本身也是攒着写的，冲两遍才落盘
+      ok(countLog(e, "[next] ===== C3 侦察开始") >= 1, "★★ 有开始标记");
+      ok(countLog(e, "← 无响应（800ms）") >= 3, "★★ 每条都记了「无响应」（" + countLog(e, "← 无响应（800ms）") + " 条）");
+      ok(countLog(e, "indexedDB 不可用") >= 1, "★★ indexedDB 探针给出了明确结论");
+      ok(countLog(e, "[next] localStorage 共") >= 1, "★★ 顺手报了 localStorage 键数");
+      ok(countLog(e, "[next] registeredCalls 共") >= 1, "★★ 也看了 registeredCalls");
+    }
+
+    // ---- (b) 有人应答：把返回值记进日志 ----
+    {
+      const e = createEnv({
+        onNative(name, cb, args) {
+          if (name === "nm.play.getNextSong" && typeof cb === "function") {
+            cb({ code: 200, data: { id: 4242, name: "下一首示例" } });
+          }
+        },
+      });
+      e.boot();
+      await flush();
+      e.win.gaplessPlayer.probeNext();
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "nm.play.getNextSong ← ") >= 1, "★★ 有应答时把结果记下来了");
+      ok(/4242/.test(e.logs()), "★★ 返回值内容进日志（能看出到底给了什么）");
+    }
+
+    // ---- (c) 有 indexedDB：要列出库名与表名（这是「直接读随机顺序」的关键前提） ----
+    {
+      const fakeIdb = {
+        databases: () => Promise.resolve([{ name: "cloudmusic" }]),
+        open(name) {
+          const rq = { onsuccess: null, onerror: null, result: null };
+          Promise.resolve().then(() => {
+            rq.result = { objectStoreNames: ["current", "last"], close() {} };
+            if (rq.onsuccess) rq.onsuccess();
+          });
+          return rq;
+        },
+      };
+      const e = createEnv({ indexedDB: fakeIdb });
+      e.boot();
+      await flush();
+      e.win.gaplessPlayer.probeNext();
+      await flush();
+      await flush();
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "IndexedDB 共 1 个库: cloudmusic") >= 1, "★★ 列出了库名");
+      ok(countLog(e, "cloudmusic → 表: current, last") >= 1, "★★ 列出了表名（有 current 就是我们想要的那张）");
+    }
+
+    // ---- (d) 连点两下：第二次要被挡住（否则会刷出一堆重复请求） ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      eq(api.probeNext(), true, "（前提）第一次跑起来了");
+      eq(api.probeNext(), false, "★★ 紧接着第二次被挡（上一轮还没跑完）");
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "上一次侦察还没跑完") >= 1, "★★ 而且日志说清楚了原因");
     }
   }
 
