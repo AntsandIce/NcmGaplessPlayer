@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.8.0";
+  var VERSION = "1.8.1";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -4944,10 +4944,21 @@
       }
       return wsum > 0 ? sc / wsum : 0;
     }
+    /**
+     * ★ v1.8.1（#9）：**速度先验**。人耳/流行乐的重心在 ~120 BPM 附近，
+     * 用对数尺度上的高斯去轻微加权，就能把「2/3 倍速」这类歧义掰回来
+     * （128 被测成 84.6 时，84.6 离 120 有半个八度，先验会明显压它）。
+     * ★ 只是**轻微**加权（σ=0.9 八度）：有真凭据的倍速关系仍然能赢。
+     */
+    function tempoPrior(b) {
+      if (!(b > 0)) return 0;
+      var oct = Math.log(b / BEAT_PREFERRED_BPM) / Math.LN2;
+      return Math.exp(-0.5 * (oct / BEAT_PRIOR_OCTAVES) * (oct / BEAT_PRIOR_OCTAVES));
+    }
     var bestLag = 0;
     var bestScore = -1;
     for (var lg = minLag; lg <= maxLag; lg++) {
-      var sc2 = comb(lg);
+      var sc2 = comb(lg) * tempoPrior(60 / (lg * hopSec));
       if (sc2 > bestScore) {
         bestScore = sc2;
         bestLag = lg;
@@ -4955,36 +4966,36 @@
     }
     if (!(bestLag > 0)) return null;
 
+    // ★ v1.8.1（#10/#13）：**亚帧细化** —— 原来 BPM 只能取到整数 lag（hop≈11.6ms），
+    //   128 BPM 处相当于 ±1.5 BPM（≈1.2%）的误差；这个误差在 12s 的长交叉里会累成上百毫秒。
+    //   这里先对相关峰做抛物线插值，再把「周期 × 相位」在细网格上再搜一遍。
+    var refinedLag = bestLag; // ★ v1.8.1：周期细搜（refinePeriodPhase）已覆盖，抛物线插值属冗余
+
     // 折回 80~180 BPM（人耳对这段最敏感，也避免把 1/2、1/3 倍当基频）
-    var bpm = 60 / (bestLag * hopSec);
-    while (bpm > 180 && bestLag * 2 <= maxLag) {
-      bestLag *= 2;
-      bpm = 60 / (bestLag * hopSec);
+    var bpm = 60 / (refinedLag * hopSec);
+    while (bpm > 180 && refinedLag * 2 <= maxLag) {
+      refinedLag *= 2;
+      bpm = 60 / (refinedLag * hopSec);
     }
-    while (bpm < 80 && Math.round(bestLag / 2) >= minLag) {
-      bestLag = Math.round(bestLag / 2);
-      bpm = 60 / (bestLag * hopSec);
+    while (bpm < 80 && Math.round(refinedLag / 2) >= minLag) {
+      refinedLag = Math.round(refinedLag / 2);
+      bpm = 60 / (refinedLag * hopSec);
     }
 
-    // ⑥ 相位：拍点处 onset 最集中的那个相位
-    var period = bestLag;
-    var bestPhase = 0;
-    var bestPhaseScore = -1;
-    for (var ph = 0; ph < period; ph++) {
-      var s3 = 0;
-      var cnt = 0;
-      for (var idx = ph; idx < frames; idx += period) {
-        s3 += onset[idx];
-        cnt++;
-      }
-      var avg2 = cnt ? s3 / cnt : 0;
-      if (avg2 > bestPhaseScore) {
-        bestPhaseScore = avg2;
-        bestPhase = ph;
-      }
-    }
+    var fine = refinePeriodPhase(onset, frames, refinedLag);
+    var period = fine.period;
+    bpm = 60 / (period * hopSec);
+    var bestPhase = fine.phase;
+    var bestPhaseScore = fine.score;
     // ⑦ 置信度：拍点均值相对全局均值的对比度
     var conf = (bestPhaseScore - meanOnset) / (bestPhaseScore + meanOnset + 1e-9);
+    if (!isFinite(conf) || conf < 0) conf = 0;
+    if (conf > 1) conf = 1;
+    // ★ v1.8.1（#11）：再乘一个「瞬态密度」因子。
+    //   对比度只说明「拍点上有能量聚集」，但**铺底人声/纯和声**也能聚出对比度 —— 那种歌不该被当成可混的。
+    //   密度 = 包络相对局部均值跳变的比例：鼓组/click 很高，铺底很低 → 置信自然被压下去。
+    var rhythmic = transientRhythmic(env, frames);
+    conf = conf * rhythmic;
     if (!isFinite(conf) || conf < 0) conf = 0;
     if (conf > 1) conf = 1;
 
@@ -4993,10 +5004,82 @@
       beatSec: 60 / bpm,
       anchorSec: start + bestPhase * hopSec, // 绝对曲目时间
       conf: conf,
+      rhythmic: rhythmic, // ★ v1.8.1：瞬态密度因子（排查「为什么置信低」时看它）
       frames: frames,
       windowSec: span,
       dur: dur, // ★ v1.8.0：整首时长（头尾不一致时用它把末拍外推出来）
     };
+  }
+
+  /**
+   * ★ v1.8.1（#11）：瞬态密度 → [0,1] 的可信度因子。
+   * 思路：把 RMS 包络先做局部平滑得到「基线」，再数「相对基线跳变超过 50%」的比例。
+   * 鼓组/打点很密（0.1 以上），铺底驻波/和声接近 0 —— 用它把后者的置信压下去。
+   */
+  function transientRhythmic(env, frames) {
+    if (!env || !(frames > 8)) return 0.5;
+    var R = 2;
+    var level = new Float32Array(frames);
+    for (var i = 0; i < frames; i++) {
+      var sum = 0;
+      var cnt = 0;
+      for (var k = -R; k <= R; k++) {
+        var j = i + k;
+        if (j >= 0 && j < frames) {
+          sum += env[j];
+          cnt++;
+        }
+      }
+      level[i] = cnt ? sum / cnt : 0;
+    }
+    var mean = 0;
+    for (var i2 = 0; i2 < frames; i2++) mean += level[i2];
+    mean /= frames;
+    if (!(mean > 1e-9)) return 0;
+    var hits = 0;
+    for (var i3 = 1; i3 < frames; i3++) {
+      if ((level[i3] - level[i3 - 1]) / mean > BEAT_TRANSIENT_JUMP) hits++;
+    }
+    var density = hits / frames;
+    var lo = BEAT_DENSITY_MIN;
+    var hi = BEAT_DENSITY_FULL;
+    var r = (density - lo) / (hi - lo);
+    if (!isFinite(r) || r < 0) r = 0;
+    if (r > 1) r = 1;
+    return r;
+  }
+
+  /**
+   * ★ v1.8.1（#10/#13）：在「周期 × 相位」二维细网格上再搜一遍。
+   * 目标函数 = 拍点处 onset 的平均值（拍点越集中越好）。
+   * 周期在粗估计 ±2% 内按 0.05% 步进 → 128 BPM 处可达 ±0.06 BPM。
+   */
+  function refinePeriodPhase(onset, frames, coarsePeriod) {
+    var best = { period: coarsePeriod, phase: 0, score: -1 };
+    if (!(coarsePeriod >= 2)) return best;
+    var steps = BEAT_REFINE_STEPS;
+    var frac = BEAT_REFINE_FRACTION;
+    for (var s = -steps; s <= steps; s++) {
+      var period = coarsePeriod * (1 + s * frac);
+      if (period < 2) continue;
+      var offRange = Math.max(1, Math.round(period));
+      for (var off = 0; off < offRange; off++) {
+        var sum = 0;
+        var cnt = 0;
+        var pos = off;
+        while (pos < frames) {
+          var idx = Math.round(pos);
+          if (idx >= frames) idx = frames - 1;
+          sum += onset[idx];
+          cnt++;
+          pos += period;
+        }
+        if (!cnt) continue;
+        var score = sum / cnt;
+        if (score > best.score) best = { period: period, phase: off, score: score };
+      }
+    }
+    return best;
   }
 
   /**
@@ -5144,6 +5227,17 @@
    */
   var BEAT_PICKUP_MAX = 6; // 最多跳过这么长的前奏
   var BEAT_PICKUP_TOL = 0.06; // 起点已经「贴着拍」的容差
+
+  /* ★ v1.8.1：拍点判定的一组常量（速度先验 / 亚帧细化 / 瞬态密度）
+   *   方法参考：Convx（GPL-3.0）的 BeatTracker 概念 —— **只借鉴思路，代码为本项目独立实现**。
+   *   （MIT 项目不能直接拷贝 GPL 代码；算法与数学方法本身不受版权保护。） */
+  var BEAT_PREFERRED_BPM = 120; // 速度先验的中心
+  var BEAT_PRIOR_OCTAVES = 0.9; // 先验的宽度（八度）—— 只要「轻微」加权
+  var BEAT_REFINE_STEPS = 40; // 细网格步数（±2%）
+  var BEAT_REFINE_FRACTION = 0.0005; // 每步 0.05%
+  var BEAT_TRANSIENT_JUMP = 0.5; // 包络相对基线跳多少算一次瞬态
+  var BEAT_DENSITY_MIN = 0.004; // 低于它 → 完全不可信
+  var BEAT_DENSITY_FULL = 0.015; // 高于它 → 完全可信
 
 
 

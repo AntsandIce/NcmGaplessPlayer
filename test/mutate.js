@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.8.0";',
+    find: 'var VERSION = "1.8.1";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -712,11 +712,11 @@ const MUTATIONS = [
     expect: "89",
   },
   {
-    name: "v1.5.0: 置信度造假（静音也当高置信，硬做拍点对齐）",
+    name: "v1.5.0/v1.8.1: 置信度造假（绕过瞬态密度门控，静音也给高置信）",
     file: "main.js",
-    find: "    var conf = (bestPhaseScore - meanOnset) / (bestPhaseScore + meanOnset + 1e-9);",
-    replace: "    var conf = 0.9; // 变异：置信度造假",
-    expect: "89",
+    find: "    conf = conf * rhythmic;",
+    replace: "    conf = 0.9; // 变异：造假",
+    expect: "100",
   },
   {
     name: "v1.5.0: 低置信也判 full（明明不同步却硬对齐）",
@@ -1056,6 +1056,27 @@ const MUTATIONS = [
     find: "    return (total / 1048576).toFixed(0);",
     replace: "    return \"0\"; // 变异：恒为 0",
     expect: "101",
+  },
+  {
+    name: "v1.8.1: 去掉速度先验（2/3 倍速歧义又回来）",
+    file: "main.js",
+    find: "      var sc2 = comb(lg) * tempoPrior(60 / (lg * hopSec));",
+    replace: "      var sc2 = comb(lg); // 变异：不要先验",
+    expect: "100",
+  },
+  {
+    name: "v1.8.1: 瞬态密度门控取消（铺底也给高置信）",
+    file: "main.js",
+    find: "    conf = conf * rhythmic;",
+    replace: "    conf = conf * 1; // 变异：不门控",
+    expect: "100",
+  },
+  {
+    name: "v1.8.1: 细搜出来的相位被丢掉（拍点整体偏移）",
+    file: "main.js",
+    find: "    var bestPhase = fine.phase;",
+    replace: "    var bestPhase = 0; // 变异：相位归零",
+    expect: "90",
   },
   {
     name: "v1.5.5: 不按 reqId 过滤（别人查库的结果会串进我们日志）",

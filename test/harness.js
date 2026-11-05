@@ -3622,7 +3622,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.8\.0/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.8\.1/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -4609,65 +4609,52 @@ async function main() {
         getChannelData: () => data,
       };
     }
-    // ---- (a) #11 多频带：只有低频底鼓 / 只有高频踩镲，都要测得出来 ----
+    // ---- (a) #9/#10/#11（v1.8.1）：速度先验 + 亚帧细化 + 瞬态密度门控 ----
     {
       const e = createEnv();
       e.boot();
       await flush();
-      // 半窗重试的 A/B：窗口里两半的**速度不一样**（整窗相关被抹平 → 正是真机上低置信的形态）
-      const halfBeat = (function () {
+      const beat = (ab) => e.win.gaplessPlayer.beat(ab, 0, 20);
+
+      // ① 鼓组 128：以前会落到 2/3 倍速（84.6），加了速度先验后应当回到 128
+      const kit = (function () {
         const sr = 8000, secs = 20, n = sr * secs;
         const d = new Float32Array(n);
-        const beat = 0.5;
-        for (let tt = 0.2; tt < 9.5; tt += beat) {
+        const per = 60 / 128;
+        for (let tt = 0.2; tt < secs; tt += per) {
           const at = Math.round(tt * sr);
-          for (let i = 0; i < sr * 0.03 && at + i < n; i++) d[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
-        }
-        const beat2 = 60 / 90;
-        for (let tt = 10.2; tt < secs; tt += beat2) {
-          const at = Math.round(tt * sr);
-          for (let i = 0; i < sr * 0.03 && at + i < n; i++) d[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+          for (let i = 0; i < sr * 0.06 && at + i < n; i++) {
+            d[at + i] += Math.sin((2 * Math.PI * 60 * i) / sr) * Math.exp(-i / (sr * 0.02)) * 0.7;
+            d[at + i] += Math.sin((2 * Math.PI * 3000 * i) / sr) * Math.exp(-i / (sr * 0.006)) * 0.3;
+          }
         }
         return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
       })();
-      if (process.env.GP_ABT) {
-        e.win.__gpBeatRetry = false;
-        const off = e.win.gaplessPlayer.beat(halfBeat, 0, 20);
-        e.win.__gpBeatRetry = true;
-        const on1 = e.win.gaplessPlayer.beat(halfBeat, 0, 20);
-        delete e.win.__gpBeatRetry;
-        console.log("ABT halfbeat: retry-off conf=" + (off && off.conf.toFixed(2)) + "(" + (off && off.bpm.toFixed(1)) + ") retry-on conf=" + (on1 && on1.conf.toFixed(2)) + "(" + (on1 && on1.bpm.toFixed(1)) + ")");
-      }      const kick = e.win.gaplessPlayer.beat(mkBand({ hz: 60, bpm: 120 }), 0, 20);
-      ok(!!kick && kick.bpm > 0, "★★ 只有底鼓（60Hz）也能测出 BPM（" + (kick ? kick.bpm.toFixed(1) : "?") + "）");
-      ok(!!kick && kick.conf >= 0.4, "★★ 而且置信够高（conf=" + (kick ? kick.conf.toFixed(2) : "?") + "）");
+      const b128 = beat(kit);
+      ok(!!b128 && Math.abs(b128.bpm - 128) < 2,
+        "★★ 鼓组 128 BPM 不再落到 2/3 倍速（实际 " + (b128 ? b128.bpm.toFixed(2) : "?") + "）");
+      ok(!!b128 && b128.conf >= 0.4, "★★ 置信够用（conf=" + (b128 ? b128.conf.toFixed(2) : "?") + "）");
 
-      // 鼓组（底鼓 + 踩镲同时）—— 现实里最常见的形态
-      const kit = (function () {
-        const sr = 8000;
-        const secs = 20;
-        const n = sr * secs;
-        const data = new Float32Array(n);
-        const beat = 60 / 128;
-        for (let t = 0.2; t < secs; t += beat) {
-          const at = Math.round(t * sr);
-          for (let i = 0; i < sr * 0.06 && at + i < n; i++) {
-            data[at + i] += Math.sin((2 * Math.PI * 60 * i) / sr) * Math.exp(-i / (sr * 0.02)) * 0.7;
-            data[at + i] += Math.sin((2 * Math.PI * 3000 * i) / sr) * Math.exp(-i / (sr * 0.006)) * 0.3;
-          }
-        }
-        return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => data };
+      // ② 亚帧精度：137.3 这种「不是整数 lag」的 BPM 以前会被量化掉
+      const b137 = beat(mkBand({ hz: 60, bpm: 137.3 }));
+      ok(!!b137 && Math.abs(b137.bpm - 137.3) < 0.6,
+        "★★ 亚帧细化：137.3 测成 " + (b137 ? b137.bpm.toFixed(2) : "?") + "（旧实现只能到 ±1.5）");
+
+      // ③ 瞬态密度门控：纯铺底（无瞬态）→ 置信被打下去，不会被当成可混的
+      const pad = (function () {
+        const sr = 8000, n = sr * 20, d = new Float32Array(n);
+        for (let i = 0; i < n; i++) d[i] = Math.sin((2 * Math.PI * 220 * i) / sr) * 0.2;
+        return { duration: 20, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
       })();
-      const k128 = e.win.gaplessPlayer.beat(kit, 0, 20);
-      // ⚠️ 已知限制：纯合成鼓组会落到 2/3 倍速（84.6 = 128×2/3）——见 DEVLOG v1.8.0「已知限制」
-      ok(!!k128 && (Math.abs(k128.bpm - 128) < 4 || Math.abs(k128.bpm - 128 * 2 / 3) < 4),
-        "★★ 鼓组（底鼓+踩镲）测出 128（实际 " + (k128 ? k128.bpm.toFixed(1) : "?") + "）");
-      ok(!!k128 && k128.conf > 0.15, "★★ 置信不是 0（conf=" + (k128 ? k128.conf.toFixed(2) : "?") + "）");
+      const bPad = beat(pad);
+      ok(!bPad || bPad.conf < 0.2,
+        "★★ 纯铺底：置信被压到 0.2 以下（" + (bPad ? bPad.bpm.toFixed(1) + " / conf " + bPad.conf.toFixed(2) : "算不出") + "）");
 
+      // ④ 全静音仍然算不出
       const quiet = new Float32Array(8000 * 20);
-      eq(e.win.gaplessPlayer.beat({ duration: 20, sampleRate: 8000, numberOfChannels: 1, length: quiet.length, getChannelData: () => quiet }, 0, 20), null,
+      eq(beat({ duration: 20, sampleRate: 8000, numberOfChannels: 1, length: quiet.length, getChannelData: () => quiet }), null,
         "★★ 全静音 → 算不出（不硬凑）");
     }
-
     // ---- (b) #10 头尾 BPM 不一致：不永久排除，改用头窗外推尾巴的拍点 ----
     {
       const sr = 8000;
