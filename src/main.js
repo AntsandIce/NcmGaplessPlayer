@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.5.8";
+  var VERSION = "1.6.0";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -557,8 +557,39 @@
    *   **有声音**（跨域音频一旦被 taint，MediaElementSource 会输出**纯静音**，
    *   LFP 不可能能用那么久）→ 这台机器上不存在这个问题。
    */
-  function ensureEl() {
-    if (S.el) return S.el;
+  /* ---- ★ v1.6.0：元素池（双元素流水线）----
+   *
+   * 之前只有一个 `<audio>`：它在给当前这首用时，下一首就**没法预热**（动它就断音）。
+   * 现在按需扩到 2 个槽：A 在槽 0 出声，B 在槽 1 静静缓冲；真切歌时把「出声槽」切过去。
+   *
+   * ★ 每个 `<audio>` 只能 `createMediaElementSource()` 一次 → 每个槽建一次、长期复用。
+   * ★ 槽的 gain 走自己的链路（gain → highpass → 总线），所以「切槽」就是一次淡入淡出。
+   */
+  var elPool = []; // [{ el, src, gain, filter, preopenTrackId }]
+  var elActive = 0;
+
+  function slotAt(i) {
+    return elPool[i] || null;
+  }
+
+  function activeSlot() {
+    return elPool[elActive] || null;
+  }
+
+  /** 把「当前出声」的槽绑定到 S.el / S.mediaSrc / S.mediaGain / S.mediaFilter */
+  function bindActive(i) {
+    var s = slotAt(i);
+    if (!s) return null;
+    elActive = i;
+    S.el = s.el;
+    S.mediaSrc = s.src;
+    S.mediaGain = s.gain;
+    S.mediaFilter = s.filter;
+    return s;
+  }
+
+  /** 建一个槽（失败返回 null，调用方负责退化） */
+  function makeSlot(i) {
     if (!S.ctx) return null;
     var El = null;
     try {
@@ -570,42 +601,73 @@
       log("[stream] ★ 拿不到 Audio 构造器 → 这一首走缓冲路径");
       return null;
     }
+    var src = null;
     try {
       El.preload = "auto";
       El.volume = 1; // 音量统一由 S.gain 控，别两处都调
-      S.mediaSrc = S.ctx.createMediaElementSource(El);
+      src = S.ctx.createMediaElementSource(El);
     } catch (e) {
       log("[stream] ★ createMediaElementSource 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
+      return null;
+    }
+    var g = null;
+    var f = null;
+    try {
+      g = S.ctx.createGain();
+      f = S.ctx.createBiquadFilter();
+      f.type = "highpass";
+      f.frequency.value = EQ_BASE_HZ;
+      src.connect(g);
+      g.connect(f);
+      f.connect(S.gain); // src → gain → filter → 总线 → analyser → destination
+    } catch (e) {
+      log("[stream] ★ 流式的 gain/高通建不起来 → 直连总线（交叉时没有淡出）｜ " + (e && e.message));
+      g = null;
+      f = null;
+      try {
+        src.connect(S.gain);
+      } catch (e2) {}
+    }
+    var slot = { el: El, src: src, gain: g, filter: f, preopenTrackId: null };
+    El.addEventListener("durationchange", function () {
+      var a = activeSlot();
+      if (S.stream && a && a.el === El && isFinite(El.duration) && El.duration > 0) S.duration = El.duration;
+    });
+    log("[stream] <audio> 已建好（槽#" + i + "）");
+    return slot;
+  }
+
+  function ensureEl() {
+    if (elPool.length) {
+      if (S.el) return S.el;
+      bindActive(elActive < elPool.length ? elActive : 0);
+      return S.el;
+    }
+    var s = makeSlot(0);
+    if (!s) {
       S.el = null;
       S.mediaSrc = null;
       S.mediaGain = null;
       S.mediaFilter = null;
       return null;
     }
-    // ★ v1.3.0/v1.3.2：流式这一路也插「自己的 gain + 高通」，交叉时才能淡出 / 扫频。
-    //   ⚠️ 这两层建不起来不能连累流式播放本身 → 退化成直连总线。
-    try {
-      S.mediaGain = S.ctx.createGain();
-      S.mediaFilter = S.ctx.createBiquadFilter();
-      S.mediaFilter.type = "highpass";
-      S.mediaFilter.frequency.value = EQ_BASE_HZ;
-      S.mediaSrc.connect(S.mediaGain);
-      S.mediaGain.connect(S.mediaFilter);
-      S.mediaFilter.connect(S.gain); // mediaSrc → mediaGain → mediaFilter → gain → analyser → destination
-    } catch (e) {
-      log("[stream] ★ 流式的 gain/高通建不起来 → 直连总线（交叉时没有淡出）｜ " + (e && e.message));
-      S.mediaGain = null;
-      S.mediaFilter = null;
-      try {
-        S.mediaSrc.connect(S.gain);
-      } catch (e2) {}
+    elPool.push(s);
+    bindActive(0);
+    return S.el;
+  }
+
+  /** 把池子扩到至少 n 个槽（第二个槽只在要预开时才建） */
+  function ensureSlotCount(n) {
+    if (!S.ctx) return elPool.length;
+    while (elPool.length < n) {
+      var wasEmpty = elPool.length === 0;
+      var s = makeSlot(elPool.length);
+      if (!s) break;
+      elPool.push(s);
+      // 第一个槽永远当「出声槽」占位（即使当前这首走缓冲），这样后续判断「空闲槽」才稳
+      if (wasEmpty) bindActive(0);
     }
-    S.el = El;
-    El.addEventListener("durationchange", function () {
-      if (S.stream && S.el && isFinite(S.el.duration) && S.el.duration > 0) S.duration = S.el.duration;
-    });
-    log("[stream] <audio> 已建好（mediaSrc → mediaGain → gain → analyser → destination）");
-    return El;
+    return elPool.length;
   }
 
   /** 上一首挂的流式事件清理函数（换歌时先摘掉，天然防「旧歌事件串到新歌」） */
@@ -616,7 +678,7 @@
    * 元素的 `loadedmetadata` / `ended` / `error` 本身**不告诉你**是哪一次 load 的，
    * 只有让闭包捕获 token，才能判断「这条事件是不是已经过期」。
    */
-  function attachStreamEvents(token) {
+  function attachStreamEvents(token, adoptSlot) {
     if (detachStream) {
       try {
         detachStream();
@@ -705,7 +767,7 @@
 
     // ★ v1.5.3：这首的流**提前预开过** → metadata 可能在我们挂监听之前就发完了，
     //   那就补一次（否则会一直等一个不会再来第二次的事件）。
-    if (S.preopenUrl && el && Number(el.readyState) >= 1) {
+    if (adoptSlot >= 0 && el && Number(el.readyState) >= 1) {
       log("[stream] ★ 复用提前预开的流（metadata 早已就绪）｜ readyState=" + el.readyState);
       onMeta();
     }
@@ -739,12 +801,26 @@
    * 拿不到元素 / 没有可用 URL → 返回 false，安静退回缓冲路径。
    */
   function startStream(token, url, local) {
+    // ★ v1.6.0：这一首已经在别的槽里预热过 → 直接把它变成出声槽（不重设 src，省掉 canplay 等待）
+    var prevEl = S.el;
+    var adoptSlot = findPreopenSlot(S.curTrackId);
+    if (adoptSlot >= 0) {
+      log("[stream] ★ 采用预开的槽 #" + adoptSlot + "（这一首已经缓冲过了）");
+      bindActive(adoptSlot);
+    }
     var el = ensureEl();
     if (!el) return false;
+    // ★ v1.6.0：接手新槽之前先把「上一个出声槽」停掉（否则会双声）
+    if (prevEl && prevEl !== el) {
+      try {
+        prevEl.pause();
+        log("[stream] 上一个槽已暂停（避免双声）");
+      } catch (e) {}
+    }
     S.stream = true;
     S.trim = null; // ★ v1.2.0：流式 =<audio>的原始时间轴，没法做首尾裁剪（也没有采样级控制）
     S.elToken = token;
-    attachStreamEvents(token);
+    attachStreamEvents(token, adoptSlot);
     armMetaTimer(token);
 
     /** 真正把 src 挂上去。返回 false = 失败（调用方负责退回缓冲路径） */
@@ -760,13 +836,11 @@
       }
       if (token !== S.loadToken) return true; // 已经过期 → 当作已处理
       // ★ v1.5.3：这一首的流已经预开过 → **别再重设 src**（重设 = 重新下载，等于白预开）
-      if (S.preopenUrl && S.preopenTrackId !== null && S.preopenTrackId === S.curTrackId) {
+      if (adoptSlot >= 0) {
         log("[stream] ★ 复用提前预开的 <audio>（不重设 src）");
-        S.preopenUrl = null; // 接管完成，交回正常流程
-        S.preopenTrackId = null;
+        slotAt(adoptSlot).preopenTrackId = null; // 接管完成，交回正常流程
         return true;
       }
-      S.preopenUrl = null;
       try {
         el.pause();
         el.src = u;
@@ -1911,9 +1985,9 @@
   function startPreload(trackId, why) {
     // ★ v0.2.5：换槽前先把上一个在飞的下载掐断（否则它照跑到底，白花带宽）
     var old = S.preload;
-    // ★ v1.5.3：换的是**别的歌** → 之前为它预开的流没用了，清掉（别白占连接）
-    if (S.preopenUrl && S.preopenTrackId !== S.curTrackId && (!old || old.trackId !== trackId)) {
-      clearPreopen("换预载目标");
+    // ★ v1.6.0：换的是**别的歌** → 之前为它预开的槽没用了（保留当前这首那一份）
+    if (!(old && old.trackId === trackId) && S.curTrackId !== null) {
+      clearPreopensExcept(S.curTrackId, "换预载目标");
     }
     if (old && old.abort) {
       try {
@@ -2060,9 +2134,9 @@
         p.abort.abort();
       } catch (e) {}
     }
-    // ★ v1.5.3：预载作废 → 为它预开的流也一起清掉
-    if (S.preopenUrl && !(opts && opts.keepPreopen) && S.preopenTrackId !== S.curTrackId) {
-      clearPreopen("预载作废");
+    // ★ v1.6.0：预载作废 → 为它预开的槽也一起清掉（保留正在播那首的预开）
+    if (!(opts && opts.keepPreopen)) {
+      clearPreopensExcept(S.curTrackId, "预载作废");
     }
     S.preload = null;
     S.preloadToken++;
@@ -2635,37 +2709,68 @@
    */
 
   /** 清掉提前预开的流（换歌 / 预载作废时调） */
-  function clearPreopen(why) {
-    if (!S.preopenUrl) return;
-    S.preopenTrackId = null;
-    var was = S.preopenUrl;
-    S.preopenUrl = null;
-    log("[stream] 清掉提前预开的流（" + (why || "?") + "）｜ " + String(was).slice(-48));
-    if (S.stream) return; // 元素正在给当前这首播 → 绝对不动
+  /** 清掉某个槽上的预开（绝不碰正在出声的槽） */
+  function clearSlotPreopen(i, why) {
+    var s = slotAt(i);
+    if (!s || s.preopenTrackId === null) return;
+    var was = s.preopenTrackId;
+    s.preopenTrackId = null;
+    log("[stream] 清掉提前预开的流（" + (why || "?") + "）｜ 槽#" + i + " track=" + was);
+    if (i === elActive) return; // 正在出声的槽绝不动
     try {
-      if (S.el) {
-        S.el.pause();
-        if (typeof S.el.removeAttribute === "function") S.el.removeAttribute("src");
-        if (typeof S.el.load === "function") S.el.load();
-      }
+      s.el.pause();
+      if (typeof s.el.removeAttribute === "function") s.el.removeAttribute("src");
+      if (typeof s.el.load === "function") s.el.load();
     } catch (e) {}
   }
 
+  /** 清掉所有预开，但**保留**指定曲目那一份（换预载目标时用） */
+  function clearPreopensExcept(keepTrackId, why) {
+    for (var i = 0; i < elPool.length; i++) {
+      if (keepTrackId !== null && keepTrackId !== undefined && elPool[i].preopenTrackId === keepTrackId) continue;
+      clearSlotPreopen(i, why);
+    }
+  }
+
+  function clearPreopen(why) {
+    clearPreopensExcept(null, why);
+  }
+
+  function findPreopenSlot(trackId) {
+    if (trackId === null || trackId === undefined) return -1;
+    for (var i = 0; i < elPool.length; i++) {
+      if (elPool[i].preopenTrackId === trackId) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * 提前把下一首的流挂到**空闲槽**上让它自己缓冲。
+   * ★ 与 v1.5.3 的区别：那时受「唯一元素正被当前这首占用」限制，只能在不走流式时才预开；
+   *   现在用到第二个槽，**当前在流式也能预开**（这正是双元素的意义）。
+   */
   function preopenStream(url, trackId) {
     if (!url) return false;
-    if (S.stream) return false; // 元素在用
     if (passAllToNative()) return false;
-    var u = String(url);
-    if (S.preopenUrl === u) return false; // 已经预开过这一首
-    var el = ensureEl();
-    if (!el) return false;
+    if (!S.ctx) return false;
+    if (trackId === null || trackId === undefined) return false;
+    if (findPreopenSlot(trackId) >= 0) return false; // 已经为这一首预开过（幂等）
+    ensureSlotCount(2);
+    var idx = -1;
+    for (var i = 0; i < elPool.length; i++) {
+      if (i !== elActive && elPool[i].preopenTrackId === null) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx < 0) return false; // 没有空闲槽 → 放弃预热（退化成原来的行为）
+    var s = elPool[idx];
     try {
-      el.preload = "auto";
-      el.src = u;
-      if (typeof el.load === "function") el.load();
-      S.preopenUrl = u;
-      S.preopenTrackId = trackId;
-      log("[stream] ★ 提前预开 <audio>（B 还没就绪）｜ " + u.slice(-64));
+      s.el.preload = "auto";
+      s.el.src = String(url);
+      if (typeof s.el.load === "function") s.el.load();
+      s.preopenTrackId = trackId;
+      log("[stream] ★ 提前预开 <audio>（B 还没就绪）｜ 槽#" + idx + " ｜ " + String(url).slice(-64));
       return true;
     } catch (e) {
       log("[stream] ★ 预开失败（忽略，照旧走原路）｜ " + (e && e.message));
@@ -2677,7 +2782,6 @@
   function maybePreopenNext(nid) {
     try {
       if (!useStream()) return;
-      // ★ 「元素正在用就不许动」这道闸在 preopenStream 内部（这里再判一次是死代码：删掉行为不变）
       if (passAllToNative()) return;
       var p = S.preload;
       if (!p || p.trackId !== nid) return;
