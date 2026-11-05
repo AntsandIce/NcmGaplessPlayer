@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.5.5";
+  var VERSION = "1.5.8";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -2251,52 +2251,189 @@
    */
 
   var sqlSeq = 0;
+  var sqlPending = {}; // reqId → 回调（一次只认一条，别人查库的结果不会串进来）
+  var sqlHandlerReady = false;
 
-  /** 发一条只读 SQL，把结果写进日志。返回 reqId（可用于在日志里对照） */
-  function probeSql(sql) {
-    var reqId = "gp" + Date.now() + "_" + ++sqlSeq;
-    var answered = false;
-    log("[sql] → " + briefJson(sql, 160) + " ｜ reqId=" + reqId);
-
-    function onDone(id, err, value) {
-      if (String(id) !== String(reqId)) return; // 只认我们自己这条（别人也在用同一个回调名）
-      if (answered) return;
-      answered = true;
-      log("[sql] ← err=" + err + " ｜ " + briefJson(value, 700));
-    }
-
+  /** 只注册一次（否则每查一次就多挂一个处理器，越用越多） */
+  function ensureSqlHandler() {
+    if (sqlHandlerReady) return true;
     try {
-      // 客户端自己就是这么注册的（name + 命名空间）；我们的 wrapper 会记录并转发给原生
-      if (typeof legacyNativeCmder !== "undefined" && legacyNativeCmder &&
-          typeof legacyNativeCmder.appendRegisterCall === "function") {
-        legacyNativeCmder.appendRegisterCall("execsqldone", "storage", onDone);
+      if (typeof legacyNativeCmder === "undefined" || !legacyNativeCmder ||
+          typeof legacyNativeCmder.appendRegisterCall !== "function") {
+        log("[sql] ★ 没有 appendRegisterCall，查不了 DB");
+        return false;
       }
+      legacyNativeCmder.appendRegisterCall("execsqldone", "storage", function (id, err, value) {
+        var key = String(id);
+        var cb = sqlPending[key];
+        if (!cb) {
+          // 客户端自己也在用这条通道 → 别人的结果直接忽略（记一笔，便于排查「结果串台」）
+          log("[sql] 忽略一条不属于我们的结果 ｜ id=" + key);
+          return;
+        }
+        delete sqlPending[key];
+        try {
+          cb(err, value);
+        } catch (e) {}
+      });
+      sqlHandlerReady = true;
+      return true;
     } catch (e) {
-      log("[sql] appendRegisterCall 失败 ｜ " + (e && e.message));
+      log("[sql] ★ 注册 execsqldone 失败 ｜ " + (e && e.message));
+      return false;
     }
+  }
 
+  /**
+   * 发一条只读 SQL。结果靠 `storage.onexecsqldone` 回来（客户端自己也是这么拿结果的）。
+   * @param cb 可选：function(errCode, value)
+   * @returns reqId（用于在日志里对照）
+   */
+  function probeSql(sql, cb) {
+    var reqId = "gp" + Date.now() + "_" + ++sqlSeq;
+    if (!ensureSqlHandler()) return null;
+    sqlPending[reqId] = function (err, value) {
+      log("[sql] ← err=" + err + " ｜ " + briefJson(value, 3000));
+      if (typeof cb === "function") {
+        try {
+          cb(err, value);
+        } catch (e) {}
+      }
+    };
+    log("[sql] → " + briefJson(sql, 200) + " ｜ reqId=" + reqId);
     try {
-      channel.call(
-        "storage.execsql",
-        function (res) {
-          log("[sql] 直接回调 ← " + briefJson(res, 300));
-        },
-        [reqId, sql]
-      );
+      channel.call("storage.execsql", function (res) {
+        if (res !== undefined && res !== null) log("[sql] 直接回调 ← " + briefJson(res, 300));
+      }, [reqId, sql]);
     } catch (e) {
+      delete sqlPending[reqId];
       log("[sql] ★ channel.call 抛错 ｜ " + (e && e.message));
+      return reqId;
     }
-
     setTimeout(function () {
-      if (!answered) log("[sql] ← 无响应（1500ms）｜ 说明这条通道没给我们结果");
+      if (sqlPending[reqId]) {
+        delete sqlPending[reqId];
+        log("[sql] ← 无响应（1500ms）｜ 这条 SQL 没等到结果");
+      }
     }, 1500);
     return reqId;
   }
 
-  /** 第一步：有哪些表（只读 sqlite_master） */
+  /**
+   * 第一步探针：
+   *   ① 直接找「哪张表有 randomOrder 列」—— 这就是随机顺序的存放处
+   *   ② 顺便把建表 SQL 里带 randomOrder 的那条的完整定义打出来（看列名/索引）
+   */
   function probeSqlTables() {
-    log("[sql] ===== 查表名 =====");
-    return probeSql("SELECT name FROM sqlite_master WHERE type='table'");
+    log("[sql] ===== 找 randomOrder 所在的表 =====");
+    probeSql(
+      "SELECT name, sql FROM sqlite_master WHERE type='table' AND (sql LIKE '%randomOrder%' OR name LIKE '%order%')",
+      function (err, value) {
+        var rows = Array.isArray(value) ? value : [];
+        if (!rows.length) {
+          log("[sql] 没找到含 randomOrder 的表/建表语句（可能需要看别的库）");
+          return;
+        }
+        for (var i = 0; i < rows.length; i++) {
+          log("[sql] ★ 候选表 " + (rows[i] && rows[i].name) + " ｜ " + briefJson(rows[i] && rows[i].sql, 600));
+        }
+        // ★ 顺手看一眼最像「播放顺序」的那张表（结构 + 前 3 行，只读）
+        for (var k = 0; k < rows.length && k < 3; k++) {
+          var nm = rows[k] && rows[k].name;
+          if (nm && /order|current|playing/i.test(nm)) {
+            probeSqlTable(nm);
+            break;
+          }
+        }
+      }
+    );
+    return true;
+  }
+
+  /**
+   * ★ v1.5.7：直接看**播放列表**那两张表。
+   * 从客户端常量里挖到的真实表名是 `currentPlayingList` / `lastPlayingList`
+   * （`{current:"currentPlayingList", last:"lastPlayingList"}`），
+   * 随机顺序就是它们里面的 `randomOrder` 列排序。
+   *
+   * 一次点完三件事：建表 SQL → 头两行（列名/值一览）→ 总行数。
+   */
+  function probePlayingList() {
+    log("[sql] ===== 看播放列表表（currentPlayingList / lastPlayingList）=====");
+    probeSql(
+      "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('currentPlayingList','lastPlayingList')",
+      function (err, rows) {
+        var list = Array.isArray(rows) ? rows : [];
+        if (!list.length) {
+          log("[sql] ★ 这张库里没有 currentPlayingList/lastPlayingList（可能不在这条连接上）");
+          return;
+        }
+        for (var i = 0; i < list.length; i++) {
+          log("[sql] ★ 表 " + list[i].name + " ｜ " + briefJson(list[i].sql, 900));
+        }
+      }
+    );
+    probeSql("SELECT * FROM currentPlayingList LIMIT 2", function (err, rows) {
+      var list = Array.isArray(rows) ? rows : [];
+      log("[sql] currentPlayingList 前 2 行: " + briefJson(list, 1500));
+    });
+    probeSql("SELECT count(*) AS n FROM currentPlayingList");
+    return true;
+  }
+  /**
+   * ★ v1.5.8：最后的两个线索（都只读）。
+   *
+   *   ① `persistentModel` 表 —— 名字像是「持久化的 store」，如果播放列表的 redux 状态在里面，
+   *      那 `curPlayingList`（含每行的 randomOrder）就能直接读到；
+   *   ② `window.frontendEncrypt` —— 客户端的加解密入口（window 上确实有），
+   *      localStorage 里的 `playingInfo`（十几 KB 的密文）很可能就是「播放列表快照」。
+   *      能解开它，就不需要 DB 也不需要 store。
+   */
+  function probePersist() {
+    log("[sql] ===== persistentModel / 加密快照 =====");
+    probeSql("SELECT sql FROM sqlite_master WHERE type='table' AND name='persistentModel'");
+    probeSql("SELECT * FROM persistentModel LIMIT 3", function (err, rows) {
+      log("[sql] persistentModel 前 3 行: " + briefJson(rows, 2000));
+    });
+
+    try {
+      var fe = (typeof window !== "undefined" && window && window.frontendEncrypt) || null;
+      log("[enc] frontendEncrypt ｜ typeof=" + typeof fe + " ｜ keys=" + (fe ? Object.keys(fe).join(",") : "（无）"));
+      var pi = null;
+      try {
+        pi = (typeof localStorage !== "undefined" && localStorage) ? localStorage.getItem("playingInfo") : null;
+      } catch (e) {
+        pi = null;
+      }
+      log("[enc] playingInfo 长度=" + (pi ? pi.length : 0));
+      if (fe && pi) {
+        var cands = ["decode", "decrypt", "decodeStr", "aesDecrypt", "aesDecode", "strDecrypt"];
+        for (var i = 0; i < cands.length; i++) {
+          var k = cands[i];
+          if (typeof fe[k] !== "function") continue;
+          try {
+            var out = fe[k](pi);
+            log("[enc] frontendEncrypt." + k + "(playingInfo) → " + briefJson(out, 600));
+          } catch (e2) {
+            log("[enc] frontendEncrypt." + k + " 抛错 ｜ " + (e2 && e2.message));
+          }
+        }
+      }
+    } catch (e) {
+      log("[enc] 探针抛错 ｜ " + (e && e.message));
+    }
+    return true;
+  }
+  /** 通用：把「某张表的结构 + 前几行」打出来 */
+  function probeSqlTable(name) {
+    var t = String(name || "");
+    if (!/^[A-Za-z0-9_]+$/.test(t)) {
+      log("[sql] ★ 表名不合法: " + t);
+      return null;
+    }
+    log("[sql] ===== 看表 " + t + " =====");
+    probeSql("SELECT sql FROM sqlite_master WHERE type='table' AND name='" + t + "'");
+    return probeSql('SELECT * FROM "' + t + '" LIMIT 3');
   }
 
   /* ==================== v1.5.4 · C3 侦察：能不能问出「下一首是谁」==================== */
@@ -5318,6 +5455,12 @@
           )
         );
       });
+      var playBtn = el("button", "gp-btn", "查播放列表");
+      playBtn.onclick = function () {
+        probePlayingList();
+        probePersist();
+      };
+      diag.appendChild(rowEl("C3 播放列表", playBtn));
       var sqlBtn = el("button", "gp-btn", "查 DB 表");
       sqlBtn.onclick = function () {
         probeSqlTables();
@@ -5482,7 +5625,10 @@
         preopen: preopenStream, // ★ v1.5.3：诊断用（也会走「元素在用就不动」的守卫）
         probeNext: probeNext, // ★ v1.5.4：C3 侦察（只读，查「下一首是谁」能不能问出来）
         sqlq: probeSql, // ★ v1.5.5：直接向播放列表 DB 发只读 SQL
-        sqlTables: probeSqlTables, // ★ v1.5.5：先看有哪些表
+        sqlTables: probeSqlTables, // ★ v1.5.5：找 randomOrder 在哪张表；★ v1.5.6：直接给出候选表+建表 SQL
+        sqlTable: probeSqlTable, // ★ v1.5.6：看某张表的结构 + 前 3 行
+        sqlPlaying: probePlayingList, // ★ v1.5.7：直接看 currentPlayingList（随机顺序就在里面）
+        sqlPersist: probePersist, // ★ v1.5.8：看 persistentModel 表 + 试着解开 playingInfo
         snapToBeat: snapToBeat,
         lastPlan: function () {
           return S.lastPlan;

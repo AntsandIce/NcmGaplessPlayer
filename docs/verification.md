@@ -480,6 +480,26 @@ gaplessPlayer.sqlq("SELECT resourceId, randomOrder FROM current ORDER BY randomO
 
 ---
 
+## 4m. C3 第二轮：播放列表不在 execsql 那条连接上（v1.5.8）
+
+已确认：storage.execsql 对我们开放，但查到的库里**没有** currentPlayingList
+（rr=1 no such table），搜 andomOrder 零命中，web_playlist_order 只是**排序偏好**表。
+
+现在剩下的两条线索（都只读，gaplessPlayer.sqlPersist() / 面板「查播放列表」）：
+
+`
+[sql] → SELECT * FROM persistentModel LIMIT 3          ← 持久化的 store？里面有没有 curPlayingList
+[enc] frontendEncrypt ｜ typeof=object ｜ keys=…        ← 客户端加解密入口
+[enc] playingInfo 长度=17016                            ← localStorage 里的加密快照
+[enc] frontendEncrypt.decode(playingInfo) → …           ← 能解开就是播放列表快照
+`
+
+- persistentModel 里能读到播放列表 → 直接按 andomOrder 排序算下一首；
+- rontendEncrypt 能解开 playingInfo → 同上；
+- 两条都不行 → 随机播放的无缝只能回到「押 + 预开流」，不再继续投入。
+
+---
+
 ## 5. 排查建议
 
 - 关键日志：`[sched] 预约 / 认领`、`[end] ★ 自然播完 → 无缝交接`、`[preload] 320k 接口`、`[nafetch]`。
@@ -488,5 +508,5 @@ gaplessPlayer.sqlq("SELECT resourceId, randomOrder FROM current ORDER BY randomO
   2. 看有没有 `[sched] 预约`：没有 = 门槛没过（模式 / 预测 / 时间窗）；
   3. 看 `[preload]` 是否出现 `320k 接口`，失败会自动退 128k。
 - 一次结束推进两首：确认 `getPlayedTime` / `getPlaybackInfo` 被插件接管（结束窗口内应有「自答」记录）。
-- 上线验证：`node test/harness.js` → `通过 588 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86、autoplay 兜底 87、风格/状态 88、拍点 89、B 入点 90、面板 91、预开流 92、C3 侦察 93、DB SQL 94）。
-  变异测试：`node test/mutate.js` → `变异点 120 个，抓住 120 个，漏网 0 个`。
+- 上线验证：`node test/harness.js` → `通过 601 项，失败 0 项`（含裁剪 81、去重 82、缓存 83、交叉 84、补缓冲 85、曲线/扫频/探针 86、autoplay 兜底 87、风格/状态 88、拍点 89、B 入点 90、面板 91、预开流 92、C3 侦察 93、DB SQL 94）。
+  变异测试：`node test/mutate.js` → `变异点 121 个，抓住 121 个，漏网 0 个`。

@@ -3611,7 +3611,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.5\.5/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.5\.8/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -3921,13 +3921,12 @@ async function main() {
       ok(arr.length >= 1, "★★ 回调挂到了 storage.onexecsqldone（共 " + arr.length + " 个）");
       // 先把「别人」的结果喂进来，验证 reqId 过滤
       arr.forEach((fn) => fn("别人的reqId", 0, [{ name: "不该出现" }]));
-      e.flushTimers();
-      e.flushTimers();
-      ok(!/不该出现/.test(e.logs()), "★★ 别人的结果被 reqId 过滤掉了");
-      // 再喂我们自己的
+      // 再喂我们自己的 —— ⚠️ 中间不能 flushTimers：那会把这条查询的 1500ms 超时也跑掉（pending 被清）
       arr.forEach((fn) => fn(rq, 0, [{ name: "current" }, { name: "last" }]));
       e.flushTimers();
       e.flushTimers();
+      ok(!/不该出现/.test(e.logs()), "★★ 别人的结果被 reqId 过滤掉了（内容没串进来）");
+      ok(countLog(e, "忽略一条不属于我们的结果") >= 1, "★★ 而且明确记了一笔「忽略别人的结果」");
       ok(countLog(e, "[sql] ← err=0") >= 1, "★★ 我们的结果被记下来了");
       ok(/current/.test(e.logs()) && /last/.test(e.logs()), "★★ 表名进了日志（能直接看出有没有 current 表）");
     }
@@ -3946,6 +3945,55 @@ async function main() {
     }
   }
 
+
+    // ---- (e) v1.5.7：播放列表探针（表名是从客户端常量里挖出来的） ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      ok(typeof api.sqlPlaying === "function", "★★ 暴露了 sqlPlaying()");
+      const n0 = e.nativeCalls.length;
+      eq(api.sqlPlaying(), true, "★★ 播放列表探针跑起来了");
+      const sqls = e.nativeCalls.slice(n0).filter((c) => c.name === "storage.execsql")
+        .map((c) => String(c.args[0][1]));
+      eq(sqls.length, 3, "★★ 一次点了三件事（结构 / 前两行 / 行数）");
+      ok(sqls.some((s) => /currentPlayingList/.test(s)), "★★ 查的是 currentPlayingList");
+      ok(sqls.some((s) => /sqlite_master/.test(s)), "★★ 先问了建表 SQL（才知道有没有 randomOrder 列）");
+      ok(sqls.some((s) => /count\(\*\)/i.test(s)), "★★ 也问了总行数");
+    }
+
+    // ---- (f) v1.5.8：persistentModel + 加密快照探针（都只读，缺什么都得能跑完） ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      ok(typeof api.sqlPersist === "function", "★★ 暴露了 sqlPersist()");
+      const n0 = e.nativeCalls.length;
+      eq(api.sqlPersist(), true, "★★ 持久化探针跑起来了");
+      const sqls = e.nativeCalls.slice(n0).filter((c) => c.name === "storage.execsql")
+        .map((c) => String(c.args[0][1]));
+      ok(sqls.some((s) => /persistentModel/.test(s)), "★★ 查了 persistentModel 表（" + sqls.length + " 条 SQL）");
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "[enc] frontendEncrypt ｜") >= 1, "★★ 也报了 frontendEncrypt 是否存在");
+      ok(countLog(e, "[enc] playingInfo 长度=") >= 1, "★★ 也报了 playingInfo 长度");
+      // 有 frontendEncrypt 时逐个试解密方法，不能抛
+      const e2 = createEnv();
+      e2.win.frontendEncrypt = {
+        decode(x) {
+          return "decoded:" + String(x).slice(0, 4);
+        },
+      };
+      e2.localStorage.setItem("playingInfo", "ABCDEFG");
+      e2.boot();
+      await flush();
+      e2.win.gaplessPlayer.sqlPersist();
+      e2.flushTimers();
+      e2.flushTimers();
+      ok(/decoded:ABCD/.test(e2.logs()), "★★ 能试出解密结果（" + (e2.logs().match(/\[enc\][^\n]*decode[^\n]*/) || ["?"])[0] + "）");
+    }
   /* ---------- 汇总 ---------- */
   console.log("\n====================");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");

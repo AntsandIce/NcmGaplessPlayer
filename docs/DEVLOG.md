@@ -1,9 +1,64 @@
-# GaplessPlayer 开发日志（0.1.0 → 1.5.5）
+# GaplessPlayer 开发日志（0.1.0 → 1.5.8）
 
 > 面向使用者的安装与使用说明见 [README](../README.md)。
 
 ---
 
+## ★ v1.5.6 ~ v1.5.8 —— C3 第二轮：通道通了，但播放列表不在那条连接上
+
+### 已经确认的事实（真机）
+
+`storage.execsql` 这条通道**对我们开放**：
+
+```
+[sql] → SELECT name FROM sqlite_master WHERE type='table'
+[sql] ← err=0 ｜ [{"name":"web_offline_track"},{"name":"web_playlist_order"},…]
+```
+
+（结果不是从 `channel.call` 的回调来的，而是走 `execsqldone` 回调 —— 所以两条得一起挂。）
+
+但接着三个反证：
+
+1. **`web_playlist_order` 不是随机序列**，它的建表语句是
+   `(playlist_id BIGINT, field VARCHAR(40), order VARCHAR(40), PRIMARY KEY(playlist_id))`
+   —— 那是「这张歌单按哪个字段、升序还是降序」的**排序偏好**。
+2. 在 `sqlite_master` 里搜 `randomOrder` **零命中** ⇒ 这条连接里的库没有那一列。
+3. 从客户端常量里挖出播放列表的真实表名 `{current:"currentPlayingList", last:"lastPlayingList"}`，
+   直接查：`sqlite_master` 给了 `err=0 ｜ undefined`（没有这张表），
+   `SELECT * FROM currentPlayingList` 给 `err=1`（no such table）。
+
+⇒ **播放列表用的是另一条 sqlite 连接**（或另一个库文件）。`storage.execsql` 没有指定库名的参数，
+   所以从这条通道读不到它。
+
+### 这一段加的工具（都只读）
+
+```js
+gaplessPlayer.sqlTables()        // 找含 randomOrder / 名字像 order 的表，并打建表 SQL
+gaplessPlayer.sqlTable("x")      // 某张表的结构 + 前 3 行
+gaplessPlayer.sqlPlaying()       // 直接看 currentPlayingList（结构/前两行/行数）
+gaplessPlayer.sqlPersist()       // persistentModel 表 + 试着解开 playingInfo
+gaplessPlayer.sqlq("SELECT …")   // 任意只读 SQL
+```
+
+工程上的三个小改进：
+
+- **结果完整输出**（截断 700 → 3000 字符），否则表名一多就看不全；
+- **回调只注册一次** + `reqId → 待处理` 映射（原来是每查一次就多挂一个处理器，会积累）；
+- 别人的查询结果会明确记一行 `[sql] 忽略一条不属于我们的结果`，不再静默。
+
+### 下一步（等真机日志）
+
+`persistentModel` 表 + `window.frontendEncrypt`（localStorage 里的 `playingInfo` 是十几 KB 密文，
+很可能就是播放列表快照）。这两条里任意一条通了，随机播放的无缝就有解；都不通就得换思路。
+
+### 验收
+
+```
+node test/harness.js  → 通过 601 项，失败 0 项（第 94 段累计 22 项）
+node test/mutate.js   → 变异点 121 个，抓住 121 个，漏网 0 个
+```
+
+---
 ## ★ v1.5.5 —— C3 实测结论 + 找到真正的 DB 通道
 
 ### 探针实测（真机，随机播放，三次）
