@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.6.1";',
+    find: 'var VERSION = "1.7.0";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -537,8 +537,8 @@ const MUTATIONS = [
   {
     name: "v1.2.0: 预约 B 时不带 B 的裁剪量（B 开头那 26ms 静音又回来了）",
     file: "main.js",
-    find: "      src.start(bStart, entry.offset, bPlayDur);",
-    replace: "      src.start(bStart, 0, bdur); // 变异：不裁 B、也不跳入点",
+    find: "      else src.start(bStart, entry.offset, bPlayDur);",
+    replace: "      else src.start(bStart, 0, bdur); // 变异：不裁 B、也不跳入点",
     expect: "81",
   },
   {
@@ -936,6 +936,41 @@ const MUTATIONS = [
     find: "      tail.bpm = head.bpm;",
     replace: "      /* 变异：不改 BPM */",
     expect: "95",
+  },
+  {
+    name: "v1.7.0: 不做拉伸（C 等于没做）",
+    file: "main.js",
+    find: "        if (sp && sp.ok && fadeSec <= 8) {",
+    replace: "        if (false) { // 变异：不拉伸",
+    expect: "97",
+  },
+  {
+    name: "v1.7.0: 拉伸段不播（只剩接续段，等于没拉）",
+    file: "main.js",
+    find: "        stretchedSrc.start(bStart, 0, stretch.outLen);",
+    replace: "        /* 变异：不播拉伸段 */",
+    expect: "97",
+  },
+  {
+    name: "v1.7.0: 接续段没从「被消耗的位置」开始（会重播拉过的内容）",
+    file: "main.js",
+    find: "        bOffsetRest = entry.offset + stretch.consumed;",
+    replace: "        bOffsetRest = entry.offset; // 变异：不跳过",
+    expect: "97",
+  },
+  {
+    name: "v1.7.0: WSOLA 输出长度不看比例（拉伸等于没变）",
+    file: "main.js",
+    find: "    var outLen = Math.max(1, Math.round(len / speed2));",
+    replace: "    var outLen = len; // 变异：不看比例",
+    expect: "96",
+  },
+  {
+    name: "v1.7.0: stretchPlan 不检查 ±6%（把完全不同的 BPM 也硬拉）",
+    file: "main.js",
+    find: "    if (bestDev > STRETCH_MAX_DEV) {",
+    replace: "    if (false) { // 变异：不拦",
+    expect: "96",
   },
   {
     name: "v1.5.5: 不按 reqId 过滤（别人查库的结果会串进我们日志）",

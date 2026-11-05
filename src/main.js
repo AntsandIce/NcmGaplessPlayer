@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.6.1";
+  var VERSION = "1.7.0";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -2289,6 +2289,12 @@
     restoreGain(sc.fadeA, 1);
     restoreGain(sc.fadeB, 0);
     restoreEq(sc.eqA); // ★ v1.3.2：扫频也要复位，否则 A 会一直闷着
+    // ★ v1.7.0：拉伸段是独立的 source，撤销时必须一起停，否则它会继续响
+    if (sc.stretchedSrc) {
+      try {
+        sc.stretchedSrc.stop();
+      } catch (e) {}
+    }
     if (sc.phase === "armed") {
       try {
         sc.src.onended = null;
@@ -2319,6 +2325,11 @@
     restoreGain(sc.fadeA, 1); // ★ v1.3.0：押错时 A 还要继续响，增益必须复位
     restoreGain(sc.fadeB, 0);
     restoreEq(sc.eqA); // ★ v1.3.2
+    if (sc.stretchedSrc) {
+      try {
+        sc.stretchedSrc.stop();
+      } catch (e) {}
+    }
     if (sc.phase === "armed") {
       try {
         sc.src.onended = null;
@@ -3023,6 +3034,24 @@
       );
     }
 
+    // ★ v1.7.0（C）：能拉就拉 —— 只拉 B 的「交叉段」，拉完从原始缓冲接回
+    var stretch = null;
+    var stretchNote = "";
+    try {
+      if (fadeSec > 0 && autoMixEnabled()) {
+        var sp = stretchPlan(gA2, gB2, fadeSec);
+        if (sp && sp.ok && fadeSec <= 8) {
+          stretch = buildStretchedHead(buf, btrim, entry, sp, fadeSec);
+          if (stretch) stretchNote = " ｜ 拉伸 " + ((sp.ratio - 1) * 100).toFixed(2) + "%";
+        } else if (sp && !sp.ok) {
+          logVerbose("[stretch] 不拉伸 ｜ " + sp.reason);
+        }
+      }
+    } catch (e) {
+      log("[stretch] ★ 拉伸失败（退回普通交叉）｜ " + (e && e.message));
+      stretch = null;
+    }
+
     // ★ 手写建 source —— **不能复用 `startSource()`**：它第 3 行无条件 `stopSource()`，会把正在播的 A 停掉。
     var src = S.ctx.createBufferSource();
     src.buffer = buf;
@@ -3040,13 +3069,53 @@
         restoreGain(gB, 1); // 曲线排不上就别淡了（宁可硬接）
       }
     }
+    // ★ v1.7.0（C）：拉伸段先响（它就是「被拉过的 B 的前奏」），原始缓冲在交叉结束时接上
+    var srcRest = src; // 接续那一段（默认就是同一个 source）
+    var bStartRest = bStart;
+    var bOffsetRest = entry.offset;
+    var bPlayDurRest = bPlayDur;
+    var restOffsetSec = entry.skip;
+    var stretchedSrc = null;
+    if (stretch) {
+      stretchedSrc = S.ctx.createBufferSource();
+      stretchedSrc.buffer = stretch.buffer;
+      var chainS = newSourceChain();
+      if (chainS.gain) stretchedSrc.connect(chainS.gain);
+      else stretchedSrc.connect(S.gain);
+      if (chainS.gain && fadeSec > 0) {
+        if (!scheduleFade(chainS.gain.gain, bStart, fadeSec, true)) restoreGain(chainS.gain, 1);
+      }
+      try {
+        stretchedSrc.start(bStart, 0, stretch.outLen);
+      } catch (e) {
+        log("[stretch] ★ 拉伸段起播失败 → 只用原始缓冲 ｜ " + (e && e.message));
+        stretch = null;
+        stretchedSrc = null;
+      }
+      if (stretch) {
+        // 原始缓冲：从「拉伸段消耗掉的位置」接着放，并在 20ms 内淡入（盖住接缝）
+        bStartRest = bStart + stretch.outLen;
+        bOffsetRest = entry.offset + stretch.consumed;
+        bPlayDurRest = Math.max(0.02, bdur - entry.skip - stretch.consumed);
+        restOffsetSec = entry.skip + stretch.consumed;
+        if (gB && scheduleFade(gB.gain, bStartRest, 0.02, true)) {
+          // 走的是 20ms 的短淡入
+        } else if (gB) {
+          restoreGain(gB, 1);
+        }
+      }
+    }
     try {
-      src.start(bStart, entry.offset, bPlayDur);
+      if (stretch) src.start(bStartRest, bOffsetRest, bPlayDurRest);
+      else src.start(bStart, entry.offset, bPlayDur);
     } catch (e) {
       log("[sched] ★ start 失败 ｜ " + (e && e.name) + ": " + (e && e.message));
       try {
         src.disconnect();
       } catch (e2) {}
+      try {
+        if (stretchedSrc) stretchedSrc.disconnect();
+      } catch (e3) {}
       return;
     }
 
@@ -3072,9 +3141,9 @@
       trackId: nid,
       buffer: buf,
       duration: bdur, // 整首的可听时长（交接后 S.duration 用它，进度条才不会错）
-      startOffset: entry.skip, // ★ v1.5.1：B 的入点（交接后 S.startOffset 用它）
-      bufOffset: entry.offset, // ★ v1.5.1：缓冲时间轴上的起点（兜底节点重启时用）
-      playDur: bPlayDur, // ★ v1.5.1：从入点起还能播多久
+      startOffset: restOffsetSec, // ★ v1.5.1/v1.7.0：交接那一刻 B 应该处的可听位置（拉伸段已消耗 headSrc）
+      bufOffset: bOffsetRest, // ★ v1.5.1：缓冲时间轴上的起点（兜底节点重启时用）
+      playDur: bPlayDurRest, // ★ v1.5.1：从入点起还能播多久
       trim: btrim,
       gain: gB, // ★ v1.3.0：B 的增益节点（交接后成为 S.srcGain）
       filter: chainB.filter, // ★ v1.3.2：B 的高通（交接后成为 S.srcFilter）
@@ -3082,7 +3151,10 @@
       fadeB: gB && fadeSec > 0 ? gB : null,
       eqA: eqA, // 被扫频的那一路（撤销时要复位）
       xfade: fadeSec,
-      startCtxTime: bStart,
+      stretchedSrc: stretchedSrc, // ★ v1.7.0：拉伸段（交接时它还可能在响，撤销时要一起停）
+      stretchRatio: stretch ? stretch.ratio : 1, // ★ v1.7.0
+      // ★ v1.7.0：有拉伸时，接续那一段是从「交叉结束」才开始播的
+      startCtxTime: stretch ? bStartRest : bStart,
       endCtxTime: endCtxTime,
       phase: "armed",
       announced: false,
@@ -3094,6 +3166,7 @@
         " ｜ 来源=" + (S.stream ? "流式" : "缓冲") +
         (entry.skip > 0.02 ? " ｜ B入点=+" + (entry.skip * 1000).toFixed(0) + "ms" : "") +
         " ｜ B裁剪=首" + (btrim.start * 1000).toFixed(1) + "ms 尾" + (btrim.end * 1000).toFixed(1) + "ms" +
+        stretchNote +
         (fadeSec > 0
           ? " ｜ 交叉=" + fadeSec.toFixed(2) + "s（曲线=" + xfadeCurveName() + (eqA ? "+扫频" : "") + "）"
           : " ｜ 交叉=关")
@@ -4813,6 +4886,204 @@
     return { offset: off, skip: skip, reason: reason };
   }
 
+  /* ==================== v1.7.0 · C：WSOLA 保音高变速（接拍对齐）==================== */
+
+  /**
+   * WSOLA（Waveform Similarity Overlap-Add）：**变速不变调**。
+   *
+   * 为什么需要它：两首歌 BPM 不同时，只对齐入点是不够的 —— 交叉期间两边鼓点会互相错开。
+   * 真正的做法是把 B 加速/减速 r 倍（r = A.bpm / B.bpm），而直接改 `playbackRate` 会**变调**，
+   * 所以要用「改时间不改音高」的算法：分帧 → 在 ±搜索窗内找波形最相似的位置 → 重叠相加。
+   *
+   * ★ 只处理「交叉那一小段」（几秒），不处理整首 —— 成本从十亿级降到千万级。
+   * ★ 相关性用**降采样后的单声道**算，找到的偏移同时套到所有声道（左/右不错位）。
+   *
+   * @param chs   [{Float32Array}, ...] 各声道输入（等长）
+   * @param speed 播放速度倍数（>1 变快、输出更短；<1 变慢、输出更长）
+   * @returns {out: [Float32Array...], outLen, frames}
+   */
+  function wsolaStretch(chs, speed, opts) {
+    var o = opts || {};
+    var sr = Number(o.sr) || 48000;
+    var speed2 = Number(speed);
+    if (!(speed2 > 0.5) || speed2 > 2) speed2 = 1;
+    var nch = (chs && chs.length) || 0;
+    if (!nch) return { out: [], outLen: 0, frames: 0 };
+    var len = chs[0].length;
+    if (!(len > 0)) return { out: chs.map(function () { return new Float32Array(0); }), outLen: 0, frames: 0 };
+
+    var N = Math.max(64, Math.round((o.frameMs || 30) * sr / 1000)); // 帧长
+    var Hs = Math.max(32, Math.round(N / 2)); // 合成跳距（50% 重叠）
+    var D = Math.max(8, Math.round((o.searchMs || 6) * sr / 1000)); // 搜索半径
+    var outLen = Math.max(1, Math.round(len / speed2));
+    var Ha = Math.max(1, Math.round(Hs * speed2)); // 分析跳距
+    var ov = N - Hs; // 重叠长度
+
+    // 降采样单声道导引（相关性只在它上面算，省 4 倍运算）
+    var dec = 4;
+    var mlen = Math.floor(len / dec);
+    var mono = new Float32Array(mlen);
+    for (var i = 0; i < mlen; i++) {
+      var sum = 0;
+      var base = i * dec;
+      for (var c0 = 0; c0 < nch; c0++) sum += chs[c0][base] || 0;
+      mono[i] = sum / nch;
+    }
+
+    var win = new Float32Array(N);
+    for (var w = 0; w < N; w++) win[w] = 0.5 - 0.5 * Math.cos((2 * Math.PI * w) / (N - 1)); // Hann
+
+    var out = [];
+    for (var c = 0; c < nch; c++) out.push(new Float32Array(outLen));
+    var wsum = new Float32Array(outLen);
+
+    var ovD = Math.max(4, Math.round(ov / dec)); // 重叠区在降采样域的长度
+    var prevStart = 0;
+    var frames = 0;
+    for (var k = 0; k * Hs < outLen; k++) {
+      var nominal = Math.round(k * Ha);
+      var bestStart = nominal;
+      if (k > 0) {
+        var from = Math.max(0, nominal - D);
+        var to = Math.min(len - N, nominal + D);
+        var refBase = prevStart + Hs; // 上一帧「本该接下去」的位置
+        var refD = Math.round(refBase / dec);
+        var best = -Infinity;
+        for (var s = from; s <= to; s += 1) {
+          var sD = Math.round(s / dec);
+          if (sD + ovD > mlen || refD + ovD > mlen) break;
+          var corr = 0;
+          for (var j = 0; j < ovD; j++) corr += mono[sD + j] * mono[refD + j];
+          if (corr > best) {
+            best = corr;
+            bestStart = s;
+          }
+        }
+      } else {
+        bestStart = Math.max(0, Math.min(nominal, len - N));
+      }
+      if (bestStart < 0) bestStart = 0;
+      if (bestStart + N > len) bestStart = Math.max(0, len - N);
+
+      // 重叠相加（各声道用同一个偏移）
+      for (var c2 = 0; c2 < nch; c2++) {
+        var src = chs[c2];
+        var dst = out[c2];
+        for (var t = 0; t < N; t++) {
+          var oi = k * Hs + t;
+          if (oi >= outLen) break;
+          var si = bestStart + t;
+          if (si >= len) break;
+          dst[oi] += src[si] * win[t];
+        }
+      }
+      for (var t2 = 0; t2 < N; t2++) {
+        var oi2 = k * Hs + t2;
+        if (oi2 < outLen) wsum[oi2] += win[t2];
+      }
+      prevStart = bestStart;
+      frames++;
+    }
+
+    // 归一化（Hann 50% 重叠的和约等于 1，但仍按实际权重除一次，避免端部衰减）
+    for (var c3 = 0; c3 < nch; c3++) {
+      var d3 = out[c3];
+      for (var i3 = 0; i3 < outLen; i3++) {
+        var ws = wsum[i3];
+        if (ws > 1e-6) d3[i3] /= ws;
+      }
+    }
+    return { out: out, outLen: outLen, frames: frames };
+  }
+
+  /**
+   * ★ v1.7.0（C）：算出「拉伸过的交叉段」AudioBuffer。
+   *
+   * 只取 B 的 `headSrc` 秒（= 交叉时长 × 比例）做 WSOLA，输出正好 `fadeSec` 秒：
+   *   [B 的头 headSrc 秒] --拉伸--> 播 fadeSec 秒
+   * 之后从原始缓冲的 `entry.offset + headSrc` 处接回未拉伸的 B（见调度处）。
+   *
+   * @returns {buffer, outLen, consumed, ratio} 或 null（数据不够 / 算失败）
+   */
+  function buildStretchedHead(buf, btrim, entry, sp, fadeSec) {
+    if (!buf || !S.ctx) return null;
+    var sr = Number(buf.sampleRate) || 48000;
+    var nch = Math.min(2, Number(buf.numberOfChannels) || 1);
+    var startIn = Number(entry && entry.offset) || Number(btrim && btrim.start) || 0;
+    var srcLen = Math.max(1, Math.round(sp.headSrc * sr));
+    if (!(buf.length > startIn + srcLen + sr * 0.05)) return null; // B 太短，不值得拉
+    var chs = [];
+    for (var c = 0; c < nch; c++) {
+      var d = buf.getChannelData(c);
+      if (!d) return null;
+      chs.push(d.subarray(startIn, startIn + srcLen));
+    }
+    var outLen = Math.max(1, Math.round(fadeSec * sr));
+    var t0 = performance.now();
+    var r = wsolaStretch(chs, sp.ratio, { sr: sr, frameMs: 30, searchMs: 6 });
+    if (!r || !r.outLen) return null;
+    var n = Math.min(outLen, r.outLen);
+    if (n < sr * 0.1) return null;
+    var ab = S.ctx.createBuffer(nch, n, sr);
+    for (var c2 = 0; c2 < nch; c2++) {
+      var dst = ab.getChannelData(c2);
+      if (!dst || !dst.set) return null;
+      dst.set(r.out[c2].subarray(0, n));
+    }
+    log(
+      "[stretch] ★ 拉 " + ((sp.ratio - 1) * 100).toFixed(2) + "% ｜ 交叉段 " + fadeSec.toFixed(2) +
+        "s ｜ 消耗 B " + sp.headSrc.toFixed(2) + "s ｜ " + (performance.now() - t0).toFixed(0) + "ms"
+    );
+    return { buffer: ab, outLen: n / sr, consumed: sp.headSrc, ratio: sp.ratio };
+  }
+
+
+  var STRETCH_MAX_DEV = 0.06;
+  /** ★ v1.7.0：最短小于这个值就不值得拉（听不出来） */
+  var STRETCH_MIN_RATIO = 0.002;
+
+  /**
+   * 决定「要不要为这次交叉做变速」，以及拉多少。
+   * @param gA A 的网格（尾窗）、gB B 的网格（头窗）
+   * @param fadeSec 交叉时长
+   * @returns {ok, ratio, headOut, headSrc, conf, reason}
+   */
+  function stretchPlan(gA, gB, fadeSec) {
+    if (!gA || !gB || !(gA.bpm > 0) || !(gB.bpm > 0)) return { ok: false, ratio: 1, reason: "缺拍点网格" };
+    if (!(fadeSec > 0.3)) return { ok: false, ratio: 1, reason: "没有交叉可拉" };
+    var conf = Math.min(gA.conf, gB.conf);
+    if (conf < 0.2) return { ok: false, ratio: 1, conf: conf, reason: "置信太低（" + conf.toFixed(2) + "）" };
+
+    var best = 1;
+    var bestDev = 1e9;
+    var fact = [0.5, 1, 2];
+    for (var i = 0; i < 3; i++) {
+      var sp = gA.bpm / (gB.bpm * fact[i]);
+      var dev = Math.abs(sp - 1);
+      if (dev < bestDev) {
+        bestDev = dev;
+        best = sp;
+      }
+    }
+    if (bestDev > STRETCH_MAX_DEV) {
+      return { ok: false, ratio: best, conf: conf, reason: "BPM 偏差 " + (bestDev * 100).toFixed(1) + "% 超出 ±6%" };
+    }
+    if (Math.abs(best - 1) < STRETCH_MIN_RATIO) {
+      return { ok: false, ratio: best, conf: conf, reason: "本来就同步，不需要拉伸" };
+    }
+    return {
+      ok: true,
+      ratio: best,
+      conf: conf,
+      dev: bestDev,
+      headOut: fadeSec, // 输出（时间轴）长度 = 交叉时长
+      headSrc: fadeSec * best, // 需要消耗的 B 输入长度
+      reason: "拉伸 " + ((best - 1) * 100).toFixed(2) + "%",
+    };
+  }
+
+
+
   /* ==================== v1.3.3 · autoplay 兜底（不带启动参数也不用点播放）==================== */
 
   /**
@@ -5850,7 +6121,11 @@
         lastPlan: function () {
           return S.lastPlan;
         },
-        // ★ v1.6.1：读某首的拍点网格（头/尾各一份），排查「头尾 BPM 不一致」时用
+        // ★ v1.7.0：C 的纯函数（验证台直接测它们，不进 Worker）
+        wsola: function (chs, speed, opts) {
+          return wsolaStretch(chs, speed, opts);
+        },
+        stretchPlan: stretchPlan,        // ★ v1.6.1：读某首的拍点网格（头/尾各一份），排查「头尾 BPM 不一致」时用
         beatGrid: function (trackId) {
           var c = S.beatCache || {};
           return { head: c[trackId + "|head"] || null, tail: c[trackId + "|tail"] || null };

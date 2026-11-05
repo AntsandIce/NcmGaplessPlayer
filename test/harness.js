@@ -179,7 +179,17 @@ function createEnv(hooks) {
       meSrcCalls.push(el);
       return { connect() {}, disconnect() {} };
     },
-    createBufferSource() {
+    createBuffer(nch, len, sr) {
+      const chans = [];
+      for (let c = 0; c < nch; c++) chans.push(new Float32Array(len));
+      return {
+        numberOfChannels: nch,
+        length: len,
+        sampleRate: sr,
+        duration: sr > 0 ? len / sr : 0,
+        getChannelData: (c) => chans[c] || chans[0],
+      };
+    },    createBufferSource() {
       const s = {
         buffer: null,
         onended: null,
@@ -3611,7 +3621,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.6\.1/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.7\.0/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -4123,6 +4133,209 @@ async function main() {
       ok(g95.tail && g95.tail.conf <= 0.15, "★★ 并且把尾窗置信压低（这次不硬对齐）｜conf=" + (g95.tail ? g95.tail.conf.toFixed(2) : "?"));
       const m = e.logs().match(/尾 (\d+\.\d) vs 头 (\d+\.\d)/);
       ok(!!m, "★★ 日志里带了两个 BPM（" + (m ? m[0] : "?") + "）");
+    }
+  }
+
+  section("96. ★★★ v1.7.0 C：WSOLA 保音高变速（先测纯函数）");
+  {
+    const api = (e) => e.win.gaplessPlayer;
+
+    // ---- (a) 拉伸长度与比例 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const sr = 8000;
+      const secs = 4;
+      const n = sr * secs;
+      const sine = new Float32Array(n);
+      for (let i = 0; i < n; i++) sine[i] = Math.sin((2 * Math.PI * 220 * i) / sr) * 0.5;
+
+      const r1 = api(e).wsola([sine], 1, { sr });
+      eq(r1.outLen, n, "★★ 比例 1.0 → 输出长度不变");
+      eq(r1.out.length, 1, "★★ 单声道进、单声道出");
+
+      const r102 = api(e).wsola([sine], 1.02, { sr });
+      ok(Math.abs(r102.outLen - Math.round(n / 1.02)) <= 2,
+        "★★ 1.02 倍 → 输出长度 ≈ 输入/1.02（" + r102.outLen + " vs " + Math.round(n / 1.02) + "）");
+
+      const r098 = api(e).wsola([sine], 0.98, { sr });
+      ok(r098.outLen > n, "★★ 0.98 倍（变慢）→ 输出更长（" + r098.outLen + "）");
+
+      // 立体声：两个声道长度一致、且都没跑成 NaN
+      const r2ch = api(e).wsola([sine, sine], 1.02, { sr });
+      eq(r2ch.out.length, 2, "★★ 双声道进、双声道出");
+      eq(r2ch.out[0].length, r2ch.out[1].length, "★★ 两声道输出等长");
+      let nan = 0;
+      for (let i = 0; i < r2ch.outLen; i++) if (!isFinite(r2ch.out[0][i])) nan++;
+      eq(nan, 0, "★★ 没有 NaN/Infinity");
+    }
+
+    // ---- (b) 能量守恒：正弦波拉伸后 RMS 不该明显变小/变大 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const sr = 8000;
+      const n = sr * 3;
+      const sine = new Float32Array(n);
+      for (let i = 0; i < n; i++) sine[i] = Math.sin((2 * Math.PI * 220 * i) / sr) * 0.5;
+      const rms = (a, len) => {
+        let s = 0;
+        for (let i = Math.floor(len * 0.1); i < Math.floor(len * 0.9); i++) s += a[i] * a[i];
+        return Math.sqrt(s / Math.max(1, Math.floor(len * 0.8)));
+      };
+      const inRms = rms(sine, n);
+      const out = api(e).wsola([sine], 1.02, { sr });
+      const outRms = rms(out.out[0], out.outLen);
+      ok(Math.abs(outRms - inRms) / inRms < 0.25,
+        "★★ 拉伸后整体能量基本不变（" + inRms.toFixed(3) + " → " + outRms.toFixed(3) + "）");
+    }
+
+    // ---- (c) 静音进 → 静音出（不能把噪声放大） ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const n = 8000 * 2;
+      const r = api(e).wsola([new Float32Array(n)], 1.05, { sr: 8000 });
+      let maxAbs = 0;
+      for (let i = 0; i < r.outLen; i++) maxAbs = Math.max(maxAbs, Math.abs(r.out[0][i]));
+      eq(maxAbs, 0, "★★ 全静音输入 → 输出仍是全静音");
+    }
+
+    // ---- (d) 节拍位置跟着比例走（脉冲不会被抹平） ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const sr = 8000;
+      const secs = 4;
+      const n = sr * secs;
+      const clicks = new Float32Array(n);
+      const beat = 0.5; // 120 BPM
+      for (let t = 0.1; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.02 && at + i < n; i++) clicks[at + i] = Math.exp(-i / (sr * 0.005)) * 0.9;
+      }
+      const r = api(e).wsola([clicks], 1.1, { sr });
+      // 找输出里的峰个数（应该仍然是 ~secs/beat/1.1 个左右，而不是被抹平）
+      let peaks = 0;
+      for (let i = 1; i < r.outLen - 1; i++) {
+        if (r.out[0][i] > 0.3 && r.out[0][i] >= r.out[0][i - 1] && r.out[0][i] > r.out[0][i + 1]) peaks++;
+      }
+      ok(peaks >= 5, "★★ 拉伸后脉冲还在（检测到 " + peaks + " 个峰）");
+    }
+
+    // ---- (e) stretchPlan：该拉才拉、超范围就拒绝 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const g = (bpm, conf) => ({ bpm, beatSec: 60 / bpm, anchorSec: 0, conf });
+      const p1 = api(e).stretchPlan(g(120, 0.8), g(122, 0.8), 3);
+      eq(p1.ok, true, "★★ 120 vs 122（差 1.7%）→ 值得拉");
+      ok(Math.abs(p1.ratio - 120 / 122) < 1e-6, "★★ 比例 = A.bpm / B.bpm（" + p1.ratio.toFixed(4) + "）");
+      ok(Math.abs(p1.headSrc - 3 * p1.ratio) < 1e-6, "★★ 需要消耗的 B 输入长度 = 交叉 × 比例");
+
+      const p2 = api(e).stretchPlan(g(120, 0.8), g(150, 0.8), 3);
+      eq(p2.ok, false, "★★ 差 20% → 不拉（超出 ±6%）");
+      ok(/超出/.test(p2.reason), "★★ 理由写明超出范围");
+
+      const p3 = api(e).stretchPlan(g(120, 0.8), g(60, 0.8), 3);
+      eq(p3.ok, false, "★★ 120 vs 60 折八度后本来就同步 → 不拉");
+
+      const p4 = api(e).stretchPlan(g(120, 0.1), g(122, 0.8), 3);
+      eq(p4.ok, false, "★★ 置信太低 → 不拉");
+
+      const p5 = api(e).stretchPlan(null, g(122, 0.8), 3);
+      eq(p5.ok, false, "★★ 缺网格 → 不拉");
+
+      const p6 = api(e).stretchPlan(g(120, 0.8), g(122, 0.8), 0);
+      eq(p6.ok, false, "★★ 没有交叉 → 不拉");
+    }
+  }
+
+  section("97. ★★★ v1.7.0 C：把拉伸段排到交叉里，然后再接回原始缓冲");
+  {
+    /**
+     * 一首歌里塞两个 BPM：头窗 120、尾窗 head/tail 指定。
+     * 这样 A 用尾窗、B 用头窗，就能在「只有一份解码缓冲」的前提下造出两个不同 BPM 的网格。
+     */
+    function mkTempo(headBpm, tailBpm, secs) {
+      const sr = 8000;
+      const S = secs || 200;
+      const n = Math.round(S * sr);
+      const data = new Float32Array(n);
+      function click(fromSec, toSec, bpm) {
+        const beat = 60 / bpm;
+        for (let t = fromSec; t < toSec; t += beat) {
+          const at = Math.round(t * sr);
+          for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+            data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+          }
+        }
+      }
+      click(0, 22, headBpm); // 头窗（0~20s）
+      click(S - 22, S, tailBpm); // 尾窗（末尾 20s）
+      return {
+        duration: S,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => data,
+      };
+    }
+
+    // ---- (a) BPM 差 1.25% → 拉，并且排两段：拉伸段 + 原始缓冲接续段 ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkTempo(120, 126.5) } });
+      e.win.__gpXfade = 3;
+      setLeft(e, 3.2);
+      const n0 = e.started.length;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[stretch] ★ 拉 ") >= 1, "★★ 决定了要拉伸（" + (e.logs().match(/\[stretch\] ★ 拉[^\n]*/) || ["?"])[0] + "）");
+      ok(/拉伸 -?\d+\.\d\d%/.test(e.logs()), "★★ [sched] 那行带上了拉伸比例");
+      eq(countLog(e, "交叉预约"), 1, "★★ 仍然是预约（不是退回硬接）");
+
+      const started = e.started.slice(n0);
+      eq(started.length, 2, "★★ 排了两段：拉伸段 + 接续段");
+      const stretched = started[0] || { at: 0, off: 0, dur: 0 };
+      const rest = started[1] || { when: 0, off: 0, dur: 0 };
+      ok(Math.abs(Number(stretched.dur) - 3) < 0.1, "★★ 拉伸段长度 ≈ 交叉时长 3s（" + Number(stretched.dur).toFixed(2) + "）");
+      ok(Number(rest.at) > Number(stretched.at), "★★ 接续段在拉伸段之后开始");
+      ok(Math.abs(Number(rest.at) - (Number(stretched.at) + Number(stretched.dur))) < 0.06,
+        "★★ 接续段正好接在拉伸段结束处（差值 " + (Number(rest.at) - Number(stretched.at) - Number(stretched.dur)).toFixed(3) + "s）");
+      ok(Number(rest.off) > 2.8 && Number(rest.off) < 3.5,
+        "★★ 接续段的起点 = 被拉伸消耗掉的 B 头部（" + Number(rest.off).toFixed(2) + "s ≈ 3s）");
+    }
+
+    // ---- (b) BPM 差 25% → 不拉（先被头尾一致性拦下，再被 ±6% 拦下） ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkTempo(120, 150) } });
+      e.win.__gpXfade = 3;
+      setLeft(e, 3.2);
+      const n0 = e.started.length;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[stretch] ★ 拉 "), 0, "★★ 不做拉伸");
+      eq(e.started.length - n0, 1, "★★ 只排一段（原来的普通交叉）");
+    }
+
+    // ---- (c) 没有交叉（干净风格）→ 不拉 ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkTempo(120, 126.5) } });
+      // 不设 __gpXfade：顺序播放 + 智能默认 = 干净（0s）
+      setLeft(e, 1.0);
+      const n0 = e.started.length;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[stretch] ★ 拉 "), 0, "★★ 没有交叉就不拉伸");
+      eq(e.started.length - n0, 1, "★★ 只排一段");
     }
   }
 
