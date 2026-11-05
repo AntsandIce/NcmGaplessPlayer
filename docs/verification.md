@@ -498,6 +498,10 @@ gaplessPlayer.sqlq("SELECT resourceId, randomOrder FROM current ORDER BY randomO
 - rontendEncrypt 能解开 playingInfo → 同上；
 - 两条都不行 → 随机播放的无缝只能回到「押 + 预开流」，不再继续投入。
 
+**实测（19:35）三条都断了**：currentPlayingList 不在那条连接（rr=1）；
+persistentModel 是页面缓存；rontendEncrypt 的 keys 是网络/Cookie 钩子（不是解密器）；
+playingInfo 488KB 密文无解密入口。→ **C3 结案：随机模式的下一首读不到。**
+
 ---
 
 ## 5. 排查建议

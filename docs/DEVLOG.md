@@ -46,7 +46,26 @@ gaplessPlayer.sqlq("SELECT …")   // 任意只读 SQL
 - **回调只注册一次** + `reqId → 待处理` 映射（原来是每查一次就多挂一个处理器，会积累）；
 - 别人的查询结果会明确记一行 `[sql] 忽略一条不属于我们的结果`，不再静默。
 
-### 下一步（等真机日志）
+### C3 最终判定（1.5.8 第三次探针，真机 19:35）
+
+| 线索 | 实测结果 | 结论 |
+|---|---|---|
+| `currentPlayingList` / `lastPlayingList`（客户端常量里的真名） | `sqlite_master` 无此行，`SELECT` 报 `err=1 no such table` | 播放列表在**另一条 sqlite 连接**，`storage.execsql` 无库名参数 |
+| `persistentModel` 表 | 内容是**页面缓存**（`page:artistDetail` / 330KB 的 artistTracks） | 与播放队列无关 |
+| `window.frontendEncrypt` | keys = `beforeLoadRequest / afterLoadRequest / setOneCookie / getCookie / …` | 那是**网络请求/Cookie 钩子**，不是解密器 |
+| `localStorage.playingInfo` | 488424 字符（806 首的体量），加密 | 没有解密入口就读不了 |
+| `nm.playingList.getPlayingListData` / `nm.play.getNextSong` | 命令确实存在于 tinyapp 桥白名单，但渲染层 `channel.call` 一律回 `undefined` | 桥不通 |
+
+⇒ **结论：随机播放的「下一首是谁」在渲染层拿不到。** 客户端的实现是
+「DB 里 `randomOrder` 列排序」，而那张表在插件够不着的连接/库里。
+
+保留的工具（都是只读、只在点按钮时才跑，零常驻开销）：
+`sqlq()` / `sqlTables()` / `sqlTable()` / `sqlPlaying()` / `sqlPersist()` / `probeNext()`。
+将来客户端换版本时，这套探针还能再问一次 —— 属于「留给未来的钩子」，不是死代码。
+
+**所以随机模式下的无缝只能靠工程手段缓解**（提前预开流、双元素流水线等），
+不再指望「读到随机序列」。C3 到此结案。
+### 下一步（待定）
 
 `persistentModel` 表 + `window.frontendEncrypt`（localStorage 里的 `playingInfo` 是十几 KB 密文，
 很可能就是播放列表快照）。这两条里任意一条通了，随机播放的无缝就有解；都不通就得换思路。
