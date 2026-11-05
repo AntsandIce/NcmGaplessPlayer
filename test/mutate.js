@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.7.2";',
+    find: 'var VERSION = "1.8.0";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -940,7 +940,7 @@ const MUTATIONS = [
   {
     name: "v1.7.0: 不做拉伸（C 等于没做）",
     file: "main.js",
-    find: "        if (sp && sp.ok && fadeSec <= 8) {",
+    find: "        if (sp && sp.ok && fadeSec <= STRETCH_MAX_SEC) {",
     replace: "        if (false) { // 变异：不拉伸",
     expect: "97",
   },
@@ -1013,6 +1013,49 @@ const MUTATIONS = [
     find: "    rawCall(\"audioplayer.pause\", function () {}, [\"\", \"\"]);\n    S.nativeRunning = false;",
     replace: "    rawCall(\"audioplayer.pause\", function () {}, [\"\", \"\"]);",
     expect: "87",
+  },
+
+  {
+    name: "v1.8.0(#10): 头尾不一致还是把置信永久压死",
+    file: "main.js",
+    find: "      tail.conf = Math.max(0.2, Math.min(head.conf * 0.85, 0.7));",
+    replace: "      tail.conf = Math.min(tail.conf, 0.15); // 变异：压死",
+    expect: "95",
+  },
+  {
+    name: "v1.8.0(#12): 拉伸上限退回 8s",
+    file: "main.js",
+    find: "  var STRETCH_MAX_SEC = 12;",
+    replace: "  var STRETCH_MAX_SEC = 8; // 变异：退回 8s",
+    expect: "101",
+  },
+  {
+    name: "v1.8.0(#13): 长交叉也不管置信（越拉越错）",
+    file: "main.js",
+    find: "    if (fadeSec > STRETCH_LONG_SEC && conf < STRETCH_LONG_CONF) {",
+    replace: "    if (false) { // 变异：不拦长交叉",
+    expect: "101",
+  },
+  {
+    name: "v1.8.0(#15): 没空槽就放弃（不抢占过期预开）",
+    file: "main.js",
+    find: "        clearSlotPreopen(i2, \"抢占给新的预热目标\");",
+    replace: "        /* 变异：不抢占 */",
+    expect: "101",
+  },
+  {
+    name: "v1.8.0(#16): 字节缓存关掉就完全不预热",
+    file: "main.js",
+    find: "      // ★ v1.8.0（#16）：只受总开关管 —— 字节缓存关掉时，预热字节会存进内存里的单首槽\n      if (!cacheEnabled()) return;",
+    replace: "      if (!bytesCacheEnabled()) return; // 变异：又受子开关管",
+    expect: "101",
+  },
+  {
+    name: "v1.8.0(#14): 内存读数恒为 0（看不出内存异常）",
+    file: "main.js",
+    find: "    return (total / 1048576).toFixed(0);",
+    replace: "    return \"0\"; // 变异：恒为 0",
+    expect: "101",
   },
   {
     name: "v1.5.5: 不按 reqId 过滤（别人查库的结果会串进我们日志）",

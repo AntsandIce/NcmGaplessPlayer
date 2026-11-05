@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.7.2";
+  var VERSION = "1.8.0";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -1685,6 +1685,12 @@
       // ★ v0.4.1 无缝交接：A 播完 → B 已经在响（start 排在了 A 的结束采样上）→ 0 间隙。
       //   ★ 顺序是命门：`stopSource()` 必须在「提升 B」**之前**（此刻 S.source 仍是 A → 只停 A）。
       //   反过来写（先提升 B 再 stopSource）就会**把正在响的 B 停掉**。
+      // ★ v1.8.0（#17）：流式那首的结束时刻是「duration - currentTime」推出来的；
+      //   媒体时钟与 AudioContext 时钟若真有漂移，这里会量化出来（正常应 ≈0）。
+      var __driftMs = (sc.endCtxTime - S.ctx.currentTime) * 1000;
+      if (Math.abs(__driftMs) > 150) {
+        log("[sched] ★ 结束时刻与预测差 " + __driftMs.toFixed(0) + "ms（媒体时钟/时长估算）→ 已按实际交接");
+      }
       log(
         "[end] ★ 自然播完 → 无缝交接 ｜ A=" + S.curTrackId + " → B=" + sc.trackId +
           " ｜ 来源=" + (S.stream ? "流式" : "缓冲") +
@@ -2035,7 +2041,8 @@
   function maybePrefetchN2() {
     try {
       if (S.preloadNextOff) return;
-      if (!bytesCacheEnabled()) return;
+      // ★ v1.8.0（#16）：只受总开关管 —— 字节缓存关掉时，预热字节会存进内存里的单首槽
+      if (!cacheEnabled()) return;
       if (S.loadedTrackId !== S.curTrackId) return; // 当前还没就绪 → 先顾当前
       var list = S.playlist || [];
       var idx = playlistIndex(S.curTrackId);
@@ -2205,7 +2212,7 @@
       return slot.promise;
     }
     // ★ v1.2.1：字节缓存命中就完全跳过「取址 + 下载」（真机实测同一首会被反复预载）
-    var cachedBytes = cacheGetBytes(trackId);
+    var cachedBytes = cacheGetBytes(trackId) || getWarmBytes(trackId); // ★ v1.8.0（#16）
     if (cachedBytes) log("[preload] ★ 字节缓存命中 → 跳过取址 + 下载 ｜ track=" + trackId);
     slot.promise = (cachedBytes
       ? Promise.resolve(cachedBytes)
@@ -2955,7 +2962,19 @@
         break;
       }
     }
-    if (idx < 0) return false; // 没有空闲槽 → 放弃预热（退化成原来的行为）
+    // ★ v1.8.0（#15）：没有空槽时，**抢占一个过期的预开**（它预开的既不是当前这首、也不是目标）
+    //   —— 之前这种情况直接放弃预热，等于白白退化回「等 canplay」。
+    if (idx < 0) {
+      for (var i2 = 0; i2 < elPool.length; i2++) {
+        if (i2 === elActive) continue;
+        var pt = elPool[i2].preopenTrackId;
+        if (pt === null || pt === S.curTrackId || pt === trackId) continue;
+        clearSlotPreopen(i2, "抢占给新的预热目标");
+        idx = i2;
+        break;
+      }
+    }
+    if (idx < 0) return false; // 实在没有可用槽 → 放弃预热（退化成原来的行为）
     var s = elPool[idx];
     try {
       s.el.preload = "auto";
@@ -3159,7 +3178,7 @@
     try {
       if (fadeSec > 0 && autoMixEnabled()) {
         var sp = stretchPlan(gA2, gB2, fadeSec);
-        if (sp && sp.ok && fadeSec <= 8) {
+        if (sp && sp.ok && fadeSec <= STRETCH_MAX_SEC) {
           stretch = buildStretchedHead(buf, btrim, entry, sp, fadeSec);
           if (stretch) stretchNote = " ｜ 拉伸 " + ((sp.ratio - 1) * 100).toFixed(2) + "%";
         } else if (sp && !sp.ok) {
@@ -3815,7 +3834,7 @@
    *    拿这里的字节会绕过「试听片段」校验，宁可少省一点也不能播半首。
    * ⚠️ `decodeAudioData` 会 **detach** 传进去的 ArrayBuffer → 交出/存下的都得是副本。
    */
-  var BYTES_CACHE_MAX = 3;
+  var BYTES_CACHE_MAX = 2; // ★ v1.8.0（#14）：3 → 2（省 ~8MB；丢掉的命中由 recentBufs 兜）
   var BYTES_CACHE = {}; // trackId -> { buf, seq }
   var bytesSeq = 0;
 
@@ -3851,7 +3870,12 @@
   function cachePutBytes(trackId, buf) {
     if (!buf || trackId === null || trackId === undefined) return;
     if (typeof buf.slice !== "function") return;
-    if (!bytesCacheEnabled()) return;
+    // ★ v1.8.0（#16）：字节缓存**关掉**时，仍然留一份「只在内存里、不落盘、只留最近一首」的
+    //   N+2 预热字节 —— 否则关掉缓存就失去「成为下一首时跳过取址 + 下载」这条捷径。
+    if (!bytesCacheEnabled()) {
+      putWarmBytes(trackId, buf);
+      return;
+    }
     try {
       BYTES_CACHE[trackId] = { buf: buf.slice(0), seq: ++bytesSeq };
     } catch (e) {
@@ -3867,6 +3891,26 @@
     for (var i = 0; i < keys.length - BYTES_CACHE_MAX; i++) delete BYTES_CACHE[keys[i]];
   }
 
+  /* ---- ★ v1.8.0（#16）：字节缓存关闭时的「单首预热字节」（只留最近一首） ---- */
+  function putWarmBytes(trackId, buf) {
+    try {
+      if (!buf || typeof buf.slice !== "function") return;
+      S.warmBytes = { trackId: trackId, buf: buf.slice(0) };
+    } catch (e) {
+      S.warmBytes = null;
+    }
+  }
+
+  function getWarmBytes(trackId) {
+    var w = S.warmBytes;
+    if (!w || w.trackId !== trackId || !w.buf) return null;
+    try {
+      return w.buf.slice(0);
+    } catch (e) {
+      return null;
+    }
+  }
+
   /**
    * 「刚刚播过的那几首」的缓冲（最多 2 首 / 合计 ≤160MB）。
    * 真机证据：切歌像换台（A→B→A→B→C→B）时，同一首会反复下载 + 解码
@@ -3879,6 +3923,26 @@
   var RECENT_MAX = 2;
   var RECENT_BUDGET = 160 * 1024 * 1024; // 两首 4~5 分钟的歌（各约 70MB）刚好放下
 
+  /** ★ v1.8.0（#14）：当前「解码缓冲」占了多少 MB（心跳里显示，方便发现内存异常） */
+  function decodedMemMB() {
+    var total = 0;
+    try {
+      if (S.buffer && S.buffer.length) total += S.buffer.length * (S.buffer.numberOfChannels || 1) * 4;
+      if (S.preload && S.preload.buffer && S.preload.buffer.length) {
+        total += S.preload.buffer.length * (S.preload.buffer.numberOfChannels || 1) * 4;
+      }
+      var list = S.recentBufs || [];
+      for (var i = 0; i < list.length; i++) {
+        var ab = list[i] && list[i].buffer;
+        if (ab && ab.length) total += ab.length * (ab.numberOfChannels || 1) * 4;
+      }
+      var keys = 0;
+      for (var k in BYTES_CACHE) if (Object.prototype.hasOwnProperty.call(BYTES_CACHE, k)) keys++;
+      total += keys * 8 * 1024 * 1024; // 字节缓存按每首约 8MB 估
+      if (S.warmBytes && S.warmBytes.buf) total += S.warmBytes.buf.byteLength || 0;
+    } catch (e) {}
+    return (total / 1048576).toFixed(0);
+  }
   function recentGet(trackId) {
     if (!cacheEnabled()) return null;
     var list = S.recentBufs || [];
@@ -3954,7 +4018,7 @@
   /** 后台把某首下载 + 解码成 AudioBuffer（带试听校验）；**不碰预载槽** */
   function fetchDecoded(trackId) {
     var ginfo = null;
-    var cached = cacheGetBytes(trackId);
+    var cached = cacheGetBytes(trackId) || getWarmBytes(trackId); // ★ v1.8.0（#16）
     var p = cached
       ? Promise.resolve(cached)
       : resolveUrl(trackId)
@@ -4853,8 +4917,7 @@
       onset[f4] = r > 0 ? r : 0;
       onsetSum += onset[f4];
     }
-    var meanOnset = onsetSum / frames;
-    if (!(meanOnset > 0)) return null;
+    var meanOnset = onsetSum / frames;    if (!(meanOnset > 0)) return null;
 
     // ④ 自相关找周期（40~220 BPM）
     var hopSec = hop / srEff;
@@ -4920,7 +4983,6 @@
         bestPhase = ph;
       }
     }
-
     // ⑦ 置信度：拍点均值相对全局均值的对比度
     var conf = (bestPhaseScore - meanOnset) / (bestPhaseScore + meanOnset + 1e-9);
     if (!isFinite(conf) || conf < 0) conf = 0;
@@ -4933,6 +4995,7 @@
       conf: conf,
       frames: frames,
       windowSec: span,
+      dur: dur, // ★ v1.8.0：整首时长（头尾不一致时用它把末拍外推出来）
     };
   }
 
@@ -4950,6 +5013,7 @@
     if (Object.prototype.hasOwnProperty.call(cache, key)) return cache[key];
 
     var from = atEnd ? Math.max(0, dur - BEAT_WIN_SEC - 2) : 0;
+
     var grid = null;
     try {
       grid = analyzeBeats(ab, from, Math.min(BEAT_WIN_SEC, dur - from));
@@ -5008,12 +5072,22 @@
       var dev = Math.abs(tail.bpm - head.bpm) / head.bpm;
       if (dev <= BEAT_BPM_MISMATCH) return;
       var tailBpm = tail.bpm;
+      var tailConf = tail.conf;
       tail.bpm = head.bpm;
       tail.beatSec = 60 / head.bpm;
-      tail.conf = Math.min(tail.conf, 0.15);
+      // ★ v1.8.0（#10）：**不再把置信永久压死**（那样这首歌此后永远不参与对齐/拉伸）。
+      //   正确做法：BPM 用头窗，**末拍位置**也用「头窗的锚点 + 头窗的拍长」重新外推到结尾，
+      //   置信只按头窗打个折 —— 这样它仍然能参与贴拍，只是不如头尾一致的歌那么硬。
+      var dur = Number(tail.dur || head.dur || 0);
+      if (dur > 0) {
+        var tt = Math.max(0, dur - 0.2);
+        tail.endBeatSec = head.anchorSec + Math.round((tt - head.anchorSec) / tail.beatSec) * tail.beatSec;
+      }
+      tail.tempoFromHead = true;
+      tail.conf = Math.max(0.2, Math.min(head.conf * 0.85, 0.7));
       log(
-        "[beat] ★ 头尾 BPM 不一致（尾 " + tailBpm.toFixed(1) + " vs 头 " + head.bpm.toFixed(1) +
-          "，差 " + (dev * 100).toFixed(1) + "%）→ 以头窗为准，且这次不做拍点对齐"
+        "[beat] ★ 头尾 BPM 不一致（尾 " + tailBpm.toFixed(1) + " / 置信 " + tailConf.toFixed(2) +
+          " vs 头 " + head.bpm.toFixed(1) + "）→ BPM 与末拍都按头窗外推，置信折到 " + tail.conf.toFixed(2)
       );
     } catch (e) {}
   }
@@ -5070,6 +5144,8 @@
    */
   var BEAT_PICKUP_MAX = 6; // 最多跳过这么长的前奏
   var BEAT_PICKUP_TOL = 0.06; // 起点已经「贴着拍」的容差
+
+
 
   function pickBEntry(grid, btrim, bdur, ab, opts) {
     var start = (btrim && btrim.start) || 0;
@@ -5264,7 +5340,8 @@
     var sr = Number(buf.sampleRate) || 48000;
     var nch = Math.min(2, Number(buf.numberOfChannels) || 1);
     var startIn = Number(entry && entry.offset) || Number(btrim && btrim.start) || 0;
-    var srcLen = Math.max(1, Math.round(sp.headSrc * sr));
+    // ★ v1.8.0（#9）：多取 0.25s 余量 —— WSOLA 输出长度由比例取整决定，余量让我们能**裁到正好 fadeSec**
+    var srcLen = Math.max(1, Math.round((sp.headSrc + 0.25) * sr));
     if (!(buf.length > startIn + srcLen + sr * 0.05)) return null; // B 太短，不值得拉
     var chs = [];
     for (var c = 0; c < nch; c++) {
@@ -5276,7 +5353,8 @@
     var t0 = performance.now();
     var r = wsolaStretch(chs, sp.ratio, { sr: sr, frameMs: 30, searchMs: 6 });
     if (!r || !r.outLen) return null;
-    var n = Math.min(outLen, r.outLen);
+    if (r.outLen < outLen) return null; // 余量不够（不该发生）→ 退回普通交叉
+    var n = outLen; // ★ v1.8.0（#9）：裁到正好 fadeSec，接续段才会落在 A 结束那一刻
     if (n < sr * 0.1) return null;
     var ab = S.ctx.createBuffer(nch, n, sr);
     for (var c2 = 0; c2 < nch; c2++) {
@@ -5295,6 +5373,11 @@
   var STRETCH_MAX_DEV = 0.06;
   /** ★ v1.7.0：最短小于这个值就不值得拉（听不出来） */
   var STRETCH_MIN_RATIO = 0.002;
+  /** ★ v1.8.0（#12）：最长拉多长的交叉段（48kHz 立体声实测：8s≈91ms、12s≈137ms） */
+  var STRETCH_MAX_SEC = 12;
+  /** ★ v1.8.0（#13）：超过这个时长算「长交叉」——比例误差会被放大，要求更高置信 */
+  var STRETCH_LONG_SEC = 6;
+  var STRETCH_LONG_CONF = 0.45;
 
   /**
    * 决定「要不要为这次交叉做变速」，以及拉多少。
@@ -5324,6 +5407,16 @@
     }
     if (Math.abs(best - 1) < STRETCH_MIN_RATIO) {
       return { ok: false, ratio: best, conf: conf, reason: "本来就同步，不需要拉伸" };
+    }
+    // ★ v1.8.0（#13）：交叉越长，BPM 的那点误差被放大得越多（10 秒里 1% 就是 100ms）
+    //   → 长交叉要求更高置信，否则宁可不对齐。
+    if (fadeSec > STRETCH_LONG_SEC && conf < STRETCH_LONG_CONF) {
+      return {
+        ok: false,
+        ratio: best,
+        conf: conf,
+        reason: "长交叉 " + fadeSec.toFixed(1) + "s 但置信只有 " + conf.toFixed(2) + "，怕越拉越错"
+      };
     }
     return {
       ok: true,
@@ -6216,22 +6309,8 @@
           )
         );
       });
-      var playBtn = el("button", "gp-btn", "查播放列表");
-      playBtn.onclick = function () {
-        probePlayingList();
-        probePersist();
-      };
-      diag.appendChild(rowEl("C3 播放列表", playBtn));
-      var sqlBtn = el("button", "gp-btn", "查 DB 表");
-      sqlBtn.onclick = function () {
-        probeSqlTables();
-      };
-      diag.appendChild(rowEl("C3 SQL（只读）", sqlBtn));
-      var nextBtn = el("button", "gp-btn", "查下一首（侦察）");
-      nextBtn.onclick = function () {
-        probeNext();
-      };
-      diag.appendChild(rowEl("Automix 侦察", nextBtn));
+      // ★ v1.8.0（#18）：C3 侦察按钮已撤（C3 结案，只读探针不再占面板）。
+      //   需要时仍可在控制台调用：gaplessPlayer.probeNext / sqlq / sqlTables / sqlPlaying / sqlPersist
       var logBtn = el("button", "gp-btn", "复制日志路径");
       logBtn.onclick = function () {
         try {
@@ -6391,6 +6470,10 @@
         sqlPlaying: probePlayingList, // ★ v1.5.7：直接看 currentPlayingList（随机顺序就在里面）
         sqlPersist: probePersist, // ★ v1.5.8：看 persistentModel 表 + 试着解开 playingInfo
         snapToBeat: snapToBeat,
+        // ★ v1.8.0（#14）：当前解码内存（MB）
+        mem: function () {
+          return decodedMemMB();
+        },
         preopenSlot: function (id) {
           return findPreopenSlot(id);
         },        // ★ v1.7.1：看当前预约（排查用）
@@ -6449,7 +6532,9 @@
         "[hb] ready=" + S.ready + " ｜ paused=" + S.paused + " ｜ pos=" + position().toFixed(1) + "s / " + S.duration.toFixed(1) + "s ｜ ctx=" + (S.ctx ? S.ctx.state : "无") + " ｜ vol=" + S.volume +
           " ｜ 记忆=" + (S.lastTrack === null ? "无" : S.lastTrack) + " ｜ 预载=" + pl +
           // ★ v0.4.0：把「这一首走的是哪条路径」打出来 —— 排查「切歌怎么还是慢」时一眼就看得出
-          " ｜ 播法=" + (S.stream ? "流式" : "缓冲") + (S.silentSuspect ? "（已判静音）" : "")
+          " ｜ 播法=" + (S.stream ? "流式" : "缓冲") + (S.silentSuspect ? "（已判静音）" : "") +
+          // ★ v1.8.0（#14）：把解码内存打出来（双元素 + 预载 + 最近缓冲 + 字节缓存）
+          " ｜ 内存=" + decodedMemMB() + "MB"
       );
       // ★ v0.2.7：窗口内如果真的一直在播（≥10s），说明用户确实在听这首 → 关窗并记账。
       //   （网易云那串恢复是毫秒级的，能连续播 10 秒只可能是人在听。）
