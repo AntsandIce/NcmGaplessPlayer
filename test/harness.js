@@ -2959,6 +2959,7 @@ async function main() {
       await playTrack(e, 1000);
       e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
       await flush();
+      e.flushTimers();
       e.advance(9000);
       e.tick();
       await flush();
@@ -3621,7 +3622,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.7\.0/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.7\.2/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -3697,6 +3698,7 @@ async function main() {
       await flush();
       e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
       await flush();
+      e.flushTimers();
       e.flushTimers();
       return e;
     }
@@ -4336,6 +4338,221 @@ async function main() {
       e.flushTimers();
       eq(countLog(e, "[stretch] ★ 拉 "), 0, "★★ 没有交叉就不拉伸");
       eq(e.started.length - n0, 1, "★★ 只排一段");
+    }
+  }
+
+  section("98. ★★★ v1.7.1 #3：流式 B 也能交叉（元素交叉）");
+  {
+    /**
+     * A 走缓冲、B 的预载挂住（→ 只能预开流）。
+     * 开关交叉后：应当排「流式交叉」而不是直接放弃。
+     */
+    async function streamBEnv() {
+      const e = createEnv();
+      delete e.win.__gpStream;
+      e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode: "playorder" }));
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      await flush();
+      // ⚠️ A 必须先正常预载就绪（走缓冲），再把取址改成「挂住」→ B 才会 pending
+      e.win.__gpXfade = 3;
+      e.eapi.url = "http://cdn.example/hang/next.flac"; // B 的预载挂住
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-x",
+        { songId: 1000, musicurl: "http://cdn.example/a.flac" },
+      ]);
+      await flush();
+      await flush();
+      await flush();
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush();
+      e.flushTimers();
+      e.flushTimers();
+      return e;
+    }
+    const slotOf = (e, i) => e.audio.instances[i] || { src: "", readyState: 0, duration: 0, paused: true, currentTime: 0 };
+
+    // ---- (a) 没有解码缓冲，但预开着流 → 排「流式交叉」 ----
+    {
+      const e = await streamBEnv();
+      e.win.__gpLogVerbose = true;
+      setLeft(e, 3.2);
+      e.tick(); // 这一拍：建预开槽
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[stream] ★ 提前预开") >= 1, "（前提）B 的流已经预开在空闲槽");
+
+      slotOf(e, 1).readyState = 1; // 有 metadata 了（真机上预开 1s 后就是这样）
+      slotOf(e, 1).duration = 210;
+      e.tick(); // 第二拍：应当排流式交叉
+      await flush();
+      e.flushTimers();
+      e.flushTimers();
+      if (process.env.GP_DBG98) console.log(e.logs().split("\n").filter((l) => /sched|preload|stream|automix/.test(l)).slice(-14).join("\n"));
+      if (process.env.GP_DBG98) console.log(e.logs().split("\n").filter((l) => /\[dbg98\]|sched|preload|stream/.test(l)).slice(-12).join("\n"));
+      ok(countLog(e, "[sched] ★ 流式交叉预约") >= 1, "★★ 排上了流式交叉（B 没缓冲也不放弃）");
+      ok(/交叉=3\.00s/.test(e.logs()), "★★ 交叉时长就是设定的 3s");
+      ok(/槽#1/.test(e.logs()), "★★ 用的是第二个元素槽");
+
+      // B 的元素到点被拉起，且 A 的增益上有淡出曲线
+      e.flushTimers(); // 跑那个「到点 play()」的定时器
+      eq(slotOf(e, 1).paused, false, "★★ 流式 B 已经被拉起（开始出声）");
+      const curves = [];
+      const seen = new Set();
+      const pushParam = (p) => {
+        if (!p || !p.events || seen.has(p)) return;
+        seen.add(p);
+        p.events.forEach((ev) => curves.push(ev));
+      };
+      if (e.ctx.__gains) e.ctx.__gains.forEach((g) => pushParam(g && g.gain));
+      if (e.ctx.__params) e.ctx.__params.forEach(pushParam);
+      if (e.gains) e.gains.forEach((g) => pushParam(g && g.gain));
+      ok(curves.some((ev) => ev.type === "curve"), "★★ 增益曲线上排了淡入/淡出（不是瞬间切换）");
+    }
+
+    // ---- (b) A 播完 → 交接给流式 B；随后 load 到达 → 认领 ----
+    {
+      const e = await streamBEnv();
+      e.win.__gpLogVerbose = true;
+      setLeft(e, 3.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      slotOf(e, 1).readyState = 1;
+      slotOf(e, 1).duration = 210;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "[sched] ★ 流式交叉预约") >= 1, "（前提）已排上");
+
+      // A 播完
+      e.ctx.currentTime = 200.02;
+      enderOf(e.started, 0)();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[end] ★ 自然播完 → 流式交叉交接") >= 1, "★★ 交接给了流式 B（不再是硬接）");
+      ok(e.emitted.some((x) => x.name === "End"), "★★ 也发出了 onEnd（客户端才会推进）");
+
+      // 客户端随后 load 这一首 → 认领
+      e.channel.call("audioplayer.load", null, [
+        idOf(2000) + "-x",
+        { songId: 2000, musicurl: "http://cdn.example/b-token" },
+      ]);
+      await flush();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[sched] 认领（流式 B）") >= 1, "★★ load 到达后是「认领」，不重启");
+      ok(/播法=流式/.test(e.logs()) || countLog(e, "认领（流式 B）") >= 1, "★★ 状态是流式接管");
+    }
+
+    // ---- (c) 关掉交叉 → 不排流式交叉（保持原来的硬接 + 预开流） ----
+    {
+      const e = await streamBEnv();
+      e.win.__gpLogVerbose = true;
+      e.win.__gpXfade = 0;
+      setLeft(e, 1.0);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      slotOf(e, 1).readyState = 1;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[sched] ★ 流式交叉预约"), 0, "★★ 没开交叉就不排流式交叉");
+    }
+  }
+
+  section("99. ★★★ v1.7.2 #2：把原生正在播的这一首接过来（首曲的尾巴归我们）");
+  {
+    /**
+     * AudioContext 起不来 → 首曲由原生播放。这里再让「原生」答出播放位置，
+     * 模拟客户端轮询 getPlayedTime 拿到了 60 秒。
+     */
+    function nativePosAnswer(e, ms) {
+      return function (name, cb, args) {
+        if (name === "audioplayer.getPlayedTime" || name === "audioplayer.getPlaybackInfo") {
+          if (typeof cb === "function") cb({ playedTime: ms, playedAudioTime: ms, result: true, playedPercent: 30 });
+        }
+      };
+    }
+
+    async function nativeEnv(posMs) {
+      const e = createEnv({
+        suspended: true,
+        onNative: (name, cb, args) => nativePosAnswer(e, posMs)(name, cb, args),
+      });
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-x",
+        { songId: 1000, musicurl: "http://cdn.example/native.flac" },
+      ]);
+      await flush();
+      e.flushTimers();
+      return e;
+    }
+
+    // ---- (a) 原生在播 60s；点按后我们把它接过来，并且从 60s 接着放 ----
+    {
+      const e = await nativeEnv(60000);
+      ok(countLog(e, "[autoplay] ★ AudioContext 起不来") >= 1, "（前提）首曲由原生播放");
+      eq(countLog(e, "[cmd] ▶ load"), 0, "（前提）load 被放行给原生");
+
+      // 客户端轮询一次 → 我们顺手记下原生位置（这就是探针）
+      e.channel.call("audioplayer.getPlayedTime", () => {}, [{ playId: idOf(1000) + "_1_x" }]);
+      await flush();
+
+      e.fireGesture(); // 点按 → 交回引擎 → 预载当前曲目 → 就绪后接管
+      await flush();
+      await flush();
+      e.flushTimers();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[takeover] ★ 接管当前这首") >= 1, "★★ 把原生这一首接过来了");
+      const st = e.started[e.started.length - 1];
+      ok(st && Number(st.off) >= 59.9 && Number(st.off) <= 61.0,
+        "★★ 从原生播到的位置接着放（offset=" + (st ? Number(st.off).toFixed(2) : "?") + "s ≈ 60s）");
+      ok(/原生位置≈60\.\d\ds/.test(e.logs()), "★★ 日志里写明接在原生位置");
+    }
+
+    // ---- (b) 客户端从没报过原生位置 → 不接管，继续由原生放（不冒险） ----
+    {
+      const e = await nativeEnv(0);
+      // 把位置清掉（模拟「客户端还没轮询过」）
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      e.fireGesture();
+      await flush();
+      await flush();
+      e.flushTimers();
+      const took = countLog(e, "[takeover] ★ 接管当前这首");
+      ok(took === 0 || /位置不合适/.test(e.logs()), "★★ 位置不可信时不接管（" + took + " 次接管）");
+    }
+
+    // ---- (c) 接管之后再来的 play 命令归我们（不再放给原生） ----
+    {
+      const e = await nativeEnv(60000);
+      e.channel.call("audioplayer.getPlayedTime", () => {}, [{ playId: idOf(1000) + "_1_x" }]);
+      await flush();
+      e.fireGesture();
+      await flush();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[takeover] ★ 接管当前这首") >= 1, "（前提）已接管");
+      const n0 = e.nativeCalls.filter((c) => c.name === "audioplayer.play").length;
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush();
+      e.flushTimers();
+      const n1 = e.nativeCalls.filter((c) => c.name === "audioplayer.play").length;
+      eq(n1, n0, "★★ 接管后 play 不再放给原生");
+      ok(countLog(e, "[cmd] ▶ play") + countLog(e, "已经在播") >= 1, "★★ 而是由我们处理（" + countLog(e, "[cmd] ▶ play") + " 次 cmd/" + countLog(e, "已经在播") + " 次忽略）");
     }
   }
 

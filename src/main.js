@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.7.0";
+  var VERSION = "1.7.2";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -423,6 +423,8 @@
     /* ---- v1.3.3：autoplay 兜底 ---- */
     deferNative: false, // 还没拿到用户手势 → 音频命令整条放行给原生
     nativeRunning: false, // 原生正在响（接管那一首要先把原生按住）
+    nativePosMs: 0, // ★ v1.7.2（#2）：原生报上来的播放位置（毫秒）
+    nativePosAt: 0, // ★ v1.7.2：上面那个位置是什么时候采到的（performance.now）
     gestureSeen: false, // 是否已经拿到过用户手势
     __rawCall: null, // 原始 channel.call（绕开拦截用）
     __armedGesture: false, // 手势监听是否已挂（防止重复挂）
@@ -1655,6 +1657,31 @@
   function onNaturalEnd() {
     var sc = S.sched;
     if (sc && sc.phase === "armed") {
+      // ★ v1.7.1（#3）：流式 B —— 元素已经在响（gain 曲线已经走完），直接把它变成出声槽
+      if (sc.streamSlot !== undefined && sc.streamSlot !== null && sc.streamSlot >= 0) {
+        log(
+          "[end] ★ 自然播完 → 流式交叉交接 ｜ A=" + S.curTrackId + " → B=" + sc.trackId +
+            " ｜ 交叉=" + (sc.xfade || 0).toFixed(2) + "s（B 是流式，靠元素交叉）"
+        );
+        playClockStop();
+        stopSource(); // 此刻 S.source / S.el 还是 A → 只停 A
+        bindActive(sc.streamSlot);
+        S.stream = true;
+        S.buffer = null;
+        S.source = null;
+        S.trim = null;
+        S.srcGain = null;
+        S.srcFilter = null;
+        S.duration = Number(S.el && S.el.duration) || 0;
+        S.startCtxTime = sc.startCtxTime;
+        S.startOffset = 0;
+        S.pausedAt = 0;
+        S.paused = false;
+        sc.phase = "live";
+        emitEnd();
+        playClockStart();
+        return;
+      }
       // ★ v0.4.1 无缝交接：A 播完 → B 已经在响（start 排在了 A 的结束采样上）→ 0 间隙。
       //   ★ 顺序是命门：`stopSource()` 必须在「提升 B」**之前**（此刻 S.source 仍是 A → 只停 A）。
       //   反过来写（先提升 B 再 stopSource）就会**把正在响的 B 停掉**。
@@ -1879,6 +1906,86 @@
     }
   }
 
+  /* ---- ★ v1.7.2（#2）：原生这一首的「接管」 ---- */
+
+  /** 原生此刻大概播到哪（秒）。原生是 1× 播放，所以按「采样时刻 + 经过时间」外推。 */
+  function nativePosEstimate() {
+    try {
+      if (!isFinite(S.nativePosMs) || !S.nativePosAt) return null;
+      var now = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+      var age = (now - S.nativePosAt) / 1000;
+      if (!(age >= 0) || age > 3) return null; // 太久没刷新 → 不可信
+      return S.nativePosMs / 1000 + age;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * ★ v1.7.2（结构性限制 #2）：把**原生正在播的这一首**接过来。
+   *
+   * 为什么要接：首曲由原生播放（autoplay 策略）时，它的尾巴不归我们 ——
+   * 于是「首曲 → 第二首」只能硬切（等客户端 load，真机 80~190ms）。
+   * 一旦我们在点按后把当前这首接管过来，它的尾巴就归我们，第二首就能正常交叉/接拍。
+   *
+   * 安全边界（任何一条不满足就老实留给原生，绝不影响正在播的歌）：
+   *   - 必须已经拿到手势（AudioContext 能跑）；
+   *   - 原生确实在响，而我们自己还没出声；
+   *   - 当前这首**已经解码**（recentGet 命中）；
+   *   - 原生位置可用且不离谱（避开开头 0.5s 和结尾 2s）；
+   *   - 起播比原生早 60ms，然后立刻按住原生 → 同曲同位置短暂重叠，不留空档。
+   */
+  function tryTakeoverCurrent(why) {
+    try {
+      if (S.deferNative) return false; // 还没手势
+      if (!S.nativeRunning) return false; // 原生不在响 / 已经接管过
+      if (!S.ctx || S.ctx.state === "suspended") return false;
+      if (S.source || (S.stream && S.el && !S.el.paused)) return false; // 我们自己已经在出声
+      var cur = S.curTrackId;
+      if (cur === null || cur === undefined) return false;
+      var ab = recentGet(cur) || peekPreloadBuffer(cur); // 预载槽里也可能就是它
+      if (!ab) {
+        logVerbose("[takeover] 当前这首（" + cur + "）还没解码完 → 这一首仍由原生放");
+        return false;
+      }
+      var pos = nativePosEstimate();
+      if (pos === null) {
+        logVerbose("[takeover] 没有可用的原生位置（客户端还没报过）→ 这一首仍由原生放");
+        return false;
+      }
+      var tr = trimOf(cur);
+      var dur = Math.max(0.02, ab.duration - tr.start - tr.end);
+      if (pos < 0.5 || pos > dur - 2) {
+        log("[takeover] 位置不合适（" + pos.toFixed(2) + "s / " + dur.toFixed(2) + "s）→ 这一首仍由原生放");
+        return false;
+      }
+      S.buffer = ab;
+      S.duration = dur;
+      S.trim = tr;
+      S.audioId = [S.audioId[0] || String(cur), S.audioId[1] || ""];
+      S.paused = false;
+      S.pausedAt = 0;
+      S.lastEmitPos = -1;
+      playClockStop();
+      S.playedMs = pos * 1000; // 接上原生已经播过的部分（进度条不跳）
+      var lead = 0.06;
+      var when = S.ctx.currentTime + 0.03;
+      startSource(pos + lead, when);
+      S.loadedTrackId = cur;
+      pauseNative(); // 按住原生（它内部会把 nativeRunning 置 false）
+      playClockStart();
+      emitProgress(true);
+      log(
+        "[takeover] ★ 接管当前这首（" + (why || "?") + "）｜ track=" + cur + " ｜ 原生位置≈" +
+          pos.toFixed(2) + "s ｜ 下一首起就能交叉/接拍了"
+      );
+      return true;
+    } catch (e) {
+      log("[takeover] ★ 接管失败（继续用原生放）｜ " + (e && e.message));
+      return false;
+    }
+  }
+
   /**
    * 该不该预载、预载谁。
    *
@@ -1909,6 +2016,8 @@
     var id = trackIdOf(nt.id);
     if (id === null || id === cur) return;
     if (!hasPreload(id)) startPreload(id, "下一首");
+    // ★ v1.7.2（#2）：当前这首若已经解码、而原生还在响 → 接手它（幂等，不满足条件就什么都不做）
+    tryTakeoverCurrent("预载就绪");
     // ③ ★ v1.6.1（B）：顺手把「下下一首」的**字节**抓下来（不解码，几乎不占内存）
     //    —— 等它真的成为下一首时，startPreload 会命中字节缓存，省掉取址 + 下载那一段。
     maybePrefetchN2();
@@ -2172,6 +2281,8 @@
           "[preload] ★★ 预载就绪（" + (why || "?") + "）｜ track=" + trackId + " ｜ " + ab.duration.toFixed(1) + "s ｜ " +
             mb(ab.length * ab.numberOfChannels * 4) + " MB ｜ 耗时 " + (performance.now() - t0).toFixed(0) + "ms"
         );
+        // ★ v1.7.2（#2）：如果这一首正是原生在播的那首、而且我们已经有原生位置 → 现在就接手
+        if (trackId === S.curTrackId) tryTakeoverCurrent("预载就绪");
         return ab;
       })
       .catch(function (e) {
@@ -2894,8 +3005,11 @@
     // ★ v1.5.3：B 还没就绪就先把它的流预开（真切歌时省掉 canplay 那几百毫秒）
     maybePreopenNext(nid);
 
+    // ★ v1.7.1：B 可能是「已解码的缓冲」，也可能是「在空闲槽里预开着的流」。
+    //   这里只做**最基本的**资格判断，真正的分支在取到 buf 之后。
     var p = S.preload;
-    if (!p || p.trackId !== nid || p.status !== "ready" || p.why !== "下一首") return;
+    var pHasBuf = !!(p && p.trackId === nid && p.status === "ready" && p.why === "下一首");
+    if (!pHasBuf && findPreopenSlot(nid) < 0) return; // 既没缓冲也没预开流 → 没得排
 
     // ③ 置信「顺序播放」：能读到模式就让它权威（⚠️ 单曲循环下 seqStreak 会冻结在高位）
     var mode = readPlayMode();
@@ -2941,7 +3055,12 @@
     }
 
     var buf = peekPreloadBuffer(nid);
-    if (!buf) return;
+    if (!buf) {
+      // ★ v1.7.1（#3）：B 还没有解码缓冲 —— 但如果它已经在**空闲槽**里预开着流，
+      //   就用「元素交叉」：A 淡出 + B 的元素淡入（两个 <audio> 各自出声）。
+      //   ⚠️ 这是结构性限制 #3 的修法：流式 B 拿不到 AudioBuffer，只能靠元素做交叉。
+      return scheduleStreamCrossfade(nid, left, endCtxTime, xf);
+    }
 
     // ★★ v1.2.0：B 自己的首尾裁剪 —— 绝不能套用 A 的（两首的 delay/padding 不一样）。
     //   start(t0, btrim.start, bdur)：从 B 的「可听起点」起，只播「可听长度」，
@@ -3177,9 +3296,144 @@
    * UI 的 `load` 到了，而这一首**已经在响**（我们提前排上的）→ 认领，**不重启**。
    * 真机时序：`load(B)` 在 `[end]` 之后约 +134ms 到达。
    */
+  /**
+   * ★ v1.7.1（结构性限制 #3）：**流式 B 也能交叉**。
+   *
+   * 流式 B 没有 `AudioBuffer`，做不了采样级调度；但它可以挂在一个**空闲的元素槽**上，
+   * 和 A 各出一个声：A 的 gain 从 1 淡到 0、B 槽的 gain 从 0 淡到 1，两者都是
+   * `AudioParam` 曲线 —— 时间精确到音频时钟，不需要「瞬间切换」。
+   *
+   * 细节（都是踩过的地方）：
+   *   - B 槽在 bStart 之前必须**静音**（gain 先置 0），否则它会提前出声；
+   *   - `play()` 不能排到未来，所以用 `setTimeout` 在 bStart 前 20ms 拉起 —— 交叉有几百毫秒到几秒，
+   *     这点定时误差听不出来；
+   *   - B 的 `currentTime` 置 0（从可听头开始），交给 gain 曲线淡入。
+   */
+  function scheduleStreamCrossfade(nid, left, endCtxTime, xf) {
+    try {
+      var slot = findPreopenSlot(nid);
+      if (slot < 0) return;
+      var s = slotAt(slot);
+      if (!s || !s.el) return;
+      if (Number(s.el.readyState) < 1) return; // 连 metadata 都没有 → 不冒险，走原路
+      if (!s.gain || !s.gain.gain) return; // 没有独立增益就没法淡入
+      var fadeSec = Math.min(xf, left - 0.05, 8);
+      if (!(fadeSec >= 0.5)) return;
+      var bStart = endCtxTime - fadeSec;
+      var now = S.ctx.currentTime;
+      if (bStart < now + 0.05) {
+        bStart = now + 0.05;
+        fadeSec = Math.max(0.3, endCtxTime - bStart);
+      }
+
+      // ① B 槽先静音（准备淡入）
+      try {
+        s.gain.gain.cancelScheduledValues(now);
+        s.gain.gain.setValueAtTime(0, now);
+      } catch (e) {}
+      // ② A 淡出
+      var gA = null;
+      var aNode = currentGainNode();
+      if (aNode && aNode.gain) {
+        if (scheduleFade(aNode.gain, bStart, fadeSec, false)) gA = aNode;
+      }
+      // ③ B 淡入
+      if (!scheduleFade(s.gain.gain, bStart, fadeSec, true)) restoreGain(s.gain, 0);
+      // ④ 到点把元素拉起来（提前 20ms，让缓冲数据就位）
+      var delay = Math.max(0, (bStart - now - 0.02) * 1000);
+      var token = S.loadToken;
+      setTimeout(function () {
+        try {
+          if (!S.sched || S.sched.streamSlot !== slot) return; // 已被撤销
+          s.el.currentTime = 0;
+          var pr = s.el.play();
+          if (pr && pr.catch) pr.catch(function () {});
+          log("[sched] ★ 流式 B 起播（槽#" + slot + "）");
+        } catch (e) {
+          log("[sched] ★ 流式 B 起播失败 ｜ " + (e && e.message));
+        }
+      }, delay);
+      try {
+        attachStreamEvents(token, -1);
+      } catch (e) {}
+
+      S.sched = {
+        src: null,
+        streamSlot: slot,
+        trackId: nid,
+        buffer: null,
+        duration: 0, // 等 metadata / 认领时再填
+        startOffset: 0,
+        bufOffset: 0,
+        playDur: 0,
+        trim: null,
+        gain: s.gain,
+        filter: s.filter || null,
+        fadeA: gA,
+        fadeB: s.gain,
+        eqA: null,
+        xfade: fadeSec,
+        startCtxTime: bStart,
+        endCtxTime: endCtxTime,
+        phase: "armed",
+        announced: false,
+      };
+      log(
+        "[sched] ★ 流式交叉预约 ｜ A=" + S.curTrackId + " → B=" + nid + " ｜ at=" + bStart.toFixed(3) +
+          " ｜ 交叉=" + fadeSec.toFixed(2) + "s ｜ 槽#" + slot + "（B 没有解码缓冲，用元素做交叉）"
+      );
+    } catch (e) {
+      log("[sched] ★ 流式交叉失败（退回原路）｜ " + (e && e.message));
+    }
+  }
+
   function claimSeamless(id, payload, trackId) {
     var sc = S.sched;
     var token = ++S.loadToken;
+    // ★ v1.7.1（#3）：流式 B 的认领 —— 那一首已经在**元素槽**里响着了，别去碰 buffer
+    if (sc.streamSlot !== undefined && sc.streamSlot !== null && sc.streamSlot >= 0) {
+      bindActive(sc.streamSlot);
+      S.stream = true;
+      S.buffer = null;
+      S.source = null;
+      S.trim = null;
+      S.srcGain = null;
+      S.srcFilter = null;
+      S.mediaGain = S.el ? (activeSlot() || {}).gain || null : null;
+      S.duration = Number(S.el && S.el.duration) || 0;
+      S.startCtxTime = sc.startCtxTime;
+      S.startOffset = 0;
+      S.elToken = token;
+      S.audioId = [id, id];
+      S.ready = true;
+      S.paused = false;
+      S.pausedAt = 0;
+      S.lastEmitPos = -1;
+      S.pendingSeek = null;
+      if (S.autoPlayTimer) {
+        clearTimeout(S.autoPlayTimer);
+        S.autoPlayTimer = 0;
+      }
+      clearMetaTimer();
+      S.curTrackId = trackId;
+      S.loadedTrackId = trackId;
+      sc.phase = "claimed";
+      try {
+        attachStreamEvents(token, -1);
+      } catch (e) {}
+      log("[sched] 认领（流式 B）｜ track=" + trackId + " ｜ 已在播（不重启）｜ duration=" + S.duration.toFixed(2) + "s");
+      if (S.bootWindow) {
+        log("[mem] 窗口内收到 load（track=" + trackId + "）→ 不写记忆（属于网易云的恢复流程）");
+      } else {
+        saveLastTrack(trackId, "加载");
+        notePlayOrder(trackId);
+      }
+      emitLoad(0, "");
+      emitProgress(true);
+      maybePreload();
+      return;
+    }
+
     S.stream = false;
     S.audioId = [id, id];
     S.ready = true;
@@ -5149,10 +5403,12 @@
       } catch (e) {}
       if (!S.deferNative) return;
       S.deferNative = false;
-      log("[autoplay] ★ 交回 Web Audio 引擎（原生这一首继续放完，下一首起由我们接管）");
-      // 提前把「当前曲目 / 下一首」预下起来，争取接管那一首就能无缝
+      log("[autoplay] ★ 交回 Web Audio 引擎");
+      // ★ v1.7.2（#2）：先把「当前这首」预下起来；解码好了就把它从原生手里接过来，
+      //   这样它的尾巴归我们 → 切到下一首时才有交叉/接拍（否则首曲只能硬切）。
       try {
         maybePreload();
+        tryTakeoverCurrent("拿到手势");
       } catch (e) {}
     }
     for (var i = 0; i < EVENTS.length; i++) {
@@ -5208,7 +5464,24 @@
 
       } catch (e) { log("[guard] 契约重写异常 ｜ " + (e && e.message)); }
     }
-    // ★ v0.4.0：逃生开关 —— `window.__gpNativeAll = true` 时把播放整条交回原生。
+    // ★ v1.7.2（#2）：原生在响时，顺手把**原生报上来的播放位置**记下来（接管当前这首要用）。
+    //   做法：把客户端的回调包一层（S.__cbSwap 会让拦截器把包装后的回调交给原生），
+    //   这样客户端的轮询就顺便成了我们的「原生位置探针」。
+    if ((S.deferNative || S.nativeRunning) && typeof cb === "function" &&
+        (name === "audioplayer.getPlayedTime" || name === "audioplayer.getPlaybackInfo")) {
+      var __posCb = cb;
+      S.__cbSwap = function (res) {
+        try {
+          if (res && isFinite(res.playedTime)) {
+            S.nativePosMs = Number(res.playedTime) || 0;
+            S.nativePosAt = typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+          }
+        } catch (e) {}
+        try {
+          return __posCb.apply(null, arguments);
+        } catch (e) {}
+      };
+    }    // ★ v0.4.0：逃生开关 —— `window.__gpNativeAll = true` 时把播放整条交回原生。
     //   放行 = 返回 false → installInterceptor 里 `below.apply(...)` 交给原生。
     if (AUDIO_CMDS[name] && passAllToNative()) {
       if (name === "audioplayer.load") stopSource();
@@ -6118,7 +6391,21 @@
         sqlPlaying: probePlayingList, // ★ v1.5.7：直接看 currentPlayingList（随机顺序就在里面）
         sqlPersist: probePersist, // ★ v1.5.8：看 persistentModel 表 + 试着解开 playingInfo
         snapToBeat: snapToBeat,
-        lastPlan: function () {
+        preopenSlot: function (id) {
+          return findPreopenSlot(id);
+        },        // ★ v1.7.1：看当前预约（排查用）
+        sched: function () {
+          var sc = S.sched;
+          if (!sc) return null;
+          return {
+            trackId: sc.trackId,
+            phase: sc.phase,
+            streamSlot: sc.streamSlot === undefined ? -1 : sc.streamSlot,
+            xfade: sc.xfade,
+            startCtxTime: sc.startCtxTime,
+            endCtxTime: sc.endCtxTime,
+          };
+        },        lastPlan: function () {
           return S.lastPlan;
         },
         // ★ v1.7.0：C 的纯函数（验证台直接测它们，不进 Worker）
