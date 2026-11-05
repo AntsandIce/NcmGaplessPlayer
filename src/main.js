@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.6.0";
+  var VERSION = "1.6.1";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -1909,6 +1909,76 @@
     var id = trackIdOf(nt.id);
     if (id === null || id === cur) return;
     if (!hasPreload(id)) startPreload(id, "下一首");
+    // ③ ★ v1.6.1（B）：顺手把「下下一首」的**字节**抓下来（不解码，几乎不占内存）
+    //    —— 等它真的成为下一首时，startPreload 会命中字节缓存，省掉取址 + 下载那一段。
+    maybePrefetchN2();
+  }
+
+  /**
+   * ★ v1.6.1（B）：第二预载槽 —— 只抓字节，不解码。
+   *
+   * 为什么只抓字节：解一首要 60~90MB 内存，两首都解会撑爆；而压缩字节只有 7~10MB，
+   * 并且 `startPreload` 本来就有「字节缓存命中 → 跳过取址 + 下载」这条路，
+   * 所以只要提前把字节放进 `BYTES_CACHE`，这条捷径就自然生效了。
+   *
+   * 只在「顺序可预测」时做：随机模式下押下一首都押不中，押下下一首纯属白下。
+   */
+  function maybePrefetchN2() {
+    try {
+      if (S.preloadNextOff) return;
+      if (!bytesCacheEnabled()) return;
+      if (S.loadedTrackId !== S.curTrackId) return; // 当前还没就绪 → 先顾当前
+      var list = S.playlist || [];
+      var idx = playlistIndex(S.curTrackId);
+      if (idx < 0 || idx + 2 >= list.length) return; // 没有「下下一首」
+      var id2 = trackIdOf(list[idx + 2] && list[idx + 2].id);
+      if (id2 === null || id2 === S.curTrackId) return;
+      if (hasPreload(id2)) return; // 已经整首预载了，不用再抓字节
+      if (hasCachedBytes(id2)) return; // 字节已经在手里
+      if (S.prefetch && S.prefetch.trackId === id2 && S.prefetch.status !== "failed") return;
+
+      if (S.prefetch && S.prefetch.abort) {
+        try {
+          S.prefetch.abort.abort(); // 换目标前把上一次在飞的抓取掐断
+        } catch (e) {}
+      }
+      var ac = null;
+      try {
+        if (typeof AbortController === "function") ac = new AbortController();
+      } catch (e) {
+        ac = null;
+      }
+      var slot = { trackId: id2, status: "pending", abort: ac };
+      S.prefetch = slot;
+      var t0 = performance.now();
+      log("[prefetch] 提前抓「下下一首」的字节（不解码）｜ track=" + id2);
+      resolveUrl(id2)
+        .catch(function (e) {
+          if (!isNcm3()) throw e;
+          return resolveUrl320(id2);
+        })
+        .then(function (u) {
+          if (!u) throw new Error("没拿到地址");
+          return fetchBytes(u, ac ? ac.signal : null);
+        })
+        .then(function (buf) {
+          if (!buf) return;
+          cachePutBytes(id2, buf);
+          slot.status = "bytes";
+          log(
+            "[prefetch] ★ 字节已备好（N+2）｜ track=" + id2 + " ｜ " + mb(buf.byteLength) + " MB ｜ " +
+              (performance.now() - t0).toFixed(0) + "ms"
+          );
+        })
+        .catch(function (e) {
+          if (e && e.name === "AbortError") {
+            log("[prefetch] 已掐断（换目标/作废）｜ track=" + id2);
+            return;
+          }
+          slot.status = "failed";
+          log("[prefetch] 放弃（不影响播放）｜ track=" + id2 + " ｜ " + (e && e.message));
+        });
+    } catch (e) {}
   }
 
   /**
@@ -2042,7 +2112,7 @@
             //   2.10.x 保持上游语义（失败直接抛给下游 → 退回流式），不多打请求。
             if (!isNcm3()) throw e;
             if (tk !== S.preloadToken) return null;
-            log("[preload] LibEAPI 不可用（" + (e && e.message) + "）→ 试 320k 免签名接口");
+            logVerbose("[preload] LibEAPI 不可用（" + (e && e.message) + "）→ 试 320k 免签名接口");
             return resolveUrl320(trackId)
               .then(function (url320) {
                 if (tk !== S.preloadToken) return null;
@@ -4567,6 +4637,8 @@
       grid.endBeatSec = grid.anchorSec + Math.round((t - grid.anchorSec) / beat) * beat;
     }
     cache[key] = grid;
+    // ★ v1.6.1：只要头/尾都算过，就顺手收敛一次 BPM（幂等；不递归 —— 它不调 beatGridNear）
+    reconcileTempo(trackId);
     if (grid) {
       log(
         "[beat] track=" + trackId + " ｜ " + (atEnd ? "尾窗" : "头窗") + " ｜ bpm=" + grid.bpm.toFixed(1) +
@@ -4587,6 +4659,36 @@
   /** 尾窗网格（A 的接缝用） */
   function beatTail(trackId, ab) {
     return beatGridNear(trackId, ab, Number(ab && ab.duration) || 0);
+  }
+
+  /** ★ v1.6.1：头窗/尾窗 BPM 允许差多少（超过就以头窗为准，并且这次不硬对齐） */
+  var BEAT_BPM_MISMATCH = 0.08;
+
+  /**
+   * ★ v1.6.1：同一首歌的头窗与尾窗可能测出**两个不同的 BPM**
+   *   （真机例子：头 120.5 置信 0.65 / 尾 157.0 置信 0.33 —— 尾窗那段大概率没有稳定鼓点）。
+   * 这种时候尾窗只能「借」它的相位去定位末拍，**BPM 一律以头窗为准**；
+   * 同时把置信压到很低，让 mixPlan 退回 plain —— 宁可不对齐，也不要照错的 BPM 硬贴。
+   */
+  function reconcileTempo(trackId) {
+    try {
+      var cache = beatCache();
+      var head = cache[trackId + "|head"];
+      var tail = cache[trackId + "|tail"];
+      if (!head || !tail || !(head.bpm > 0) || !(tail.bpm > 0)) return;
+      if (tail.tempoFixed) return;
+      tail.tempoFixed = true;
+      var dev = Math.abs(tail.bpm - head.bpm) / head.bpm;
+      if (dev <= BEAT_BPM_MISMATCH) return;
+      var tailBpm = tail.bpm;
+      tail.bpm = head.bpm;
+      tail.beatSec = 60 / head.bpm;
+      tail.conf = Math.min(tail.conf, 0.15);
+      log(
+        "[beat] ★ 头尾 BPM 不一致（尾 " + tailBpm.toFixed(1) + " vs 头 " + head.bpm.toFixed(1) +
+          "，差 " + (dev * 100).toFixed(1) + "%）→ 以头窗为准，且这次不做拍点对齐"
+      );
+    } catch (e) {}
   }
 
   /**
@@ -4916,6 +5018,17 @@
             var dead = S.preload.trackId;
             dropPreload("不在新歌单"); // ★ v0.2.5：真的 abort 掉在飞的下载，不只是丢结果（预开也一并清掉）
             log("[mem] 预载的 " + dead + " 不在新歌单里 → 作废（已掐断下载）");
+          }
+          // ★ v1.6.1：N+2 的字节抓取同理 —— 那首不在新列表里就掐掉，别白下
+          if (S.prefetch && !playlistHas(S.prefetch.trackId)) {
+            var dead2 = S.prefetch.trackId;
+            if (S.prefetch.abort) {
+              try {
+                S.prefetch.abort.abort();
+              } catch (e) {}
+            }
+            S.prefetch = null;
+            log("[prefetch] N+2 的 " + dead2 + " 不在新歌单里 → 作废（已掐断）");
           }
           maybePreload();
         } else {
@@ -5736,6 +5849,11 @@
         snapToBeat: snapToBeat,
         lastPlan: function () {
           return S.lastPlan;
+        },
+        // ★ v1.6.1：读某首的拍点网格（头/尾各一份），排查「头尾 BPM 不一致」时用
+        beatGrid: function (trackId) {
+          var c = S.beatCache || {};
+          return { head: c[trackId + "|head"] || null, tail: c[trackId + "|tail"] || null };
         },
         setStyle: applyStyle,
         setXfade: saveXfade,

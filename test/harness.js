@@ -3611,7 +3611,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.6\.0/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.6\.1/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -4043,6 +4043,89 @@ async function main() {
       e2.flushTimers();
       ok(/decoded:ABCD/.test(e2.logs()), "★★ 能试出解密结果（" + (e2.logs().match(/\[enc\][^\n]*decode[^\n]*/) || ["?"])[0] + "）");
     }
+  section("95. ★★★ v1.6.1 B：N+2 只抓字节 + 头尾 BPM 不一致的收敛");
+  {
+    /** 头窗 120BPM、尾窗 157BPM 的合成轨（模拟真机「头尾测出两个 BPM」） */
+    function mkTwoTempo(opts) {
+      const o = opts || {};
+      const sr = o.sr || 8000;
+      const secs = o.secs || 180;
+      const n = Math.round(secs * sr);
+      const data = new Float32Array(n);
+      function click(fromSec, toSec, bpm) {
+        const beat = 60 / bpm;
+        for (let t = fromSec; t < toSec; t += beat) {
+          const at = Math.round(t * sr);
+          for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+            data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+          }
+        }
+      }
+      click(0, 20, 120);
+      click(secs - 20, secs, 157);
+      return {
+        duration: secs,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => data,
+      };
+    }
+
+    // ---- (a) N+2 只抓字节 → 等它成为下一首时直接命中字节缓存 ----
+    {
+      const e = createEnv({ decode: () => mkTwoTempo({ secs: 200 }) });
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000); // 第 0 首 → 下一首 2000、下下一首 3000
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "[prefetch] 提前抓") >= 1, "★★ 开始抓 N+2 的字节");
+      ok(countLog(e, "[prefetch] ★ 字节已备好（N+2）") >= 1, "★★ 字节抓好了（不解码）");
+      ok(/track=3000/.test(e.logs()), "★★ 抓的是下下一首（3000）");
+
+      // 播到 2000 之后，3000 变成「下一首」→ 预载它应当命中字节缓存（不再取址 + 下载）
+      await playTrack(e, 2000);
+      await flush();
+      await flush();
+      e.flushTimers();
+      ok(countLog(e, "字节缓存命中") >= 1, "★★ 成为下一首后直接命中字节缓存（不重新下载）");
+    }
+
+    // ---- (b) 列表末端不抓（没有下下一首） ----
+    {
+      const e = createEnv({ decode: () => mkTwoTempo({ secs: 200 }) });
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 5000); // 索引 4 → 下下一首是索引 6（不存在）
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "[prefetch] 提前抓") + countLog(e, "[prefetch] ★ 字节已备好"), 0,
+        "★★ 列表末端不抓下下一首（越界判断）");
+    }
+
+    // ---- (c) 头尾 BPM 不一致 → 以头窗为准，并压低置信（不再硬对齐） ----
+    {
+      const e = createEnv({ decode: () => mkTwoTempo({ secs: 180 }) });
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      e.flushTimers();
+      ok(countLog(e, "★ 头尾 BPM 不一致") >= 1, "★★ 检测到头尾 BPM 不一致");
+      ok(/以头窗为准/.test(e.logs()), "★★ 日志写明「以头窗为准」");
+      const g95 = e.win.gaplessPlayer.beatGrid(1000) || { head: null, tail: null };
+      ok(!!g95.head && !!g95.tail, "（前提）头尾网格都在缓存里");
+      eq(Math.abs((g95.tail ? g95.tail.bpm : -1) - (g95.head ? g95.head.bpm : -2)) < 0.01, true,
+        "★★ 收敛后尾窗 BPM 等于头窗（" + (g95.tail ? g95.tail.bpm.toFixed(1) : "?") + " == " + (g95.head ? g95.head.bpm.toFixed(1) : "?") + "）");
+      ok(g95.tail && g95.tail.conf <= 0.15, "★★ 并且把尾窗置信压低（这次不硬对齐）｜conf=" + (g95.tail ? g95.tail.conf.toFixed(2) : "?"));
+      const m = e.logs().match(/尾 (\d+\.\d) vs 头 (\d+\.\d)/);
+      ok(!!m, "★★ 日志里带了两个 BPM（" + (m ? m[0] : "?") + "）");
+    }
+  }
+
   /* ---------- 汇总 ---------- */
   console.log("\n====================");
   console.log("通过 " + pass + " 项，失败 " + fail + " 项");
