@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.8.2";
+  var VERSION = "1.8.3";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -582,6 +582,13 @@
   function bindActive(i) {
     var s = slotAt(i);
     if (!s) return null;
+    // ★ v1.8.3：**必须**把这一槽的增益/高通复位 ——
+    //   它可能刚在上一轮交叉里被淡到 0（出声音那个槽），如果不复位，
+    //   这一首就会「从头到尾声音极小」。这正是「最后几秒声音被拉得极低」的一种成因。
+    try {
+      restoreGain(s.gain, 1);
+      restoreEq(s.filter);
+    } catch (e) {}
     elActive = i;
     S.el = s.el;
     S.mediaSrc = s.src;
@@ -3118,7 +3125,7 @@
           // 拍点网格跑在「缓冲时间轴」上 → 先把可听位置换算过去（加 trim.start）
           var trA = S.trim || zeroTrim();
           var bufPos = S.duration - fadeSec + trA.start;
-          // ★ v1.8.2：mix-out 候选按「优先级」逐个试，**第一个可行的才算数**：
+          // ⚠️ 注意：交叉时长其实已经被「调度窗口」卡死了 —— 窗口只在 left ≤ xf+0.4 时开，          // ★ v1.8.2：mix-out 候选按「优先级」逐个试，**第一个可行的才算数**：
           //   ① 能量曲线的 outro 掉点（最自然）② 乐句头（4 小节）③ 最近的拍（保底）
           //   ⚠️ 每个候选都要通过「新的交叉时长仍在窗口内」的检查，否则退到下一个 ——
           //   之前写成「优先用乐句头」而没有级联，结果窗口不够时连拍点对齐都丢了。
@@ -3295,6 +3302,9 @@
       var aNode = currentGainNode();
       if (aNode && aNode.gain) {
         if (scheduleFade(aNode.gain, bStart, fadeSec, false)) gA = aNode;
+        else log("[sched] ★ A 的淡出曲线没排上（交叉会变成硬切）");
+      } else {
+        log("[sched] ★ 找不到 A 的增益节点（交叉会变成硬切）");
       }
     }
     // ★ v1.3.2：A 的高通扫频（20Hz→900Hz），把低频让给新歌 —— DJ 过渡的招牌手法
@@ -3338,7 +3348,8 @@
         " ｜ B裁剪=首" + (btrim.start * 1000).toFixed(1) + "ms 尾" + (btrim.end * 1000).toFixed(1) + "ms" +
         stretchNote +
         (fadeSec > 0
-          ? " ｜ 交叉=" + fadeSec.toFixed(2) + "s（曲线=" + xfadeCurveName() + (eqA ? "+扫频" : "") + "）"
+          ? " ｜ 交叉=" + fadeSec.toFixed(2) + "s（曲线=" + xfadeCurveName() + (eqA ? "+扫频" : "") + "）" +
+            " ｜ 淡出 " + bStart.toFixed(2) + "→" + endCtxTime.toFixed(2)
           : " ｜ 交叉=关")
     );
   }
@@ -3368,7 +3379,9 @@
       if (!s || !s.el) return;
       if (Number(s.el.readyState) < 1) return; // 连 metadata 都没有 → 不冒险，走原路
       if (!s.gain || !s.gain.gain) return; // 没有独立增益就没法淡入
-      var fadeSec = Math.min(xf, left - 0.05, 8);
+      // ★ v1.8.3：流式 B 没有解码缓冲 → 入点对不上（只能从 0 开始）。
+      //   所以把交叉压短（≤3s），避免「A 淡完了 B 还在前奏里」听着像掉音量。
+      var fadeSec = Math.min(xf, left - 0.05, 2);
       if (!(fadeSec >= 0.5)) return;
       var bStart = endCtxTime - fadeSec;
       var now = S.ctx.currentTime;
@@ -3429,6 +3442,7 @@
         phase: "armed",
         announced: false,
       };
+      log("[sched] ★ 流式 B 没有解码缓冲 → 入点无法对齐（只能从 0 开始），交叉压到 " + fadeSec.toFixed(2) + "s");
       log(
         "[sched] ★ 流式交叉预约 ｜ A=" + S.curTrackId + " → B=" + nid + " ｜ at=" + bStart.toFixed(3) +
           " ｜ 交叉=" + fadeSec.toFixed(2) + "s ｜ 槽#" + slot + "（B 没有解码缓冲，用元素做交叉）"

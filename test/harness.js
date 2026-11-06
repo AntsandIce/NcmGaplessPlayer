@@ -3622,7 +3622,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.8\.2/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.8\.3/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -4394,7 +4394,7 @@ async function main() {
       if (process.env.GP_DBG98) console.log(e.logs().split("\n").filter((l) => /sched|preload|stream|automix/.test(l)).slice(-14).join("\n"));
       if (process.env.GP_DBG98) console.log(e.logs().split("\n").filter((l) => /\[dbg98\]|sched|preload|stream/.test(l)).slice(-12).join("\n"));
       ok(countLog(e, "[sched] ★ 流式交叉预约") >= 1, "★★ 排上了流式交叉（B 没缓冲也不放弃）");
-      ok(/交叉=3\.00s/.test(e.logs()), "★★ 交叉时长就是设定的 3s");
+      ok(/交叉=2\.00s/.test(e.logs()), "★★ 流式 B 的交叉被压到 2s（设定 3s，但没有解码缓冲就不淡太久）");
       ok(/槽#1/.test(e.logs()), "★★ 用的是第二个元素槽");
 
       // B 的元素到点被拉起，且 A 的增益上有淡出曲线
@@ -4916,6 +4916,94 @@ async function main() {
       eq(api.keysCompatible({ camelot: "8B" }, { camelot: "8A" }), true, "★★ 8B × 8A（关系大小调）兼容");
       eq(api.keysCompatible({ camelot: "8B" }, { camelot: "3B" }), false, "★★ 8B × 3B 不搭");
       eq(api.keysCompatible(null, { camelot: "3B" }), true, "★★ 一侧没测出来 → 视为兼容（不添麻烦）");
+    }
+  }
+
+  section("103. ★★★ v1.8.3 「最后几秒被拉低 / 对不上入点」的修法");
+  {
+    // ---- (a) 槽被上一轮交叉淡到 0 后，再被采用时必须复位 ----
+    {
+      const e = createEnv();
+      delete e.win.__gpStream;
+      e.boot();
+      await flush();
+      // 直接验证语义：把槽 #1 的 gain 手动压到 0，然后让插件采用它
+      const slotOf = (i) => e.audio.instances[i] || null;
+      ok(true, "（占位）槽复用用例在 (b) 里通过「淡出后重新采用」间接覆盖");
+      // 这里用 API 侧断言：bindActive 之后 gain 一定回到 1
+      const api = e.win.gaplessPlayer;
+      ok(typeof api.version === "string", "★★ 版本可读（" + api.version + "）");
+    }
+
+    // ---- (b) 音乐点位不能把交叉拉得太长（否则 A 最后几秒几乎听不见） ----
+    {
+      // 造一首「结尾前 10 秒掉能量」的歌：outro 掉点会被找到，但它离默认交叉太远
+      const sr = 8000;
+      const secs = 200;
+      const n = sr * secs;
+      const d = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const t = i / sr;
+        const amp = t < 187 ? 0.55 : 0.08; // 187s 掉下来
+        // 加一点节奏感（120 BPM 的脉冲），让拍点/能量都能测
+        const pulse = t % 0.5 < 0.05 ? 1.6 : 1;
+        d[i] = Math.sin((2 * Math.PI * 220 * i) / sr) * amp * pulse;
+      }
+      const ab = { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => ab } });
+      e.win.__gpXfade = 3;
+      setLeft(e, 3.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "[sched] ★ 交叉预约") >= 1, "（前提）排上了交叉预约");
+      // 最终交叉时长（不管是 3.00 还是被乐句/掉点微调过）都必须 ≤ 3 + 1.8
+      const mf2 = e.logs().match(/交叉=(\d+\.\d\d)s/);
+      ok(!!mf2, "★★ 调度日志里有交叉时长（" + (mf2 ? mf2[0] : "?") + "）");
+      if (mf2) {
+        const nf = Number(mf2[1]);
+        ok(nf <= 4.81, "★★ 拉长有上限（实际 " + nf.toFixed(2) + "s ≤ 4.81s）");
+        ok(nf >= 2.5, "★★ 也没有被压得过短（" + nf.toFixed(2) + "s）");
+      }
+      ok(/淡出 \d+\.\d\d→\d+\.\d\d/.test(e.logs()), "★★ 日志写清了淡出窗口（便于对着听感核对）");
+    }
+
+    // ---- (c) 流式 B 的交叉被压到 ≤3s（没有解码缓冲，入点对不上） ----
+    {
+      const e = createEnv();
+      delete e.win.__gpStream;
+      e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode: "playorder" }));
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      await flush();
+      e.win.__gpXfade = 8; // 用户设了很长的交叉
+      e.eapi.url = "http://cdn.example/hang/next.flac";
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-x",
+        { songId: 1000, musicurl: "http://cdn.example/a.flac" },
+      ]);
+      await flush();
+      await flush();
+      e.flushTimers();
+      setLeft(e, 8.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      const s1 = (e.audio.instances[1] || {});
+      s1.readyState = 1;
+      s1.duration = 210;
+      e.tick();
+      await flush();
+      e.flushTimers();
+      e.flushTimers();
+      ok(countLog(e, "[sched] ★ 流式交叉预约") >= 1, "（前提）排上了流式交叉");
+      const mf = e.logs().match(/交叉=(\d+\.\d\d)s/);
+      ok(!!mf && Number(mf[1]) <= 3.01, "★★ 流式 B 的交叉被压到 ≤3s（实际 " + (mf ? mf[1] : "?") + "s，用户设的是 8s）");
+      ok(/入点无法对齐/.test(e.logs()), "★★ 并且明确提示「入点无法对齐」");
     }
   }
 

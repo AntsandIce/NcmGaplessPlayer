@@ -159,7 +159,7 @@ const MUTATIONS = [
     name: "版本号与 manifest 不一致（忘 bump / 装错包）",
     file: "main.js",
     // ⚠️ bump 版本号时这里要跟着改（验证台第 27 段就是盯「横幅 == manifest」的）
-    find: 'var VERSION = "1.8.2";',
+    find: 'var VERSION = "1.8.3";',
     replace: 'var VERSION = "0.2.1";',
     expect: "27",
   },
@@ -1113,7 +1113,14 @@ const MUTATIONS = [
     replace: "    if (false) return true; // 变异：不认相邻",
     expect: "102",
   },
+
   {
+    name: "v1.8.3: 流式 B 的交叉又放回 8s（A 淡完 B 还在前奏）",
+    file: "main.js",
+    find: "      var fadeSec = Math.min(xf, left - 0.05, 2);",
+    replace: "      var fadeSec = Math.min(xf, left - 0.05, 8); // 变异：放回 8s",
+    expect: "103",
+  },  {
     name: "v1.5.5: 不按 reqId 过滤（别人查库的结果会串进我们日志）",
     file: "main.js",
     find: "        var cb = sqlPending[key];\n        if (!cb) {",
