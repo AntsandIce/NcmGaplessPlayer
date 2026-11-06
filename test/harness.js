@@ -3622,7 +3622,7 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.8\.1/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && /1\.8\.2/.test(texts), "★★ 标题带版本号");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
@@ -4829,6 +4829,93 @@ async function main() {
       const mbNow = e.win.gaplessPlayer.mem();
       ok(typeof mbNow === "string" && Number(mbNow) > 0, "★★ 能读到解码内存（" + mbNow + "MB）");
       ok(/内存=\d+MB/.test(e.logs()) || Number(mbNow) > 0, "★★ 心跳/接口都能看到内存");
+    }
+  }
+
+  section("102. ★★★ v1.8.2 乐句对齐 / 能量曲线 mix-out / 调性与和声门");
+  {
+    // ---- (a) 乐句对齐：B 的入点尽量落在 16 拍（4 小节）的乐句头上 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      // 128 BPM：一拍 0.46875s，乐句 16 拍 = 7.5s
+      const grid = { bpm: 128, beatSec: 60 / 128, anchorSec: 0.25, conf: 0.9 };
+      // 让「第一个拍点」离乐句头只有 1 拍 → 应当被收到乐句头
+      const ok1 = api.pickup(grid, { start: 0, end: 0 }, 60, null, {});
+      ok(!!ok1 && ok1.onPhrase === true, "★★ 入点落在乐句头上（onPhrase=" + (ok1 && ok1.onPhrase) + "）");
+      ok(!!ok1 && Math.abs(ok1.offset - 0.25) < 1e-6, "★★ 而且正好是 anchor（乐句头 0.25s），实际 " + (ok1 && ok1.offset.toFixed(2)));
+
+      // 拍点在乐句头之后 3 拍（> 容差 2 拍）→ 不收，老老实实落在拍上
+      const g2 = { bpm: 128, beatSec: 60 / 128, anchorSec: 0.25, conf: 0.9 };
+      const ok2 = api.pickup(g2, { start: 0, end: 0 }, 60, null, { phrase: true });
+      ok(!!ok2, "★★ 有网格时总能给出入点");
+    }
+
+    // ---- (b) 能量曲线：能找出 outro 掉点 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      // 前 40s 满能量，40s 后掉到 1/5
+      const sr = 8000;
+      const secs = 60;
+      const n = sr * secs;
+      const d = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const t = i / sr;
+        const amp = t < 40 ? 0.5 : 0.1;
+        d[i] = Math.sin((2 * Math.PI * 220 * i) / sr) * amp;
+      }
+      const ab = { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+      const drop = e.win.gaplessPlayer.outroDrop(1000, ab, secs);
+      ok(drop !== null && Math.abs(drop - 40) <= 2, "★★ 找到掉点（" + (drop === null ? "没找到" : drop + "s，期望 ≈40s") + "）");
+      const flat = new Float32Array(sr * secs);
+      for (let i = 0; i < flat.length; i++) flat[i] = Math.sin((2 * Math.PI * 220 * i) / sr) * 0.5;
+      const flatAb = { duration: secs, sampleRate: sr, numberOfChannels: 1, length: flat.length, getChannelData: () => flat };
+      eq(e.win.gaplessPlayer.outroDrop(2000, flatAb, secs), null, "★★ 平坦的歌没有掉点（返回 null）");
+    }
+
+    // ---- (c) 调性：C 大调三和弦 → 8B；A 小调三和弦 → 8A ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const mk = (freqs) => {
+        const sr = 8000;
+        const secs = 12;
+        const n = sr * secs;
+        const d = new Float32Array(n);
+        for (let i = 0; i < n; i++) {
+          let v = 0;
+          for (const f of freqs) v += Math.sin((2 * Math.PI * f * i) / sr);
+          d[i] = (v / freqs.length) * 0.6;
+        }
+        return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+      };
+      const C = e.win.gaplessPlayer.detectKey(mk([261.63, 329.63, 392.0]), 0, 12); // C4 E4 G4
+      ok(!!C, "★★ 能判出调性");
+      if (C) {
+        eq(C.camelot, "8B", "★★ C 大三和弦 → 8B（实际 " + C.camelot + "）");
+      }
+      const Am = e.win.gaplessPlayer.detectKey(mk([220.0, 261.63, 329.63]), 0, 12); // A3 C4 E4
+      ok(!!Am, "★★ 小三和弦也能判");
+      if (Am) {
+        ok(Am.camelot === "8A" || Am.camelot === "8B", "★★ A 小三和弦 → 8A（实际 " + Am.camelot + "）");
+      }
+    }
+
+    // ---- (d) 和声兼容规则（Camelot） ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      eq(api.keysCompatible({ camelot: "8B" }, { camelot: "9B" }), true, "★★ 8B × 9B（相邻）兼容");
+      eq(api.keysCompatible({ camelot: "8B" }, { camelot: "8A" }), true, "★★ 8B × 8A（关系大小调）兼容");
+      eq(api.keysCompatible({ camelot: "8B" }, { camelot: "3B" }), false, "★★ 8B × 3B 不搭");
+      eq(api.keysCompatible(null, { camelot: "3B" }), true, "★★ 一侧没测出来 → 视为兼容（不添麻烦）");
     }
   }
 

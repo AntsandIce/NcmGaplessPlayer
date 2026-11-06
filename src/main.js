@@ -279,7 +279,7 @@
 (function () {
   "use strict";
 
-  var VERSION = "1.8.1";
+  var VERSION = "1.8.2";
   var LOG = "C:\\betterncm\\gapless-player.log";
   var TICK_MS = 100;
   // ★ v0.2.10：连续几次「预载下一首」押不中就认定「播放顺序 ≠ 列表顺序」
@@ -3118,12 +3118,39 @@
           // 拍点网格跑在「缓冲时间轴」上 → 先把可听位置换算过去（加 trim.start）
           var trA = S.trim || zeroTrim();
           var bufPos = S.duration - fadeSec + trA.start;
-          var sn = snapToBeat(gA2, bufPos);
+          // ★ v1.8.2：mix-out 候选按「优先级」逐个试，**第一个可行的才算数**：
+          //   ① 能量曲线的 outro 掉点（最自然）② 乐句头（4 小节）③ 最近的拍（保底）
+          //   ⚠️ 每个候选都要通过「新的交叉时长仍在窗口内」的检查，否则退到下一个 ——
+          //   之前写成「优先用乐句头」而没有级联，结果窗口不够时连拍点对齐都丢了。
+          var cands = [];
+          var dropSec = outroDropSec(S.curTrackId, S.buffer, S.duration);
+          if (dropSec !== null) {
+            cands.push({ pos: dropSec + trA.start, how: "outro 掉点", pull: OUTRO_PULL_MAX_SEC });
+          }
+          var pb2 = phraseAtOrBefore(gA2, bufPos);
+          cands.push({
+            pos: pb2,
+            how: "乐句头",
+            pull: PHRASE_MIXOUT_MAX_BEATS * gA2.beatSec,
+          });
+          cands.push({ pos: snapToBeat(gA2, bufPos).pos, how: "拍", pull: gA2.beatSec });
+          var sn = { delta: 0 };
+          var how = "拍";
+          for (var ci = 0; ci < cands.length; ci++) {
+            var cd = cands[ci];
+            var dl = cd.pos - bufPos;
+            if (dl > 0.05 || -dl > cd.pull + 1e-6) continue;
+            var nf = fadeSec - dl;
+            if (!(nf >= 0.5) || !(nf <= left - 0.05) || !(nf <= bdur - 0.05)) continue;
+            sn = { delta: dl };
+            how = cd.how;
+            break;
+          }
           if (sn.delta) {
             var newFade = fadeSec - sn.delta;
             if (newFade >= 0.5 && newFade <= left - 0.05 && newFade <= bdur - 0.05) {
               mixNote =
-                " ｜ 拍点对齐 " + (sn.delta * 1000).toFixed(0) + "ms（交叉 " + fadeSec.toFixed(2) +
+                " ｜ 拍点对齐（" + how + "）" + (sn.delta * 1000).toFixed(0) + "ms（交叉 " + fadeSec.toFixed(2) +
                 "→" + newFade.toFixed(2) + "s）";
               fadeSec = newFade;
               bStart = endCtxTime - fadeSec;
@@ -3167,7 +3194,7 @@
     var bPlayDur = Math.max(0.02, bdur - entry.skip);
     if (entry.skip > 0.02) {
       log(
-        "[automix] B 入点 → " + entry.reason + " ｜ 跳过 " + (entry.skip * 1000).toFixed(0) +
+        "[automix] B 入点 → " + entry.reason + (entry.onPhrase ? "（乐句头）" : "") + " ｜ 跳过 " + (entry.skip * 1000).toFixed(0) +
           "ms ｜ 起点=" + entry.offset.toFixed(2) + "s（缓冲）"
       );
     }
@@ -3178,6 +3205,11 @@
     try {
       if (fadeSec > 0 && autoMixEnabled()) {
         var sp = stretchPlan(gA2, gB2, fadeSec);
+        // ★ v1.8.2：和声门 —— 两边调性都可信但不搭（Camelot 规则）→ 这次不做变速贴拍
+        if (sp && sp.ok && !keysCompatible(keyOf(gA2), keyOf(gB2))) {
+          log("[automix] 和声不搭（" + (keyOf(gA2) ? keyOf(gA2).camelot : "?") + " × " + (keyOf(gB2) ? keyOf(gB2).camelot : "?") + "）→ 这次不做变速贴拍");
+          sp = { ok: false, ratio: sp.ratio, reason: "和声不搭" };
+        }
         if (sp && sp.ok && fadeSec <= STRETCH_MAX_SEC) {
           stretch = buildStretchedHead(buf, btrim, entry, sp, fadeSec);
           if (stretch) stretchNote = " ｜ 拉伸 " + ((sp.ratio - 1) * 100).toFixed(2) + "%";
@@ -5082,6 +5114,157 @@
     return best;
   }
 
+  /* ---- ★ v1.8.2：调性检测（Camelot）+ 和声兼容 ----
+   * 方法参考 Convx（GPL-3.0）的 KeyDetector 概念（Krumhansl 调性模板 + Camelot 轮）；
+   * **代码为本项目独立实现**。
+   */
+
+  var KEY_MIN_CONF = 0.45; // 两侧都达到这个置信才参与「和声门」
+  var KEY_WINDOW_SEC = 12; // 用歌曲开头这么长来判断调性
+  var KEY_STRIDE_SEC = 1; // 只取这些片段的样本（省时间）
+
+  // Krumhansl 调性原型（大调 / 小调）
+  var KEY_MAJOR_PROFILE = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+  var KEY_MINOR_PROFILE = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+  // Camelot 轮：按半音（C=0 … B=11）索引
+  var CAMELOT_MAJOR = [8, 3, 10, 5, 12, 7, 2, 9, 4, 11, 6, 1];
+  var CAMELOT_MINOR = [5, 12, 7, 2, 9, 4, 11, 6, 1, 8, 3, 10];
+
+  function camelotOf(pc, minor) {
+    var n = minor ? CAMELOT_MINOR[pc] : CAMELOT_MAJOR[pc];
+    return n + (minor ? "A" : "B");
+  }
+
+  /** 从网格里取调性（没有就 null） */
+  function keyOf(grid) {
+    return grid && grid.key && grid.key.conf >= KEY_MIN_CONF ? grid.key : null;
+  }
+
+  /**
+   * 和声兼容（Camelot 规则）：
+   *   - 同号（A↔A / B↔B）相邻（±1）→ 兼容
+   *   - 同号码、不同字母（关系大小调）→ 兼容
+   * 任一侧没有可信调性 → **视为兼容**（不给用户添麻烦，只是不做额外约束）。
+   */
+  function keysCompatible(ka, kb) {
+    if (!ka || !kb) return true;
+    var na = parseInt(String(ka.camelot), 10);
+    var nb = parseInt(String(kb.camelot), 10);
+    var la = String(ka.camelot).slice(-1);
+    var lb = String(kb.camelot).slice(-1);
+    if (na === nb) return true;
+    if (la === lb && Math.abs(na - nb) === 1) return true;
+    return false;
+  }
+
+  /**
+   * ★ v1.8.2：检测调性 —— 12 个半音的 chroma（Goertzel，3 个八度）→ 与 Krumhansl 原型相关。
+   * @returns {pitchClass, minor, conf, camelot} 或 null
+   */
+  function detectKey(ab, from, len) {
+    try {
+      if (!ab || typeof ab.getChannelData !== "function") return null;
+      var sr = Number(ab.sampleRate) || 44100;
+      var dur = Number(ab.duration) || 0;
+      if (!(dur > 4)) return null;
+      var start = Math.max(0, Math.min(dur - 2, Number(from) || 0));
+      var span = Math.min(Number(len) || KEY_WINDOW_SEC, dur - start);
+      if (!(span >= 4)) return null;
+      var nch = Math.min(2, Number(ab.numberOfChannels) || 1);
+      var stride = Math.max(1, Math.round(KEY_STRIDE_SEC * 0 + 2)); // 每 2 个采样取一个
+      var a0 = Math.floor(start * sr);
+      var a1 = Math.min(ab.length, Math.floor((start + span) * sr));
+      var n = Math.floor((a1 - a0) / stride);
+      if (n < sr * 0.5) return null;
+      var srEff = sr / stride;
+
+      var chans = [];
+      for (var c = 0; c < nch; c++) {
+        var d = ab.getChannelData(c);
+        if (d && d.length) chans.push(d);
+      }
+      if (!chans.length) return null;
+
+      // chroma：三个八度（C3~B5）共 36 个频点
+      var chroma = new Float64Array(12);
+      var noteNames = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+      for (var oct = 0; oct < 3; oct++) {
+        for (var pci = 0; pci < 12; pci++) {
+          var midi = 48 + oct * 12 + pci; // 48 = C3
+          var f = 440 * Math.pow(2, (midi - 69) / 12);
+          if (f > srEff / 2.2) continue; // 超过奈奎斯特就不算
+          var w = (2 * Math.PI * f) / srEff;
+          var coeff = 2 * Math.cos(w);
+          var s1 = 0;
+          var s2 = 0;
+          for (var i = 0; i < n; i++) {
+            var idx = a0 + i * stride;
+            var v = 0;
+            for (var c2 = 0; c2 < chans.length; c2++) v += chans[c2][idx] || 0;
+            v /= chans.length;
+            var s0 = v + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+          }
+          var mag = Math.sqrt(s1 * s1 + s2 * s2 - coeff * s1 * s2);
+          chroma[noteNames[pci]] += mag / Math.sqrt(n);
+        }
+      }
+      var total = 0;
+      for (var q = 0; q < 12; q++) total += chroma[q];
+      if (!(total > 1e-9)) return null;
+      for (var q2 = 0; q2 < 12; q2++) chroma[q2] /= total;
+
+      function corr(profile, root) {
+        var mx = 0;
+        var my = 0;
+        for (var t = 0; t < 12; t++) {
+          mx += chroma[(t + root) % 12];
+          my += profile[t];
+        }
+        mx /= 12;
+        my /= 12;
+        var num = 0;
+        var dx = 0;
+        var dy = 0;
+        for (var t2 = 0; t2 < 12; t2++) {
+          var ax = chroma[(t2 + root) % 12] - mx;
+          var by = profile[t2] - my;
+          num += ax * by;
+          dx += ax * ax;
+          dy += by * by;
+        }
+        if (!(dx > 0) || !(dy > 0)) return 0;
+        return num / Math.sqrt(dx * dy);
+      }
+
+      var best = null;
+      var second = -2;
+      for (var root = 0; root < 12; root++) {
+        var maj = corr(KEY_MAJOR_PROFILE, root);
+        var min = corr(KEY_MINOR_PROFILE, root);
+        var pick = maj >= min ? { root: root, minor: false, r: maj } : { root: root, minor: true, r: min };
+        if (!best || pick.r > best.r) {
+          second = best ? best.r : -2;
+          best = pick;
+        } else if (pick.r > second) {
+          second = pick.r;
+        }
+      }
+      if (!best) return null;
+      var conf = Math.max(0, Math.min(1, (best.r - Math.max(0, second)) / (1 - Math.max(0, second) + 1e-9)));
+      return {
+        pitchClass: best.root,
+        minor: best.minor,
+        conf: conf,
+        r: best.r,
+        camelot: camelotOf(best.root, best.minor),
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
   /**
    * 取某首歌「靠近某个时间点」的拍点网格（带缓存）。
    * 我们只关心两个位置：**开头**（B 的入点）和**结尾**（A 的接缝），所以只算两段 20s 窗口。
@@ -5103,6 +5286,14 @@
     } catch (e) {
       log("[beat] ★ 分析抛错 ｜ track=" + trackId + " ｜ " + (e && e.message));
       grid = null;
+    }
+    // ★ v1.8.2：头窗顺便判一下调性（Camelot），给「和声门」用
+    if (grid && !atEnd) {
+      try {
+        grid.key = detectKey(ab, from, Math.min(KEY_WINDOW_SEC, dur - from));
+      } catch (eK) {
+        grid.key = null;
+      }
     }
     if (grid && atEnd && grid.bpm > 0) {
       // 把锚点折算到「结尾附近最近的一拍」，接缝直接取用
@@ -5212,6 +5403,146 @@
     return { pos: pos + delta, delta: delta };
   }
 
+  /* ==================== v1.8.2：乐句对齐 / 能量曲线 / 调性 ====================
+   * 方法参考 Convx（GPL-3.0）的 BeatGrid.phraseAtOrBeforeMs、EnergyProfile、KeyDetector 概念；
+   * **代码为本项目独立实现**（MIT 项目不吸收 GPL 代码）。
+   */
+
+  /** 乐句长度（拍）。16 拍 = 4 小节 4/4 —— 流行乐最常见的段落单位 */
+  var BEATS_PER_PHRASE = 16;
+  /** B 的入点允许往回贴到乐句头的最多拍数（往回 = 多吃一点前奏，交叉里无害） */
+  var PHRASE_ENTRY_TOL_BEATS = 2;
+  /** A 的 mix-out 允许为对齐乐句头而提前的最多拍数 */
+  var PHRASE_MIXOUT_MAX_BEATS = 8;
+
+  function beatAtOrAfter(grid, pos) {
+    if (!grid || !(grid.bpm > 0)) return pos;
+    var beat = grid.beatSec;
+    return grid.anchorSec + Math.ceil((pos - grid.anchorSec) / beat - 1e-6) * beat;
+  }
+
+  function phraseAtOrBefore(grid, pos) {
+    if (!grid || !(grid.bpm > 0)) return pos;
+    var ph = grid.beatSec * BEATS_PER_PHRASE;
+    return grid.anchorSec + Math.floor((pos - grid.anchorSec) / ph + 1e-6) * ph;
+  }
+
+  function phraseAtOrAfter(grid, pos) {
+    if (!grid || !(grid.bpm > 0)) return pos;
+    var ph = grid.beatSec * BEATS_PER_PHRASE;
+    return grid.anchorSec + Math.ceil((pos - grid.anchorSec) / ph - 1e-6) * ph;
+  }
+  /** ★ v1.8.2：outro 掉点最多允许提前多少秒（再多就不像「自然的收尾」了） */
+  var OUTRO_PULL_MAX_SEC = 25;
+  /** ★ v1.8.2：掉点的最小能量比（前 2s / 后 2s）；低于它就当没有掉点 */
+  var OUTRO_DROP_MIN_RATIO = 1.8;
+  /** ★ v1.8.2：能量曲线的粒度（每秒一个值） */
+  var ENERGY_PROFILE = {}; // trackId -> { buf: Uint8Array, dur, at }
+
+  function cacheEnergy(trackId) {
+    try {
+      if (Object.prototype.hasOwnProperty.call(ENERGY_PROFILE, trackId)) return ENERGY_PROFILE[trackId];
+    } catch (e) {}
+    return null;
+  }
+
+  /**
+   * ★ v1.8.2：每秒一个能量值（0..255）。
+   * 为什么要它：真实曲子的收尾常常是「最后一段副歌 → 掉下来 → 渐弱」，
+   * 在**掉下来的那一下**混出去，听感比「按剩余秒数硬切」自然得多。
+   * 计算很便宜：每隔 ~200 个采样取一个点算 RMS，一首歌几万次乘法。
+   */
+  function buildEnergyProfile(trackId, ab, dur) {
+    if (!ab || !(dur > 4) || trackId === null || trackId === undefined) return null;
+    var hit = cacheEnergy(trackId);
+    if (hit && Math.abs(hit.dur - dur) < 0.5) return hit.buf;
+    var sr = Number(ab.sampleRate) || 48000;
+    var nch = Math.min(2, Number(ab.numberOfChannels) || 1);
+    var seconds = Math.max(1, Math.floor(dur));
+    var stride = Math.max(1, Math.floor(sr * 0.05)); // 50ms 一个采样点
+    var perSec = Math.max(1, Math.round(sr / stride));
+    var prof = new Uint8Array(seconds);
+    var peak = 0;
+    for (var s = 0; s < seconds; s++) {
+      var sum = 0;
+      var cnt = 0;
+      for (var k = 0; k < perSec; k++) {
+        var base = (s * perSec + k) * stride;
+        if (base >= ab.length) break;
+        var win = Math.min(stride, ab.length - base);
+        // ★ v1.8.2：窗内多点取样（每 4 个取一个）—— 只取单点的话，
+        //   一旦信号周期正好是步长的整数倍，就会一直取到同一个相位（全 0），能量被判成 0。
+        var acc = 0;
+        var got = 0;
+        for (var j = 0; j < win; j += 4) {
+          var idx = base + j;
+          var v = 0;
+          for (var c = 0; c < nch; c++) {
+            var d = ab.getChannelData(c);
+            v += d ? d[idx] || 0 : 0;
+          }
+          v /= nch;
+          acc += v * v;
+          got++;
+        }
+        if (!got) continue;
+        sum += acc / got;
+        cnt++;
+      }
+      var rms = cnt ? Math.sqrt(sum / cnt) : 0;
+      var v8 = Math.round(Math.min(1, rms * 4) * 255); // ×4 提一下灵敏度（音乐 RMS 通常 < 0.25）
+      prof[s] = v8;
+      if (v8 > peak) peak = v8;
+    }
+    if (!(peak > 0)) return null;
+    ENERGY_PROFILE[trackId] = { buf: prof, dur: dur, at: Date.now() };
+    // 只留最近 4 首（每秒 1 字节，202s 的歌 = 202 字节，几乎不占内存）
+    var keys = [];
+    for (var kk in ENERGY_PROFILE) if (Object.prototype.hasOwnProperty.call(ENERGY_PROFILE, kk)) keys.push(kk);
+    if (keys.length > 4) {
+      keys.sort(function (a, b) { return (ENERGY_PROFILE[a].at || 0) - (ENERGY_PROFILE[b].at || 0); });
+      for (var d2 = 0; d2 < keys.length - 4; d2++) delete ENERGY_PROFILE[keys[d2]];
+    }
+    return prof;
+  }
+
+  /**
+   * ★ v1.8.2：找「outro 掉点」—— 在最后 OUTRO_PULL_MAX_SEC 秒里，
+   * 找一个「前 2 秒明显比后 2 秒响」的位置（能量比最大者）。
+   * @returns 可听时间轴上的秒数；找不到返回 null
+   */
+  function outroDropSec(trackId, ab, dur) {
+    try {
+      var prof = buildEnergyProfile(trackId, ab, dur);
+      if (!prof) return null;
+      var secs = prof.length;
+      if (secs < 20) return null;
+      var from = Math.max(2, secs - OUTRO_PULL_MAX_SEC);
+      var best = -1;
+      var bestRatio = 0;
+      for (var s = from; s < secs - 3; s++) {
+        var pre = 0;
+        var post = 0;
+        for (var i = 0; i < 2; i++) {
+          pre += prof[s - 1 - i] || 0;
+          post += prof[s + 1 + i] || 0;
+        }
+        if (pre < 12) continue; // 本来就很安静 → 不是「掉下来」
+        var ratio = pre / Math.max(6, post);
+        if (ratio > bestRatio) {
+          bestRatio = ratio;
+          best = s;
+        }
+      }
+      if (best < 0 || bestRatio < OUTRO_DROP_MIN_RATIO) return null;
+      return best;
+    } catch (e) {
+      return null;
+    }
+  }
+
+
+
   /**
    * ★ v1.5.1：给 B 选一个**入点**（都在「缓冲时间轴」上算）。
    *
@@ -5297,17 +5628,30 @@
     }
     if (off < start) off = start;
 
+    // ★ v1.8.2：再从「拍点」往回收一点，尽量落在**乐句头**（16 拍 = 4 小节）。
+    //   对 B 的入点来说，往前收 = 多吃一点前奏，这段在交叉里本来就被淡入盖住，无害；
+    //   反过来（往后贴到下一个乐句头）会白吃 1~16 拍，所以只往前收，且最多 2 拍。
+    var onPhrase = false;
+    if (!silenceOnly && grid && grid.bpm > 0) {
+      var pb = phraseAtOrBefore(grid, off);
+      var back = off - pb;
+      if (back >= 0 && back <= PHRASE_ENTRY_TOL_BEATS * beat && pb >= from - 1e-6) {
+        off = pb;
+        onPhrase = true;
+      }
+    }
+
     // ③ 跳太多就不跳
     var skip = off - start;
     if (!(skip >= 0) || skip > cap + 1e-6) {
       return { offset: start, skip: 0, reason: "跳过 " + skip.toFixed(2) + "s 超出上限" };
     }
     var reason;
-    if (skip < 0.02) reason = onBeat ? "本来就在拍上" : "起点即拍点";
+    if (skip < 0.02) reason = onBeat || onPhrase ? "本来就在拍上" : "起点即拍点";
     else if (gapCapped) reason = "空白比上限还长 → 只跳到第一拍";
     else if (gap >= 0.25) reason = "跳过 " + gap.toFixed(2) + "s 空白，落到第一拍";
     else reason = "对齐到第一拍";
-    return { offset: off, skip: skip, reason: reason };
+    return { offset: off, skip: skip, reason: reason, onPhrase: onPhrase };
   }
 
   /* ==================== v1.7.0 · C：WSOLA 保音高变速（接拍对齐）==================== */
@@ -6586,7 +6930,15 @@
           return S.lastPlan;
         },
         // ★ v1.7.0：C 的纯函数（验证台直接测它们，不进 Worker）
-        wsola: function (chs, speed, opts) {
+        // ★ v1.8.2：乐句/能量/调性
+        phraseAtOrBefore: phraseAtOrBefore,
+        outroDrop: function (trackId, ab, dur) {
+          return outroDropSec(trackId, ab, dur);
+        },
+        detectKey: function (ab, from, len) {
+          return detectKey(ab, from, len);
+        },
+        keysCompatible: keysCompatible,        wsola: function (chs, speed, opts) {
           return wsolaStretch(chs, speed, opts);
         },
         stretchPlan: stretchPlan,        // ★ v1.6.1：读某首的拍点网格（头/尾各一份），排查「头尾 BPM 不一致」时用
