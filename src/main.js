@@ -10180,9 +10180,6 @@
     ".gp-hero-num{font-size:31px;font-weight:700;letter-spacing:-.6px;font-variant-numeric:tabular-nums;color:#fff;line-height:1.15}",
     ".gp-hero-sub{margin-top:4px;color:#a7b0c6;font-size:11px;line-height:1.55}",
     ".gp-status{display:block;color:#7c8498;font-size:10.5px;line-height:1.7;word-break:break-all;margin:0 0 12px}",
-    // ★ v1.20.0：状态信息分列（一项一列，自动换行）
-    ".gp-stat-grid{display:flex;flex-wrap:wrap;gap:2px 14px}",
-    ".gp-stat{white-space:nowrap}",
     ".gp-sec{margin-bottom:13px}",
     ".gp-cap{font-size:9.5px;letter-spacing:1.6px;text-transform:uppercase;color:#7c8498;margin:0 0 6px 2px}",
     ".gp-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 2px}",
@@ -10300,20 +10297,8 @@
   function refreshPanel() {
     if (!panel.box) return;
     try {
-      // ★ v1.20.0：状态信息分列（引擎 / 过渡 / 拍点 / 缓存 / 磁盘 / 预载命中 …）
-      if (panel.statusGrid) {
-        try {
-          while (panel.statusGrid.children && panel.statusGrid.children.length) {
-            panel.statusGrid.removeChild(panel.statusGrid.children[0]);
-          }
-        } catch (eS) {}
-        var stItems = statusItems();
-        for (var si = 0; si < stItems.length; si++) {
-          panel.statusGrid.appendChild(el("span", "gp-stat", stItems[si]));
-        }
-      } else if (panel.status) {
-        panel.status.textContent = statusLine();
-      }
+      // ★ v1.20.0：状态信息回到原来的一行（`｜` 分隔）
+      if (panel.status) panel.status.textContent = statusLine();
       // ★ v1.14.0：顶部大卡 = 上一次真实过渡
       // ★ v1.20.0：一张大卡（本次交叉）+ 横向排列的小项
       var hc = heroCardModel();
@@ -10455,9 +10440,7 @@
       box.appendChild(panel.hero);
 
       /* ---- 状态行（小字，完整信息） ---- */
-      panel.status = el("div", "gp-status");
-      panel.statusGrid = el("div", "gp-stat-grid");
-      panel.status.appendChild(panel.statusGrid);
+      panel.status = el("div", "gp-status", statusLine());
       box.appendChild(panel.status);
 
       /* ---- 子标签页：过渡 / 音色 / 缓存 ---- */

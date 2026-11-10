@@ -3778,11 +3778,10 @@ async function main() {
     const texts = all.map((n) => String(n.textContent || "")).join("|");
     ok(/GaplessPlayer/.test(texts) && texts.indexOf(MF91.version) >= 0, "★★ 标题带版本号（" + MF91.version + "）");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
-    const statCols = all.filter((n) => n.className === "gp-stat");
-    ok(statCols.length >= 4, "★★ 状态信息分列（" + statCols.length + " 项）");
-    ok(!statCols.some((n) => String(n.textContent).indexOf("缓存=") === 0), "★★ 缓存不再占状态行（缓存页里有）");
-    ok(!statCols.some((n) => String(n.textContent).indexOf("磁盘=") === 0), "★★ 磁盘不再占状态行");
-    ok(statCols.some((n) => String(n.textContent).indexOf("引擎=") === 0), "★★ 「引擎=」单独一列");
+    const stNode = all.find((n) => String(n.className).indexOf("gp-status") >= 0) || {};
+    const stText = String(stNode.textContent || "");
+    ok(/引擎=/.test(stText) && /过渡=/.test(stText) && /拍点=/.test(stText), "★★ 状态行是一整行（｜ 分隔）");
+    ok(stText.indexOf("缓存=") < 0 && stText.indexOf("磁盘=") < 0, "★★ 状态行不含缓存/磁盘（缓存页里有）");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/交叉淡入淡出/.test(texts) && /响度平衡/.test(texts) && /缓存/.test(texts), "★★ 只有开关 + 缓存两块（简单易懂）");
     ok(/更多/.test(texts), "★★ 高级开关收在「更多」里（折叠）");
