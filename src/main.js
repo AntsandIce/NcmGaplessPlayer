@@ -10052,19 +10052,10 @@
       }
     }
 
-    // ★ v1.8.4：磁盘缓存也是独立一项（「清掉再看还是慢」要先知道盘上到底有没有东西）
-    var diskText = "关";
-    if (diskEnabled()) {
-      if (!DISK.index) diskLoadIndex(); // 第一次看状态顺手把索引读起来（异步，下一次就准了）
-      diskText = diskCount() + " 首/" + sizeText(diskBytes());
-    }
-
     var items = [
       "引擎=" + eng,
       "过渡=" + trans,
       "拍点=" + beatText,
-      "缓存=" + (S.recentBufs || []).length + " 首/" + sizeText(recentBytes()),
-      "磁盘=" + diskText,
       "预载命中=" + hitText,
     ];
     // ★ v1.13.0：补算进度（有活才显示，闲着不占地方）
@@ -10224,8 +10215,8 @@
     ".gp-hcard-num{font-size:21px;font-weight:700;line-height:1.2;margin:3px 0 5px;white-space:nowrap}",
     ".gp-hcard-items{display:flex;flex-wrap:wrap;gap:4px}",
     ".gp-chip{font-size:10px;color:#9aa3b8;background:rgba(255,255,255,.06);border-radius:6px;padding:1px 6px;white-space:nowrap}",
-    ".gp-hero.gp-anim-a{animation:gp-hero-in 1s ease-out}",
-    ".gp-hero.gp-anim-b{animation:gp-hero-in2 1s ease-out}",
+    ".gp-hero.gp-anim-a{animation:gp-hero-in 2s ease-out}",
+    ".gp-hero.gp-anim-b{animation:gp-hero-in2 2s ease-out}",
     // ★ v1.20.0：本次交叉切换时的 1s 过渡动画
     "@keyframes gp-hero-in{from{opacity:.35;transform:translateY(6px)}to{opacity:1;transform:none}}",
     "@keyframes gp-hero-in2{from{opacity:.35;transform:translateY(6px)}to{opacity:1;transform:none}}",
@@ -10339,7 +10330,7 @@
         panel.__heroTimer = setTimeout(function () {
           if (panel.hero) panel.hero.className = "gp-hero";
           panel.__heroTimer = 0;
-        }, 1050);
+        }, 2050);
       }
       panel.__heroSig = heroSig;
       // ★ v1.15.0：所有开关都从真实状态同步（控制台改过也不会显示错）
@@ -10736,19 +10727,23 @@
       document.body.appendChild(box);
       panel.box = box;
 
-      // ★ v1.16.0：贴在窗口左侧、播放器上方（不再跟着 ♪ 按钮水平居中）
+      // ★ v1.20.0：回到「面板按钮正上方」（水平对齐 ♪ 按钮，太靠边就夹住）
       try {
-        var anchor = findPlayModeButton();
-        var br = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
+        var br = panel.btn && panel.btn.getBoundingClientRect ? panel.btn.getBoundingClientRect() : null;
         if (!br || !(br.width > 0)) {
-          br = panel.btn && panel.btn.getBoundingClientRect ? panel.btn.getBoundingClientRect() : null;
+          var anchor = findPlayModeButton();
+          br = anchor && anchor.getBoundingClientRect ? anchor.getBoundingClientRect() : null;
         }
         if (br && br.width > 0 && typeof window !== "undefined" && window) {
-          var barGap = Math.max(10, (70 - br.height) / 2 + 10);
-          var bottom = (window.innerHeight || 768) - br.top + barGap;
-          box.style.left = "8px";
+          var wBox = 344;
+          var left = br.left + br.width / 2 - wBox / 2;
+          var maxLeft = (window.innerWidth || 1024) - wBox - 8;
+          if (maxLeft < 8) maxLeft = 8;
+          if (left > maxLeft) left = maxLeft;
+          if (left < 8) left = 8;
+          box.style.left = Math.round(left) + "px";
           box.style.right = "auto";
-          box.style.bottom = Math.round(Math.max(8, bottom)) + "px";
+          box.style.bottom = Math.round(Math.max(8, (window.innerHeight || 768) - br.top + 10)) + "px";
         } else {
           box.style.left = "8px";
           box.style.right = "auto";

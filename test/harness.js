@@ -3345,7 +3345,7 @@ async function main() {
       ok(st.indexOf("引擎=") === 0, "★★ 状态行以「引擎=」开头（" + st.slice(0, 40) + "…）");
       ok(st.indexOf("过渡=") > 0, "★★ 有过渡信息");
       ok(/过渡=干净无缝/.test(st), "★★ 默认就写明「干净无缝」");
-      ok(st.indexOf("缓存=") > 0, "★★ 有缓存占用");
+      ok(st.indexOf("预载命中=") > 0, "★★ 有预载命中率（缓存/磁盘已移到缓存页）");
       ok(/预载命中=\d+%/.test(st), "★★ 有预载命中率（" + st.slice(st.indexOf("预载命中")) + "）");
       ok(countLog(e, "[status] ") >= 1, "★★ 启动时也往日志里写一行状态");
     }
@@ -3752,7 +3752,7 @@ async function main() {
     ok(/\.gp-fab\{[^}]*width:42px/.test(css), "★★ 按钮边长 42px（30 + 12）");
     ok(/\.gp-fab\{[^}]*background:none/.test(css), "★★ 没有背景（只要图标）");
     ok(css.indexOf("@keyframes gp-hero-in") >= 0, "★★ 大卡切歌动画的 keyframes 在 CSS 里");
-    ok(/\.gp-hero\.gp-anim-a\{[^}]*animation:gp-hero-in 1s/.test(css), "★★ 动画 1s");
+    ok(/\.gp-hero\.gp-anim-a\{[^}]*animation:gp-hero-in 2s/.test(css), "★★ 动画 2s");
     ok(/\.gp-fab\{[^}]*border:0/.test(css), "★★ 没有边框");
 
     // ---- 点它只开面板：冒泡被拦住（这是「连带触发随机播放」的修法） ----
@@ -3762,10 +3762,10 @@ async function main() {
     eq(doc.body.children.length, 2, "★★ 面板打开了");
     const card = doc.body.children[1] || { children: [], className: "", textContent: "" };
     eq(card.className, "gp-card", "★★ 卡片类是 gp-card");
-    // ★ v1.16.0：贴窗口左侧、播放器上方
-    eq(String(card.style.left), "8px", "★★ 面板贴窗口左侧（left=8px）");
+    // ★ v1.20.0：在面板按钮正上方（贴边时夹到 8px）
+    eq(String(card.style.left), "8px", "★★ 面板对齐按钮（太靠左 → 夹到 8px）");
     eq(String(card.style.right), "auto", "★★ 不再靠右");
-    eq(String(card.style.bottom), "100px", "★★ 底边贴在播放器上方（按钮 top 700 上方约 32px）");
+    eq(String(card.style.bottom), "78px", "★★ 底边在按钮上方 10px（按钮 top 700 → 78px）");
     ok(String(btn.className).indexOf("on") >= 0, "★★ 打开时按钮高亮");
     eq(doc.head.children.length, 1, "★★ 样式不重复注入");
 
@@ -3779,7 +3779,9 @@ async function main() {
     ok(/GaplessPlayer/.test(texts) && texts.indexOf(MF91.version) >= 0, "★★ 标题带版本号（" + MF91.version + "）");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
     const statCols = all.filter((n) => n.className === "gp-stat");
-    ok(statCols.length >= 5, "★★ 状态信息分列（" + statCols.length + " 项）");
+    ok(statCols.length >= 4, "★★ 状态信息分列（" + statCols.length + " 项）");
+    ok(!statCols.some((n) => String(n.textContent).indexOf("缓存=") === 0), "★★ 缓存不再占状态行（缓存页里有）");
+    ok(!statCols.some((n) => String(n.textContent).indexOf("磁盘=") === 0), "★★ 磁盘不再占状态行");
     ok(statCols.some((n) => String(n.textContent).indexOf("引擎=") === 0), "★★ 「引擎=」单独一列");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
     ok(/交叉淡入淡出/.test(texts) && /响度平衡/.test(texts) && /缓存/.test(texts), "★★ 只有开关 + 缓存两块（简单易懂）");
