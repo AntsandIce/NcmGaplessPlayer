@@ -6,6 +6,23 @@
 一个 [BetterNCM](https://github.com/std-microblock/BetterNCM) 插件：把「下一首」提前排到
 「这一首」的最后一个采样上，切歌间隙压到 **0**。
 
+## 🚀 一键安装
+
+1. 下载仓库里的 [`install/`](install/) 目录（或整个仓库）；
+2. 双击 **`install\安装 GaplessPlayer.cmd`**；
+3. UAC 点“是”——脚本会自动：
+   - 找到网易云安装目录；
+   - 没装 BetterNCM 就先装 BetterNCM（从 [std-microblock/chromatic](https://github.com/std-microblock/chromatic) 取对应架构的 DLL）；
+   - 把 `gapless-player-*.plugin` 复制进 BetterNCM 插件目录；
+   - 关闭并重启网易云。
+
+装完在网易云「设置 → BetterNCM」里能看到 **GaplessPlayer** 即成功。
+只想检查不安装：`install.ps1 -DryRun`。3.x 客户端如果没出现插件管理器，
+用 `install.ps1 -UseOfficialInstaller` 让 BetterNCM 官方安装器处理兼容版本。
+
+> 手动安装：把 `dist/gapless-player-x.y.z.plugin` 放进 `C:\betterncm\plugins\`（或你的
+> `BETTERNCM_PROFILE\plugins`），重启网易云即可。
+
 本文件只记**和上游的差别**，以及本分支**新增 / 修复**了什么。
 装法、开关、缓存、响度、排错等使用细节都在 **[docs/GUIDE.md](docs/GUIDE.md)**。
 
