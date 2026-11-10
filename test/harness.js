@@ -199,7 +199,10 @@ function createEnv(hooks) {
           s.__started = { at, off, dur };
           started.push({ at, off, dur, node: s });
         },
-        stop() {
+        stop(when) {
+          // ★ v1.9.2：记下 stop 的时刻（「A 提前收尾」就是靠重复调用 stop(t) 实现的）
+          if (when !== undefined) s.__stopAt = when;
+          else s.__stopAt = -1; // 立刻停
           stopped.push(s);
         },
       };
@@ -369,33 +372,47 @@ function createEnv(hooks) {
 
   /* ---- 假 betterncm ---- */
   const fsFiles = {}; // 假文件系统：路径 -> 文本（记忆文件、日志都写这里）
+  const baseFs = {
+    writeFile(p, blob) {
+      const text = blob && blob.parts ? blob.parts.join("") : "";
+      fsFiles[String(p)] = text;
+    },
+    /** ★ v0.4.0：本地文件走流式时用它换一个可播 URL（LFP 就是这么做的） */
+    mountFile(p) {
+      return Promise.resolve("blob:mock/" + p);
+    },
+    readFile(p) {
+      const key = String(p);
+      if (Object.prototype.hasOwnProperty.call(fsFiles, key)) {
+        const s = fsFiles[key];
+        const buf = new ArrayBuffer(s.length);
+        const view = new Uint8Array(buf);
+        for (let i = 0; i < s.length; i++) view[i] = s.charCodeAt(i) & 0xff;
+        return Promise.resolve(buf);
+      }
+      if (/^missing/.test(key)) return Promise.reject(new Error("no such file"));
+      return Promise.resolve(new ArrayBuffer(2048 * 1024));
+    },
+  };
+
+  /**
+   * ★ v1.8.4：磁盘字节缓存要 `readFileText / writeFileText / readFile / writeFile`。
+   *   默认这套假 fs 没有那几个方法 → 磁盘缓存自动判为「不可用」（其它用例完全不受影响）。
+   *   要测磁盘缓存就 `createEnv({ fs: mkDiskFs() })` 覆盖进来。
+   *
+   * ⚠️ 不管用例怎么换 fs，**日志文件的写入都必须记进 `writes`** —— `logs()` 取的就是
+   *    `writes` 的最后一份快照。把这件事放在这层包起来，用例就不用自己操心。
+   */
+  const fsImpl = Object.assign({}, baseFs, (hooks && hooks.fs) || {});
+  const fsWrite = fsImpl.writeFile;
   const betterncm = {
     isMRBNCM: false,
-    fs: {
+    fs: Object.assign({}, fsImpl, {
       writeFile(p, blob) {
-        const text = blob && blob.parts ? blob.parts.join("") : "";
-        fsFiles[String(p)] = text;
-        // ⚠️ 只有「日志文件」才计入 writes —— logs() 取的是 writes 的最后一份快照，
-        //    要是把记忆文件也塞进来，logs() 就会返回记忆文件的内容（所有断言全乱）。
         if (String(p).indexOf("gapless-player.log") >= 0) writes.push({ path: p, blob });
+        return fsWrite.apply(fsImpl, arguments);
       },
-      /** ★ v0.4.0：本地文件走流式时用它换一个可播 URL（LFP 就是这么做的） */
-      mountFile(p) {
-        return Promise.resolve("blob:mock/" + p);
-      },
-      readFile(p) {
-        const key = String(p);
-        if (Object.prototype.hasOwnProperty.call(fsFiles, key)) {
-          const s = fsFiles[key];
-          const buf = new ArrayBuffer(s.length);
-          const view = new Uint8Array(buf);
-          for (let i = 0; i < s.length; i++) view[i] = s.charCodeAt(i) & 0xff;
-          return Promise.resolve(buf);
-        }
-        if (/^missing/.test(key)) return Promise.reject(new Error("no such file"));
-        return Promise.resolve(new ArrayBuffer(2048 * 1024));
-      },
-    },
+    }),
   };
 
   /* ---- 假 LibEAPIRequest（A1 预载查地址用）---- */
@@ -404,16 +421,24 @@ function createEnv(hooks) {
     available: true, // isRequestAvailable() 的返回值
     mode: "ok", // ok | nourl | fail
     url: "http://cdn.example/next.flac",
+    gain: null, // ★ v1.9.0：player/url 的响度增益（dB）；null = 响应里没有这个字段
+    peak: null, // ★ v1.9.0：线性峰值
+    gainMap: null, // ★ v1.9.3：逐曲指定 { trackId: {gain, peak} }（测「相对参考」用）
     eapiRequest(url, opts) {
       this.log.push({ url, data: opts && opts.data });
       if (this.mode === "fail") {
         if (opts && opts.onerror) opts.onerror(new Error("mock eapi 请求失败"));
         return;
       }
+      const idsStr = String((opts && opts.data && opts.data.ids) || "[]");
+      const id = Number(idsStr.replace(/[^0-9]/g, "")) || 1;
+      const over = (this.gainMap && this.gainMap[id]) || {};
+      const gain = over.gain !== undefined ? over.gain : this.gain;
+      const peak = over.peak !== undefined ? over.peak : this.peak;
       const body =
         this.mode === "nourl"
-          ? { data: [{ id: 1, url: null, br: 999000, size: 0 }] }
-          : { data: [{ id: 1, url: this.url, br: 999000, size: 12345 }] };
+          ? { data: [{ id: id, url: null, br: 999000, size: 0 }] }
+          : { data: [{ id: id, url: this.url, br: 999000, size: 12345, gain: gain, peak: peak }] };
       if (opts && opts.onload) opts.onload(body);
     },
   };
@@ -1530,6 +1555,24 @@ async function main() {
   /** ★ 用计数差，别用 indexOf —— 日志每次 flush 是**整份缓冲区重写**，indexOf 会被前面场景污染 */
   const countLog = (e, s) => e.logs().split(s).length - 1;
 
+  /**
+   * ★ v1.8.7：让「当前这一首」**自然播完**（真机：客户端随后 ~120ms 才发 setCurrentPlay）。
+   *
+   * 为什么用例必须加这一步：`notePrediction` 现在只在「上一首真的播到结尾」时，
+   * 才把一次换歌当成「对播放顺序的检验」。直接在歌中途 setCurrentPlay 换掉 = 用户在跳歌，
+   * 不该算押错。所以凡是模拟「随机播放的客户端自己挑了一首别的」，都得先让 A 播完。
+   */
+  async function playToEnd(e, n) {
+    e.channel.call("audioplayer.play", () => {}, [idOf(n) + "-x", "t|resume|T"]);
+    await flush(2);
+    const st = e.started[e.started.length - 1];
+    if (!st) return;
+    // 把 ctx 时钟推到这一首的结束采样，再触发 onended（就是真机的「自然播完」）
+    e.ctx.currentTime = (Number(st.at) || 0) + (Number(st.dur) || 200);
+    if (st.node && typeof st.node.onended === "function") st.node.onended();
+    await flush(4);
+  }
+
   section("40. ★★ v0.2.10 随机播放：连续 3 次押不中 → 停止「预载下一首」");
   {
     const e40 = createEnv();
@@ -1541,14 +1584,18 @@ async function main() {
     ok(countLog(e40, "开始预载（下一首）｜ track=2000") >= 1, "（前提）预载的确实是列表里的 2000");
 
     // 客户端「随机」挑了 3000（不是列表里的下一首 2000）→ 押不中
+    //   ★ v1.8.7：必须是「A 播完之后客户端自己挑的」，否则那只是用户在歌中途跳歌（不算检验）
+    await playToEnd(e40, 1000);
     await playTrack(e40, 3000);
     ok(countLog(e40, "✗ 预测失败 1/3") >= 1, "★ 第 1 次押不中被记下（预载 2000，实际播 3000）");
     eq(countLog(e40, "开始预载（下一首）"), 2, "★ 还没到阈值 → 仍然预载下一首");
 
+    await playToEnd(e40, 3000);
     await playTrack(e40, 5000);
     ok(countLog(e40, "✗ 预测失败 2/3") >= 1, "★ 第 2 次押不中被记下");
     eq(countLog(e40, "开始预载（下一首）"), 3, "（前提）关闭前一共预载了 3 次「下一首」");
 
+    await playToEnd(e40, 5000);
     await playTrack(e40, 1000); // 第 3 次押不中 → 关
     ok(countLog(e40, "✗ 预测失败 3/3") >= 1, "★★ 第 3 次押不中");
     ok(countLog(e40, "停止预载下一首") >= 1, "★★ 判定「播放顺序 ≠ 列表顺序」（随机播放）→ 停止预载下一首");
@@ -1569,6 +1616,7 @@ async function main() {
     await flush();
     e41.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
     await playTrack(e41, 1000); // 就绪后预载「下一首」= 2000
+    await playToEnd(e41, 1000); // ★ v1.8.7：A 播完 → 客户端随后自己挑（这才算检验）
     e41.channel.call("player.setCurrentPlay", null, [idOf(3000)]); // 押不中 1；槽换成「当前曲目」3000
     await flush();
     e41.flushTimers();
@@ -1591,8 +1639,11 @@ async function main() {
     e42.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
     // 先逼到「关闭」状态（一路随机挑，全押不中）
     await playTrack(e42, 1000); // 预载 2000
+    await playToEnd(e42, 1000); // ★ v1.8.7：先让 A 播完（客户端随后自己挑 3000）
     await playTrack(e42, 3000); // 押不中 1 → 预载 4000
+    await playToEnd(e42, 3000);
     await playTrack(e42, 5000); // 押不中 2 → 预载 6000
+    await playToEnd(e42, 5000);
     await playTrack(e42, 1000); // 押不中 3 → 关闭
     ok(countLog(e42, "停止预载下一首") >= 1, "（前提）已经关掉了");
     eq(countLog(e42, "开始预载（下一首）"), 3, "（前提）关闭前预载了 3 次下一首");
@@ -1839,9 +1890,39 @@ async function main() {
    * 默认 `__gpStream=false`（createEnv 的默认）→ 走缓冲路径，才有 start(when) 可用。
    * @param mode  写进 localStorage 的 `NM_SETTING_PLAYER.mode`（不传就不写 → 走 seqStreak 兜底）
    */
+  /**
+   * 合成节拍轨（v1.17.0）：交叉/拍点用例要「两边都有网格」才不会被「跳过交叉」规则拦下。
+   * 120 BPM、默认 200s，脉冲短促、带一点 90Hz 铺底。
+   */
+  function mkBeatTrack(bpm, secs) {
+    const sr = 8000;
+    const n = Math.round((secs || 200) * sr);
+    const data = new Float32Array(n);
+    const beat = 60 / (bpm || 120);
+    for (let t = 0; t < secs; t += beat) {
+      const at = Math.round(t * sr);
+      for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+        data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+      }
+    }
+    for (let i = 0; i < n; i++) data[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+    return {
+      duration: secs || 200,
+      sampleRate: sr,
+      numberOfChannels: 1,
+      length: n,
+      getChannelData: () => data,
+    };
+  }
+
   async function seamlessEnv(mode, opts) {
     opts = opts || {};
     const e = createEnv(opts.hooks);
+    // ★ v1.19.0：这些用例测的是交叉/拉伸本身，默认关掉「连续母带」检测；
+    //   连续母带的用例自己把它打开。
+    e.win.__gpKeepContinuous = false;
+    // ★ v1.20.0：扫频默认开；这些用例多数不测扫频，显式关掉免得日志/曲线断言被 +扫频 干扰
+    e.win.__gpXfadeEq = false;
     if (mode) e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode }));
     if (opts.eapiUrl) e.eapi.url = opts.eapiUrl;
     e.boot();
@@ -2161,6 +2242,9 @@ async function main() {
   async function streamSeamEnv(mode) {
     const e = createEnv();
     delete e.win.__gpStream; // 出厂默认 → 流式
+    // ★ v1.17.0：这里的 A 没有分析记录（流式）→ 默认会被「跳过交叉」拦下；
+    //   这个 helper 要测的是「流式路径的交叉曲线」，所以显式关掉跳过规则。
+    e.win.__gpSkipBadMix = false;
     if (mode) e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode }));
     e.boot();
     await flush();
@@ -2265,6 +2349,7 @@ async function main() {
     const implied = d0.size && d0.br ? Math.round((d0.size / (d0.br / 8)) * 1000) : 158600;
     const dur = durMs || implied;
     const e = createEnv({
+      fs: opts.fs, // ★ v1.8.5：让 3.x 用例也能挂磁盘缓存
       onNative(name, cb, args) {
         if (name !== "network.fetch" || typeof cb !== "function") return;
         // ⚠️ originalCall 收到的是 channel.call 的完整参数，hooks 拿到的是 slice(2) →
@@ -2272,9 +2357,11 @@ async function main() {
         const a0 = args && args[0];
         const first = Array.isArray(a0) ? (a0[0] || {}) : (a0 || {});
         const u = String(first.url || "");
-        const body = u.indexOf("/api/song/detail") >= 0
-          ? { blob: JSON.stringify({ songs: [{ id: 0, duration: dur }] }) }
-          : { blob: JSON.stringify(jsonBody) };
+        const body =
+          u.indexOf("/api/song/detail") >= 0
+            ? // ★ v1.8.5：opts.noDetail = 让权威时长接口「拿不到」（验不依赖它的那条路）
+              { blob: JSON.stringify(opts.noDetail ? { songs: [] } : { songs: [{ id: 0, duration: dur }] }) }
+            : { blob: JSON.stringify(jsonBody) };
         // ★ opts.defer：把回包推迟一个微任务 —— 用来制造「真并发」，
         //   验证 `once()` 确实把同一个 id 的两次请求合并了（同步回答的话它们根本不会重叠）。
         if (opts.defer) Promise.resolve().then(() => cb(body));
@@ -2713,7 +2800,7 @@ async function main() {
 
     // ---- (a) 默认 0s：绝对不能自己冒出交叉（Spotify 出厂也是关的） ----
     {
-      const e = await seamlessEnv("playorder");
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       eq(e.win.__gpXfade, undefined, "（前提）没有设 __gpXfade");
       setLeft(e, 1.0);
       e.tick();
@@ -2727,7 +2814,7 @@ async function main() {
 
     // ---- (b) __gpXfade=3：窗口变宽 + B 提前 3s + 两条等功率曲线 ----
     {
-      const e = await seamlessEnv("playorder");
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e.win.__gpXfade = 3;
       setLeft(e, 3.2); // ★ 3.2s：旧版本（窗口只有 1.5s）根本进不来
       e.tick();
@@ -2750,8 +2837,8 @@ async function main() {
           Math.abs((iEv.t === undefined ? -999 : iEv.t) - t0) < 0.02,
         "★★ 两条曲线同一时刻开始"
       );
-      eq(oEv.dur, 3, "★★ 淡出曲线时长 = 交叉时长");
-      eq(iEv.dur, 3, "★★ 淡入曲线时长 = 交叉时长");
+      ok(Math.abs(oEv.dur - 3) < 0.02, "★★ 淡出曲线时长 = 交叉时长（" + Number(oEv.dur).toFixed(3) + "s）");
+      ok(Math.abs(iEv.dur - 3) < 0.02, "★★ 淡入曲线时长 = 交叉时长（" + Number(iEv.dur).toFixed(3) + "s）");
       const oCurve = curveOf(out);
       const iCurve = curveOf(inn);
       const mid = Math.max(0, Math.floor(oCurve.length / 2) - 1);
@@ -2794,7 +2881,7 @@ async function main() {
 
     // ---- (c) 只剩 1s 时设 12s → 自动缩短成「剩多少用多少」 ----
     {
-      const e = await seamlessEnv("playorder");
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e.win.__gpXfade = 12;
       setLeft(e, 1.0);
       e.tick();
@@ -2807,7 +2894,7 @@ async function main() {
 
     // ---- (d) 上限 12s + 暂停时把增益复位（A 不能永远留在小声） ----
     {
-      const e = await seamlessEnv("playorder");
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e.win.__gpXfade = 99; // 超上限
       setLeft(e, 12.2);
       e.tick();
@@ -2829,7 +2916,7 @@ async function main() {
 
     // ---- (f) 太短的值直接当关（0.3s 没有意义） ----
     {
-      const e = await seamlessEnv("playorder");
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e.win.__gpXfade = 0.3;
       setLeft(e, 1.0);
       e.tick();
@@ -2856,11 +2943,12 @@ async function main() {
       const out = nodes.find((x) => isFalling(x.ev[0]));
       const inn = nodes.find((x) => isRising(x.ev[0]));
       ok(!!out && !!inn, "★★ 一条淡出一条淡入");
-      // 排除法：增益节点只可能有三个 —— 总线、元素那一路、B 那一路。
-      // 淡出既然不是总线也不是 B，那就只能是元素那一路（= 流式的 gain）。
+      // 排除法：淡出既然不是总线、也不是 B，那就只能是流式元素那一路。
+      // ★ v1.9.0：链路里多了「响度归一化」节点（每路一份），所以「还有几个 gain」不再固定为 1；
+      //   这里改成只断言「淡出那个节点不是总线、也不是 B」——要验的东西没变。
       const others = (e.ctx.__gains || []).filter((g) => g !== e.ctx.__gain && g !== nodeOfX(inn));
-      eq(others.length, 1, "（前提）除总线与 B 之外只剩一个 gain（元素那一路）");
-      ok(nodeOfX(out) === others[0], "★★ 淡出打在了流式元素自己的 gain 上");
+      ok(others.length >= 1, "（前提）除总线与 B 之外还有别的 gain（元素那一路 + 响度归一化）");
+      ok(others.indexOf(nodeOfX(out)) >= 0, "★★ 淡出打在了「不是总线、也不是 B」的那一路上（= 流式元素）");
       ok(Math.abs(evOf(inn).t - (now + 0.05)) < 0.06, "★★ B 提前约 3s 起播（曲线从 " + Number(evOf(inn).t).toFixed(3) + " 开始）");
       ok(Math.abs(evOf(inn).dur - 2.95) < 0.06, "★★ 交叉时长被压到 2.95s（剩 3.0s，留 0.05 余量）");
     }
@@ -2885,7 +2973,7 @@ async function main() {
     {
       const e = streamEnv();
       await streamPlay(e, idOf(1000), "http://cdn.example/s1.flac");
-      eq(countLog(e, "[promote]"), 0, "（前提）刚起播不补");
+      eq(countLog(e, "[promote] 流式那首已听"), 0, "（前提）刚起播不补");
 
       e.advance(9000); // 真听了 9 秒
       const f0 = e.fetchLog.length;
@@ -2934,7 +3022,7 @@ async function main() {
       e.tick();
       await flush();
       e.flushTimers();
-      eq(countLog(e, "[promote]"), 0, "★★ 不到 8s → 完全不补");
+      eq(countLog(e, "[promote] 流式那首已听"), 0, "★★ 不到 8s → 完全不补");
       eq(e.fetchLog.length, f0, "★★ 一个字节都没多下");
     }
 
@@ -2947,7 +3035,7 @@ async function main() {
       e.tick();
       await flush();
       e.flushTimers();
-      eq(countLog(e, "[promote]"), 0, "★★ __gpPromote=false → 不补");
+      eq(countLog(e, "[promote] 流式那首已听"), 0, "★★ __gpPromote=false → 不补");
     }
 
     // ---- (d) 缓冲路径不参与（它本来就有 AudioBuffer） ----
@@ -2964,7 +3052,7 @@ async function main() {
       e.tick();
       await flush();
       e.flushTimers();
-      eq(countLog(e, "[promote]"), 0, "★★ 缓冲路径已经在 recentBufs 里了，不用补");
+      eq(countLog(e, "[promote] 流式那首已听"), 0, "★★ 缓冲路径已经在 recentBufs 里了，不用补");
     }
 
     // ---- (e) 3.x 试听片段 → 绝不把「半首」塞进缓存 ----
@@ -3000,7 +3088,7 @@ async function main() {
     // ---- (a) 曲线预设 ----
     {
       // 默认：等功率（中点 ≈ 0.707）
-      const e0 = await seamlessEnv("playorder");
+      const e0 = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e0.win.__gpXfade = 3;
       setLeft(e0, 3.2);
       e0.tick();
@@ -3011,7 +3099,7 @@ async function main() {
       ok(countLog(e0, "曲线=equal") >= 1, "★★ 日志写出曲线名");
 
       // linear：中点 ≈ 0.5
-      const e1 = await seamlessEnv("playorder");
+      const e1 = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e1.win.__gpXfade = 3;
       e1.win.__gpXfadeCurve = "linear";
       setLeft(e1, 3.2);
@@ -3023,7 +3111,7 @@ async function main() {
       ok(countLog(e1, "曲线=linear") >= 1, "★★ 日志写明曲线=linear");
 
       // s-line（smoothstep）：x≈0.25 处应当明显低于等功率的 0.38
-      const e2 = await seamlessEnv("playorder");
+      const e2 = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e2.win.__gpXfade = 3;
       e2.win.__gpXfadeCurve = "s-line";
       setLeft(e2, 3.2);
@@ -3033,7 +3121,7 @@ async function main() {
       ok(!!cS && cS[16] < 0.25, "★★ s-line：前段压得比等功率低（x≈0.25 时 " + (cS ? cS[16].toFixed(3) : "?") + "）");
 
       // step：中点前是 0、之后是 1
-      const e3 = await seamlessEnv("playorder");
+      const e3 = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e3.win.__gpXfade = 3;
       e3.win.__gpXfadeCurve = "step";
       setLeft(e3, 3.2);
@@ -3045,7 +3133,7 @@ async function main() {
 
     // ---- (b) 高通扫频（DJ 过渡的招牌手法） ----
     {
-      const e = await seamlessEnv("playorder");
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e.win.__gpXfade = 3;
       e.win.__gpXfadeEq = true;
       setLeft(e, 3.2);
@@ -3070,7 +3158,7 @@ async function main() {
 
     // ---- (c) 默认不扫频（会改音色，得用户自己开） ----
     {
-      const e = await seamlessEnv("playorder");
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkBeatTrack(120, 200) } });
       e.win.__gpXfade = 3;
       setLeft(e, 3.2);
       e.tick();
@@ -3196,50 +3284,52 @@ async function main() {
     ok(countLog(e2, "[cmd] ▶ load") >= 1, "★★ 照旧由我们接管");
   }
 
-  section("88. ★★★ v1.4.0 过渡风格智能默认 + 状态行 + 设置面板 API");
+  section("88. ★★★ v1.9.4 过渡只留「干净」+ 一个开关（风格预设已撤）");
   {
     const api = (e) => e.win.gaplessPlayer;
 
-    // ---- (a) 智能默认：随机 → 轻过渡；顺序 → 干净 ----
+    // ---- (a) 默认永远是干净：顺序、随机都一样 ----
     {
-      const eRand = await seamlessEnv("playrandom");
-      const x1 = api(eRand).xfade();
-      eq(x1.source, "auto:light", "★★ 随机播放 → 智能默认「轻过渡」（source=auto:light）");
-      eq(x1.sec, 2.5, "★★ 轻过渡 = 2.5s");
-      eq(x1.curve, "equal", "★★ 轻过渡用等功率");
-      eq(x1.eq, false, "★★ 轻过渡不扫频");
-
       const eSeq = await seamlessEnv("playorder");
       const x2 = api(eSeq).xfade();
-      eq(x2.source, "auto:clean", "★★ 顺序播放 → 智能默认「干净」（source=auto:clean）");
+      eq(x2.source, "clean", "★★ 默认干净（source=clean）");
       eq(x2.sec, 0, "★★ 干净 = 0s（采样级无缝）");
+      eq(api(eSeq).xfadeOn(), false, "★★ 开关默认是关");
+
+      const eRand = await seamlessEnv("playrandom");
+      eq(api(eRand).xfade().sec, 0, "★★ 随机播放也不再「智能默认轻过渡」（风格预设已撤）");
     }
 
-    // ---- (b) 用户选风格 → 立刻生效并记住 ----
+    // ---- (b) 开关：打开 = 智能（3s 兜底），关掉 = 干净，并且记住 ----
     {
       const e = await seamlessEnv("playorder");
-      eq(api(e).xfade().sec, 0, "（前提）顺序播放默认不交叉");
-      ok(api(e).setStyle("dj") === true, "★★ setStyle('dj') 成功");
-      const x = api(e).xfade();
-      eq(x.source, "style:dj", "★★ 变成 style:dj");
-      eq(x.sec, 3, "★★ DJ = 3s");
-      eq(x.curve, "s-line", "★★ DJ 用 s-line 曲线");
-      eq(x.eq, true, "★★ DJ 打开高通扫频");
-      eq(String(e.localStorage.getItem("gaplessPlayer.style")), "dj", "★★ 风格被记住（重启后还在）");
+      eq(api(e).setXfade(true), 3, "★★ 打开开关 → 3s（兜底）");
+      eq(api(e).xfade().sec, 3, "★★ 立刻生效");
+      eq(api(e).xfade().smart, true, "★★ source=smart（v1.14.0：开关 = 智能交叉）");
+      eq(api(e).xfade().source, "smart", "★★ source=smart");
+      eq(api(e).xfadeOn(), true, "★★ xfadeOn() 也跟着变");
+      eq(String(e.localStorage.getItem("gaplessPlayer.xfade")), "3", "★★ 记住（重启后还在）");
+      eq(String(e.localStorage.getItem("gaplessPlayer.xfadeSmart")), "1", "★★ 智能开关也记住");
+      e.flushTimers();
+      ok(countLog(e, "交叉淡入淡出 → 智能（按小节，兜底 3.0s）") >= 1, "★★ 切换有日志");
 
-      // 关掉风格（改回干净）
-      api(e).setStyle("clean");
-      eq(api(e).xfade().sec, 0, "★★ 切回「干净」= 0s");
+      api(e).setXfade(false);
+      eq(api(e).xfade().sec, 0, "★★ 关掉 → 干净");
+      eq(api(e).xfade().smart, false, "★★ 关掉同时退掉智能");
+      eq(String(e.localStorage.getItem("gaplessPlayer.xfade")), "0", "★★ 关掉也记住");
+      e.flushTimers();
+      ok(countLog(e, "交叉淡入淡出 → 关") >= 1, "★★ 关闭有日志");
     }
 
-    // ---- (c) 显式时长 > 风格（老开关仍然优先级最高） ----
+    // ---- (c) 老调用仍然能用；显式时长优先级最高 ----
     {
       const e = await seamlessEnv("playorder");
+      eq(api(e).setStyle("clean"), true, "★ 老调用 setStyle('clean') 仍然可用（= 关）");
+      eq(api(e).xfade().sec, 0, "★ 关 = 0s");
       api(e).setStyle("dj");
-      e.win.__gpXfade = 6; // 显式 6s
-      const x = api(e).xfade();
-      eq(x.source, "explicit", "★★ 显式设过时长 → source=explicit");
-      eq(x.sec, 6, "★★ 显式 6s 覆盖风格的 3s");
+      eq(api(e).xfade().sec, 3, "★ 老调用 setStyle('dj') = 打开 3s");
+      e.win.__gpXfade = 6;
+      eq(api(e).xfade().sec, 6, "★★ 显式 __gpXfade=6 覆盖开关");
       eq(String(e.localStorage.getItem("gaplessPlayer.xfade")), "6", "★★ 显式时长也会记住");
     }
 
@@ -3253,7 +3343,8 @@ async function main() {
       e.flushTimers();
       const st = api(e).status();
       ok(st.indexOf("引擎=") === 0, "★★ 状态行以「引擎=」开头（" + st.slice(0, 40) + "…）");
-      ok(st.indexOf("过渡=") > 0, "★★ 有过渡信息（含来源）");
+      ok(st.indexOf("过渡=") > 0, "★★ 有过渡信息");
+      ok(/过渡=干净无缝/.test(st), "★★ 默认就写明「干净无缝」");
       ok(st.indexOf("缓存=") > 0, "★★ 有缓存占用");
       ok(/预载命中=\d+%/.test(st), "★★ 有预载命中率（" + st.slice(st.indexOf("预载命中")) + "）");
       ok(countLog(e, "[status] ") >= 1, "★★ 启动时也往日志里写一行状态");
@@ -3425,7 +3516,12 @@ async function main() {
       e.flushTimers();
       ok(countLog(e, "[automix] A=") >= 1, "★★ 调度时打出 automix 判定");
       ok(countLog(e, "120.0bpm") >= 1, "★★ 判定里能看到 A 的 120 BPM");
-      ok(countLog(e, "拍点对齐") >= 1, "★★ 交叉起点被吸到了拍点上（" + (e.logs().match(/拍点对齐[^｜|]*/) || ["?"])[0].trim() + "）");
+      // ★ v1.9.2：混音点对齐有两朵花法 —— 老的是「拉长淡出（拍点对齐）」，新的是「A 提前收尾」。
+      //   两者都说明「交叉边界被放到了音乐点上」，所以这里认任一。
+      ok(
+        countLog(e, "拍点对齐") + countLog(e, "A 提前收尾") >= 1,
+        "★★ 交叉边界被吸到了音乐点上（" + ((e.logs().match(/(拍点对齐|A 提前收尾)[^｜|]*/) || ["?"])[0]).trim() + "）"
+      );
       const lp = e.win.gaplessPlayer.lastPlan();
       ok(!!lp && typeof lp.tier === "string", "★★ lastPlan() 能取到（" + (lp ? lp.tier : "?") + "）");
     }
@@ -3551,9 +3647,12 @@ async function main() {
     }
   }
 
-  section("91. ★★★ v1.5.2 设置面板（自绘 DOM / 分段控件 / 拨动开关）");
+  section("91. ★★★ v1.5.2 → v1.10.0 设置面板（自绘 DOM；按钮是浮层，不在客户端组件树里）");
   {
-    /* 极简假 DOM：只覆盖面板真正用到的那点 API（appendChild / className / textContent / onclick…） */
+    // ★ 版本号从 manifest 读 —— 免得每次 bump 都要来改断言（27 段也是这么做的）
+    const MF91 = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "src", "manifest.json"), "utf8"));
+    const api = (en) => en.win.gaplessPlayer;
+    /** 假 DOM：一个播放器栏 + 一颗「随机播放」按钮（bar 上挂了一个「委托」监听用来验冒泡） */
     function makeDoc() {
       function node(tag) {
         const n = {
@@ -3564,10 +3663,19 @@ async function main() {
           checked: false,
           children: [],
           attrs: {},
+          style: {},
           _parent: null,
+          listeners: {},
           appendChild(c) {
             c._parent = n;
             n.children.push(c);
+            return c;
+          },
+          insertBefore(c, ref) {
+            const i = ref ? n.children.indexOf(ref) : -1;
+            c._parent = n;
+            if (i >= 0) n.children.splice(i, 0, c);
+            else n.children.push(c);
             return c;
           },
           removeChild(c) {
@@ -3577,6 +3685,21 @@ async function main() {
           },
           setAttribute(k, v) {
             n.attrs[k] = v;
+          },
+          getAttribute(k) {
+            return Object.prototype.hasOwnProperty.call(n.attrs, k) ? n.attrs[k] : null;
+          },
+          getBoundingClientRect() {
+            // 「随机播放」按钮的真实位置：右边 100~126、上边 700~726
+            return n === shuffle
+              ? { left: 100, top: 700, width: 26, height: 26, right: 126, bottom: 726 }
+              : { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0 };
+          },
+          addEventListener(t, fn) {
+            (n.listeners[t] = n.listeners[t] || []).push(fn);
+          },
+          remove() {
+            if (n._parent) n._parent.removeChild(n);
           },
           get lastChild() {
             return n.children[n.children.length - 1] || null;
@@ -3589,7 +3712,21 @@ async function main() {
       }
       const body = node("body");
       const head = node("head");
-      return { body, head, createElement: node, querySelector: () => null };
+      const bar = node("div");
+      bar.className = "m-playbar btns";
+      const shuffle = node("a");
+      shuffle.className = "rdi";
+      shuffle.setAttribute("title", "随机播放");
+      bar.appendChild(shuffle);
+      return {
+        body,
+        head,
+        bar,
+        shuffle,
+        createElement: node,
+        querySelector: (s) => (/rdi|shuffle|order|mode/i.test(String(s)) ? shuffle : null),
+        querySelectorAll: () => [],
+      };
     }
 
     const doc = makeDoc();
@@ -3598,21 +3735,38 @@ async function main() {
     await flush();
     e.flushTimers();
 
-    // ---- 右下角按钮 + 样式只注入一次 ----
-    eq(doc.body.children.length, 1, "★★ 右下角按钮注入（1 个元素）");
-    eq(doc.body.children[0].className, "gp-fab", "★★ 用的是新的圆角图标按钮");
-    eq(String(doc.body.children[0].textContent), "♪", "★★ 图标是 ♪");
+    // ---- 按钮：留在 body 里（不进客户端组件树），靠定位浮到「随机播放」左边 ----
+    eq(doc.bar.children.length, 1, "★★ 没有往播放器栏里塞节点（避免客户端点击委托命中我们）");
+    eq(doc.body.children.length, 1, "★★ 按钮挂在 body 上");
+    const btn = doc.body.children[0] || { className: "", textContent: "", style: {} };
+    ok(/^gp-fab/.test(String(btn.className)), "★★ 是 gp-fab 浮层（" + btn.className + "）");
+    eq(String(btn.textContent), "♪", "★★ 图标是 ♪");
+    eq(String(btn.style.position), "fixed", "★★ 用 fixed 浮着");
+    eq(String(btn.style.left), "44px", "★★ 位置 = 随机播放左边（left 100 − 宽 42 − 空隙 14）");
+    eq(String(btn.style.top), "692px", "★★ 垂直居中在同一行（700 + (26−42)/2）");
     eq(doc.head.children.length, 1, "★★ 面板样式注入到 head");
     const css = String((doc.head.children[0] || {}).textContent || "");
     ok(css.indexOf(".gp-card") >= 0 && css.indexOf(".gp-sw") >= 0, "★★ 样式里有卡片与拨动开关");
-    ok(css.indexOf(".gp-seg>button.on") >= 0, "★★ 分段控件的选中态样式也在");
+    ok(css.indexOf(".gp-fab.inline") < 0, "★★ 旧方案（塞进组件树）的样式已经删掉");
+    // ★ v1.9.7：按钮是「纯音符图标」（无边框/无背景），边长 42px
+    ok(/\.gp-fab\{[^}]*width:42px/.test(css), "★★ 按钮边长 42px（30 + 12）");
+    ok(/\.gp-fab\{[^}]*background:none/.test(css), "★★ 没有背景（只要图标）");
+    ok(css.indexOf("@keyframes gp-hero-in") >= 0, "★★ 大卡切歌动画的 keyframes 在 CSS 里");
+    ok(/\.gp-hero\.gp-anim-a\{[^}]*animation:gp-hero-in 1s/.test(css), "★★ 动画 1s");
+    ok(/\.gp-fab\{[^}]*border:0/.test(css), "★★ 没有边框");
 
-    const api = e.win.gaplessPlayer;
-    eq(api.openPanel(), true, "★★ openPanel() 打开面板");
-    eq(doc.body.children.length, 2, "★★ 卡片挂到 body");
+    // ---- 点它只开面板：冒泡被拦住（这是「连带触发随机播放」的修法） ----
+    let stopped = 0;
+    btn.onclick({ stopPropagation() { stopped++; }, preventDefault() {} });
+    eq(stopped, 1, "★★ 点击处理器拦住了冒泡（客户端收不到）");
+    eq(doc.body.children.length, 2, "★★ 面板打开了");
     const card = doc.body.children[1] || { children: [], className: "", textContent: "" };
     eq(card.className, "gp-card", "★★ 卡片类是 gp-card");
-    eq(doc.body.children[0].className, "gp-fab on", "★★ 打开时按钮高亮");
+    // ★ v1.16.0：贴窗口左侧、播放器上方
+    eq(String(card.style.left), "8px", "★★ 面板贴窗口左侧（left=8px）");
+    eq(String(card.style.right), "auto", "★★ 不再靠右");
+    eq(String(card.style.bottom), "100px", "★★ 底边贴在播放器上方（按钮 top 700 上方约 32px）");
+    ok(String(btn.className).indexOf("on") >= 0, "★★ 打开时按钮高亮");
     eq(doc.head.children.length, 1, "★★ 样式不重复注入");
 
     const walk = (n, out) => {
@@ -3622,54 +3776,198 @@ async function main() {
     };
     const all = walk(card, []);
     const texts = all.map((n) => String(n.textContent || "")).join("|");
-    ok(/GaplessPlayer/.test(texts) && /1\.8\.3/.test(texts), "★★ 标题带版本号");
+    ok(/GaplessPlayer/.test(texts) && texts.indexOf(MF91.version) >= 0, "★★ 标题带版本号（" + MF91.version + "）");
     ok(/引擎=/.test(texts), "★★ 状态行在面板里");
+    const statCols = all.filter((n) => n.className === "gp-stat");
+    ok(statCols.length >= 5, "★★ 状态信息分列（" + statCols.length + " 项）");
+    ok(statCols.some((n) => String(n.textContent).indexOf("引擎=") === 0), "★★ 「引擎=」单独一列");
     ok(/拍点=开/.test(texts), "★★ 状态行直接显示「拍点=开」（默认就是开的）");
-    ok(/过渡风格/.test(texts) && /播放行为/.test(texts) && /缓存/.test(texts), "★★ 分了三个区（过渡/行为/缓存）");
-    ok(/诊断/.test(texts), "★★ 诊断还是折叠的");
+    ok(/交叉淡入淡出/.test(texts) && /响度平衡/.test(texts) && /缓存/.test(texts), "★★ 只有开关 + 缓存两块（简单易懂）");
+    ok(/更多/.test(texts), "★★ 高级开关收在「更多」里（折叠）");
+    ok(!/过渡风格/.test(texts), "★★ 「过渡风格」已经撤掉");
 
-    // ---- 分段控件：点 DJ 立刻生效并高亮 ----
-    const segBtns = all.filter(
-      (n) => n.tagName === "button" && ["干净", "轻过渡", "DJ"].indexOf(String(n.textContent)) >= 0
-    );
-    eq(segBtns.length, 3, "★★ 三个风格按钮（分段控件）");
-    segBtns[2].onclick();
-    eq(api.xfade().source, "style:dj", "★★ 点 DJ → 立刻生效");
-    eq(segBtns[2].className, "on", "★★ 选中的那个高亮");
-    eq(segBtns[0].className, "", "★★ 其余不高亮");
+    // ---- 顺序：「拍点对齐」在「交叉淡入淡出」上面 ----
+    const rowAt = (label) =>
+      all.findIndex(
+        (n) => n.className === "gp-row" && n.children[0] && String(n.children[0].textContent) === label
+      );
+    const iBeat = rowAt("拍点对齐");
+    const iXf = rowAt("交叉淡入淡出");
+    ok(iBeat >= 0 && iXf >= 0 && iBeat < iXf, "★★ 「拍点对齐」排在「交叉淡入淡出」上面（" + iBeat + " < " + iXf + "）");
 
-    // ---- 拨动开关：拍点对齐默认开，点一下关、再点开 ----
-    const toggles = all.filter((n) => /^gp-sw/.test(n.className));
-    ok(toggles.length >= 4, "★★ 拨动开关若干（" + toggles.length + " 个）");
-    // 按「行的标签」定位开关（顺序不可靠：扫频开关在行为开关之前）
     const rowOf = (label) =>
       all.filter(
         (n) => n.className === "gp-row" && n.children[0] && String(n.children[0].textContent) === label
       )[0];
+
+    // ---- v1.14.0：顶部大卡 + 时长步进器 ----
+    ok(all.some((n) => n.className === "gp-hero"), "★★ 顶部有一张「本次交叉」大卡");
+    ok(all.some((n) => n.className === "gp-hero-num"), "★★ 卡片里有大号数值");
+    ok(all.filter((n) => n.className === "gp-chip").length >= 1, "★★ 卡片下面的信息是排列的小项");
+    ok(!!rowOf("时长"), "★★ 有「时长」步进器行（不再只有开关）");
+
+    // ---- v1.16.0：子标签页 过渡 / 音色 / 缓存 ----
+    const tabs = all.filter((n) => /^gp-tab( |$)/.test(String(n.className)));
+    eq(tabs.length, 3, "★★ 三个子标签页");
+    eq(tabs.map((t) => String(t.textContent)), ["过渡", "音色", "缓存"], "★★ 标签页名称");
+    const panes = all.filter((n) => n.className === "gp-pane");
+    eq(panes.length, 3, "★★ 三个面板容器");
+    eq(String(tabs[0].className), "gp-tab on", "★★ 默认选中「过渡」");
+    eq(panes[0].style.display, "", "★★ 过渡面板可见");
+    eq(panes[1].style.display, "none", "★★ 音色面板收起");
+    tabs[1].onclick();
+    eq(String(tabs[1].className), "gp-tab on", "★★ 点「音色」→ 选中");
+    eq(panes[1].style.display, "", "★★ 音色面板可见");
+    eq(panes[0].style.display, "none", "★★ 过渡面板收起");
+    tabs[2].onclick();
+    eq(String(tabs[2].className), "gp-tab on", "★★ 点「缓存」→ 选中");
+    const cacheSec = (panes[2] && panes[2].children[0]) || { children: [] };
+    const cacheLabels = cacheSec.children
+      .filter((n) => n.className === "gp-row")
+      .map((n) => String((n.children[0] || {}).textContent));
+    eq(cacheLabels, ["最近缓冲", "磁盘字节", "磁盘缓存"], "★★ 缓存页只留三项");
+    ok(!/分析记录|空闲补算|A 提前收尾/.test(texts), "★★ 分析/补算/A 提前收尾已从面板撤掉");
+    tabs[0].onclick();
+
+    // ---- 交叉淡入淡出开关：默认关（干净），点一下开「智能」、再点关 ----
+    const xfRow = rowOf("交叉淡入淡出") || { children: [] };
+    const xfSw = xfRow.children[1] || { className: "", onclick() {} };
+    eq(xfSw.className, "gp-sw", "★★ 「交叉淡入淡出」默认关（= 干净无缝）");
+    xfSw.onclick();
+    eq(xfSw.className, "gp-sw on", "★★ 点一下 → 开，视觉同步");
+    eq(api(e).xfadeOn(), true, "★★ 真的开了");
+    eq(api(e).xfade().sec, 3, "★★ 打开 = 3s（兜底）");
+    eq(api(e).xfade().smart, true, "★★ 而且进入智能模式（按小节定时长/曲线）");
+    e.flushTimers();
+    ok(countLog(e, "[ui] 交叉淡入淡出 → 智能（按小节，兜底 3.0s）") >= 1, "★★ 有开启日志");
+    // 时长：智能时只显示「智能 · 按小节」，不摆假数字；点「固定」才进显式
+    const durRow = rowOf("时长") || { children: [] };
+    const durBox = durRow.children[1] || { children: [] };
+    const smartWrap = durBox.children[0] || { style: {}, children: [] };
+    const stepWrap = durBox.children[1] || { style: {}, children: [] };
+    eq(smartWrap.style.display, "", "★★ 智能模式显示「智能 · 按小节」");
+    eq(stepWrap.style.display, "none", "★★ 智能模式不显示 3.0s 数字");
+    const fixBtn = smartWrap.children[1] || { onclick() {} };
+    fixBtn.onclick();
+    eq(api(e).xfade().smart, false, "★★ 点「固定」→ 退出智能");
+    eq(api(e).xfade().sec, 3, "★★ 首次固定 = 默认 3s");
+    eq(stepWrap.style.display, "", "★★ 固定模式才显示滑杆");
+    const range = stepWrap.children[0] || { value: "", oninput() {} };
+    eq(String(range.type || ""), "range", "★★ 时长用滑杆（0.1s 步进）");
+    range.value = "3.5";
+    range.oninput();
+    eq(api(e).xfade().sec, 3.5, "★★ 拖动滑杆 → 3.5s");
+    const smartBtn = stepWrap.children[2] || { onclick() {} };
+    smartBtn.onclick();
+    eq(api(e).xfade().smart, true, "★★ 点「按小节」→ 回到智能");
+    eq(api(e).xfade().sec, 3, "★★ 智能模式兜底仍是 3.0（不跟着上次固定值 3.5 跑）");
+    fixBtn.onclick();
+    eq(api(e).xfade().sec, 3.5, "★★ 再切固定：沿用上次的 3.5s（不再跳回 3.0）");
+    smartBtn.onclick();
+    xfSw.onclick();
+    eq(api(e).xfadeOn(), false, "★★ 再点一下 → 关");
+
+    // ---- 拍点对齐默认开，点一下关 ----
+    const toggles = all.filter((n) => /^gp-sw/.test(n.className));
+    ok(toggles.length >= 3, "★★ 拨动开关若干（" + toggles.length + " 个）");
     const beatRow = rowOf("拍点对齐") || { children: [] };
     const beatSw = beatRow.children[1] || { className: "", onclick() {} };
-    eq(beatSw.className, "gp-sw on", "★★ 「拍点对齐」那一行的开关默认是开");
     eq(beatSw.className, "gp-sw on", "★★ 「拍点对齐」默认就是开");
     beatSw.onclick();
     eq(e.win.__gpAutoMix, false, "★★ 点一下 → 关");
     eq(beatSw.className, "gp-sw", "★★ 视觉同步（不再是 on）");
-    e.flushTimers(); // 日志是攒着写的，断言前得先冲一遍
-    ok(countLog(e, "[ui] 拍点对齐 → 关") >= 1, "★★ 有关闭日志");
-    beatSw.onclick();
-    eq(e.win.__gpAutoMix, true, "★★ 再点一下 → 开");
 
-    // ---- 滑杆：拖一下就是显式时长 ----
-    const range = all.filter((n) => n.tagName === "input" && n.className === "gp-range")[0];
-    ok(!!range, "★★ 有时长滑杆");
-    range.value = "6";
-    range.oninput();
-    eq(api.xfade().source, "explicit", "★★ 拖滑杆 → 变成显式时长（优先级最高）");
-    eq(api.xfade().sec, 6, "★★ 值 = 6s");
+    // ---- v1.16.0：总开关在标题栏、关闭按钮左边 ----
+    const headSw = all.find((n) => n.className === "gp-head-sw") || { children: [] };
+    ok(!!headSw.children[0], "★★ 标题栏有「插件」开关");
+    eq(String((headSw.children[0] || {}).textContent), "插件", "★★ 标签是「插件」");
+    const pluginSw = headSw.children[1] || { className: "", onclick() {} };
+    eq(pluginSw.className, "gp-sw on", "★★ 总开关默认启用");
+    const iHeadSw = all.indexOf(headSw);
+    const iClose = all.findIndex((n) => n.className === "gp-x");
+    ok(iHeadSw >= 0 && iClose >= 0 && iHeadSw < iClose, "★★ 总开关在关闭按钮左边");
+    pluginSw.onclick();
+    eq(e.win.__gpNativeAll, true, "★★ 关掉 = __gpNativeAll=true（整条交回原生）");
+    eq(pluginSw.className, "gp-sw", "★★ 视觉同步（不再是 on）");
+    ok(
+      walk(card, []).some((n) => String(n.textContent || "").indexOf("插件已停用") >= 0),
+      "★★ 状态行立刻变成「插件已停用」"
+    );
+    pluginSw.onclick();
+    eq(e.win.__gpNativeAll, false, "★★ 再点一下 → 启用");
+
+    // ---- v1.20.0：曲线改成 Dialog ----
+    const curveRow = rowOf("曲线") || { children: [] };
+    const curveBtn = curveRow.children[1] || { textContent: "", onclick() {} };
+    eq(String(curveBtn.textContent), "自动", "★★ 曲线默认「自动」（按档位）");
+    curveBtn.onclick();
+    const dlg = doc.body.children.filter((n) => n.className === "gp-dialog")[0];
+    ok(!!dlg, "★★ 点曲线 → 弹出 Dialog");
+    const dRows = dlg && dlg.children[0]
+      ? dlg.children[0].children.filter((n) => /^gp-dialog-row/.test(String(n.className)))
+      : [];
+    eq(dRows.length, 7, "★★ Dialog 里 7 个选项（自动 + 6 条曲线）");
+    const sline = dRows.filter((r) => String(r.textContent).indexOf("s-line") >= 0 && String(r.textContent).indexOf("r_s") < 0)[0];
+    ok(!!sline, "（前提）找到 s-line 选项");
+    if (sline) sline.onclick();
+    eq(e.win.__gpXfadeCurve, "s-line", "★★ 选 s-line → 写入 __gpXfadeCurve");
+    eq(doc.body.children.filter((n) => n.className === "gp-dialog").length, 0, "★★ 选完 Dialog 关闭");
+    curveBtn.onclick();
+    const dlg2 = doc.body.children.filter((n) => n.className === "gp-dialog")[0];
+    const autoRow = dlg2 && dlg2.children[0]
+      ? dlg2.children[0].children.filter((n) => String(n.textContent).indexOf("自动") >= 0)[0]
+      : null;
+    if (autoRow) autoRow.onclick();
+    eq(e.win.__gpXfadeCurve, undefined, "★★ 选「自动」→ 清掉显式曲线");
+
+    const eqRow = rowOf("扫频") || { children: [] };
+    const eqSw = eqRow.children[1] || { className: "", onclick() {} };
+    eq(eqSw.className, "gp-sw on", "★★ 扫频默认开");
+    eqSw.onclick();
+    eq(e.win.__gpXfadeEq, false, "★★ 点一下 → 关");
+    eqSw.onclick();
+    eq(e.win.__gpXfadeEq, true, "★★ 再点 → 开");
+
+    // ★ v1.20.0：跳过默认关
+    const skipRow = rowOf("差拍跳过") || { children: [] };
+    const skipSw = skipRow.children[1] || { className: "", onclick() {} };
+    eq(skipSw.className, "gp-sw", "★★ 「差拍跳过」默认关");
+    skipSw.onclick();
+    eq(e.win.__gpSkipBadMix, true, "★★ 打开写入 true");
+    skipSw.onclick();
+    eq(e.win.__gpSkipBadMix, false, "★★ 再点关掉");
+    const contRow = rowOf("无缝专辑原样") || { children: [] };
+    const contSw = contRow.children[1] || { className: "", onclick() {} };
+    eq(contSw.className, "gp-sw on", "★★ 「无缝专辑原样」默认开");
+    contSw.onclick();
+    eq(e.win.__gpKeepContinuous, false, "★★ 关掉写入 __gpKeepContinuous=false");
+    contSw.onclick();
+
+    const trimRow = rowOf("首尾裁剪") || { children: [] };
+    const trimSw = trimRow.children[1] || { onclick() {} };
+    trimSw.onclick();
+    eq(e.win.__gpTrim, false, "★★ 首尾裁剪总开关");
+    trimSw.onclick();
+    eq(e.win.__gpTrim, true, "★★ 再开回来");
+
+    const loudRefRow = rowOf("响度参考") || { children: [] };
+    const loudRefSw = loudRefRow.children[1] || { onclick() {} };
+    loudRefSw.onclick();
+    eq(e.win.__gpLoudRef, "none", "★★ 响度参考可切绝对");
+    loudRefSw.onclick();
+    eq(e.win.__gpLoudRef, "median", "★★ 再切回相对");
+
+    const diskRow = rowOf("磁盘缓存") || { children: [] };
+    const diskSw = diskRow.children[1] || { onclick() {} };
+    // 验证台没有 fs → 初始不可用；点一下仍应把开关写进 __gpDiskCache
+    diskSw.onclick();
+    eq(e.win.__gpDiskCache, true, "★★ 磁盘缓存开关会写 __gpDiskCache");
+    e.win.__gpDiskCache = false;
 
     // ---- 再点一次收起 ----
-    eq(api.openPanel(), true, "★★ 再调 openPanel() 收起");
+    eq(api(e).openPanel(), true, "★★ 再调 openPanel() 收起");
     eq(doc.body.children.length, 1, "★★ 卡片被移除");
-    eq(doc.body.children[0].className, "gp-fab", "★★ 按钮恢复不高亮");
+    eq(String(btn.className), "gp-fab", "★★ 按钮恢复不高亮（仍在原位）");
   }
 
   section("92. ★★★ v1.5.3/v1.6.0 预开流 + 双元素：B 在空闲槽里缓冲，切歌时接管");
@@ -4306,7 +4604,14 @@ async function main() {
       eq(started.length, 2, "★★ 排了两段：拉伸段 + 接续段");
       const stretched = started[0] || { at: 0, off: 0, dur: 0 };
       const rest = started[1] || { when: 0, off: 0, dur: 0 };
-      ok(Math.abs(Number(stretched.dur) - 3) < 0.1, "★★ 拉伸段长度 ≈ 交叉时长 3s（" + Number(stretched.dur).toFixed(2) + "）");
+      // ★ v1.9.1/v1.9.2：交叉时长会被「量化到整拍」再「混音点对齐（可能提前收尾）」，
+      //   所以拿日志里真正排上的那个时长来比，而不是硬编码用户设的 3s。
+      const mXf = e.logs().match(/交叉=(\d+\.\d\d)s/);
+      const wantFade = mXf ? Number(mXf[1]) : 3;
+      ok(
+        Math.abs(Number(stretched.dur) - wantFade) < 0.05,
+        "★★ 拉伸段长度 == 实际排上的交叉时长（" + Number(stretched.dur).toFixed(2) + "s / 期望 " + wantFade.toFixed(2) + "s）"
+      );
       ok(Number(rest.at) > Number(stretched.at), "★★ 接续段在拉伸段之后开始");
       ok(Math.abs(Number(rest.at) - (Number(stretched.at) + Number(stretched.dur))) < 0.06,
         "★★ 接续段正好接在拉伸段结束处（差值 " + (Number(rest.at) - Number(stretched.at) - Number(stretched.dur)).toFixed(3) + "s）");
@@ -4650,10 +4955,92 @@ async function main() {
       ok(!bPad || bPad.conf < 0.2,
         "★★ 纯铺底：置信被压到 0.2 以下（" + (bPad ? bPad.bpm.toFixed(1) + " / conf " + bPad.conf.toFixed(2) : "算不出") + "）");
 
+      /**
+       * ⑤ ★ v1.9.2：**有能量但没节拍**的素材（不规则瞬态）—— 这一条盯的是「置信度本身」。
+       *   纯正弦会走「onset 为 0 → 直接返回 null」那条路，压根到不了置信度那几步，
+       *   所以没法证明置信度是真的在算。这里用**固定种子的不规则打击**：有能量、有 onset，
+       *   但没有任何周期 → 网格能算出来，置信必须很低。
+       */
+      const noPulse = (function () {
+        const sr = 8000;
+        const secs = 20;
+        const n = sr * secs;
+        const d = new Float32Array(n);
+        let seed = 987654321;
+        const rnd = () => {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          return seed / 0x7fffffff;
+        };
+        let t = 0;
+        while (t < secs - 0.1) {
+          t += 0.15 + rnd() * 0.85; // 间隔完全不规则
+          const at = Math.round(t * sr);
+          const amp = 0.3 + rnd() * 0.6;
+          for (let i = 0; i < sr * 0.04 && at + i < n; i++) {
+            d[at + i] += Math.exp(-i / (sr * 0.01)) * amp;
+          }
+        }
+        return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+      })();
+      const bNoPulse = beat(noPulse);
+      ok(!!bNoPulse, "（前提）不规则瞬态素材也能算出网格（说明走到了置信度那一步）");
+      ok(
+        !bNoPulse || bNoPulse.conf < 0.25,
+        "★★ 但不规则瞬态 → 置信必须很低（conf=" + (bNoPulse ? bNoPulse.conf.toFixed(2) : "?") +
+          "，对比度 " + (bNoPulse && bNoPulse.prominence !== undefined ? bNoPulse.prominence.toFixed(2) : "?") + "）"
+      );
+
       // ④ 全静音仍然算不出
       const quiet = new Float32Array(8000 * 20);
       eq(beat({ duration: 20, sampleRate: 8000, numberOfChannels: 1, length: quiet.length, getChannelData: () => quiet }), null,
         "★★ 全静音 → 算不出（不硬凑）");
+
+      /**
+       * ⑤ ★ v1.9.2：像真实曲目那样「onset 到处都是」的素材。
+       *
+       * 老置信度是拿「拍上均值」和**全局均值**比 —— 底鼓/军鼓/踩镲/齿音让 onset 通量处处非零，
+       * 全局均值被抬高，于是真实曲目被测出 `bpm 对、置信 0.00`（真机日志就是这个形态）。
+       * 这里造一条最常见的形态：**底鼓在拍上 + 踩镲在拍外 + 低电平铺底和弦**。
+       * 注意这是**确定性**素材（没有随机噪声），验证台里可复现。
+       */
+      const noisy = (function () {
+        const sr = 8000;
+        const secs = 20;
+        const n = sr * secs;
+        const d = new Float32Array(n);
+        const beatSec = 60 / 128;
+        // 拍上：底鼓
+        for (let t = 0; t < secs; t += beatSec) {
+          const at = Math.round(t * sr);
+          for (let i = 0; i < sr * 0.05 && at + i < n; i++) {
+            d[at + i] += Math.sin((2 * Math.PI * 70 * i) / sr) * Math.exp(-i / (sr * 0.012)) * 0.8;
+            d[at + i] += Math.sin((2 * Math.PI * 2500 * i) / sr) * Math.exp(-i / (sr * 0.004)) * 0.25;
+          }
+        }
+        // 拍外（半拍处）：踩镲 —— 故意让「拍外」也有瞬态，这才像真实曲目
+        for (let t = beatSec / 2; t < secs; t += beatSec) {
+          const at = Math.round(t * sr);
+          for (let i = 0; i < sr * 0.02 && at + i < n; i++) {
+            d[at + i] += Math.sin((2 * Math.PI * 4200 * i) / sr) * Math.exp(-i / (sr * 0.005)) * 0.18;
+          }
+        }
+        // 低电平铺底和弦（真实曲目一直有）
+        for (let i = 0; i < n; i++) {
+          const t = i / sr;
+          d[i] += 0.08 * Math.sin(2 * Math.PI * 220 * t);
+          d[i] += 0.055 * Math.sin(2 * Math.PI * 277.18 * t);
+          d[i] += 0.04 * Math.sin(2 * Math.PI * 329.63 * t);
+        }
+        return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+      })();
+      const bNoisy = beat(noisy);
+      ok(!!bNoisy && Math.abs(bNoisy.bpm - 128) < 3, "★★ 压缩感素材：BPM 仍测得准（" + (bNoisy ? bNoisy.bpm.toFixed(1) : "?") + "）");
+      ok(
+        !!bNoisy && bNoisy.conf > 0.3,
+        "★★ 而且置信能用（conf=" + (bNoisy ? bNoisy.conf.toFixed(2) : "?") +
+          "，对比度 " + (bNoisy && bNoisy.prominence !== undefined ? bNoisy.prominence.toFixed(2) : "?") +
+          " / 锐度 " + (bNoisy && bNoisy.rhythmic !== undefined ? bNoisy.rhythmic.toFixed(2) : "?") + "）"
+      );
     }
     // ---- (b) #10 头尾 BPM 不一致：不永久排除，改用头窗外推尾巴的拍点 ----
     {
@@ -4698,9 +5085,16 @@ async function main() {
       const started = e.started.slice(n0);
       ok(started.length === 2, "（前提）排了两段（" + started.length + "）");
       if (started.length === 2) {
+        // ★ v1.9.2：A 的位置可能被「提前收尾」提前（边界落在乐句/掉点/拍上），
+        //   所以「收手时刻」应当等于**调度日志里的结束时刻**，而不是硬编码的自然结尾 200。
+        const mEnds = e.logs().match(/结束 at=\d+\.\d+/g);
+        const mEnd = mEnds && mEnds.length ? mEnds[mEnds.length - 1].match(/(\d+\.\d+)/) : null;
+        const wantEnd = mEnd ? Number(mEnd[1]) : 200;
         const seam = Number(started[0].at) + Number(started[0].dur);
-        ok(Math.abs(seam - 200) < 0.01,
-          "★★ 拉伸段正好在 A 的结束时刻（200.000s）收手（实际 " + seam.toFixed(3) + "s）");
+        ok(
+          Math.abs(seam - wantEnd) < 0.01,
+          "★★ 拉伸段正好在「排定的结束时刻」（" + wantEnd.toFixed(3) + "s）收手（实际 " + seam.toFixed(3) + "s）"
+        );
         const gap = Number(started[1].at) - seam;
         ok(Math.abs(gap) < 0.01, "★★ 接续段紧接其后（误差 " + (gap * 1000).toFixed(1) + "ms）");
       }
@@ -5004,6 +5398,2255 @@ async function main() {
       const mf = e.logs().match(/交叉=(\d+\.\d\d)s/);
       ok(!!mf && Number(mf[1]) <= 3.01, "★★ 流式 B 的交叉被压到 ≤3s（实际 " + (mf ? mf[1] : "?") + "s，用户设的是 8s）");
       ok(/入点无法对齐/.test(e.logs()), "★★ 并且明确提示「入点无法对齐」");
+    }
+  }
+
+  /* ---------- 104. 清缓存后不再冷启动 ---------- */
+  section("104. ★★★ v1.8.4 清缓存后不再冷启动（磁盘字节缓存 / 清完重排 / 下载闸门）");
+  {
+    /**
+     * 假磁盘：能存二进制，并记下每一次调用。
+     * ⚠️ main.js 传进来的 Blob 是验证台的 FakeBlob（`parts[0]` 才是 ArrayBuffer）。
+     */
+    function mkDiskFs() {
+      const files = new Map();
+      const calls = [];
+      const fs2 = {
+        calls,
+        files,
+        readFileText(p) {
+          calls.push(["readFileText", String(p)]);
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(String(files.get(String(p))));
+        },
+        writeFileText(p, txt) {
+          calls.push(["writeFileText", String(p)]);
+          files.set(String(p), String(txt));
+          return Promise.resolve(true);
+        },
+        readFile(p) {
+          calls.push(["readFile", String(p)]);
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(files.get(String(p))); // ArrayBuffer
+        },
+        writeFile(p, blob) {
+          calls.push(["writeFile", String(p)]);
+          const ab = blob && blob.parts ? blob.parts[0] : null;
+          if (!ab) return Promise.resolve(false);
+          files.set(String(p), ab);
+          return Promise.resolve(true);
+        },
+        remove(p) {
+          calls.push(["remove", String(p)]);
+          files.delete(String(p));
+          return Promise.resolve(true);
+        },
+        mkdir(p) {
+          calls.push(["mkdir", String(p)]);
+          return Promise.resolve(true);
+        },
+        dataPaths() {
+          return Array.from(files.keys()).filter((k) => /\.mp3$/.test(k));
+        },
+        countOf(name) {
+          return calls.filter((c) => c[0] === name).length;
+        },
+        /** 只数「磁盘缓存目录」下的调用（日志 / 记忆文件的写入不算） */
+        diskCalls() {
+          return calls.filter((c) => String(c[1] || "").indexOf("gapless-cache") >= 0);
+        },
+      };
+      return fs2;
+    }
+
+    // ---- (a) 预载就绪 → 压缩字节落盘（PCM 不落盘）----
+    {
+      const disk = mkDiskFs();
+      const e = createEnv({ fs: disk });
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(16);
+      e.flushTimers();
+      ok(countLog(e, "[disk] 已落盘") >= 1, "★★ 预载就绪后把压缩字节落盘");
+      eq(countLog(e, "[disk] 自检 ★ 可写"), 1, "★★ 开机自检真的写了→读了→删了（0 首也有话说）");
+      const st = e.win.gaplessPlayer.diskStats();
+      eq(st.enabled, true, "★★ 磁盘缓存可用（fs 四个方法齐了）");
+      ok(st.count >= 1, "★★ 索引里有 " + st.count + " 首");
+      ok(st.bytes > 0, "★★ 体积也记着（" + st.bytes + " 字节）");
+      ok(disk.files.has("C:\\betterncm\\gapless-cache\\index.json"), "★★ index.json 已写入");
+      ok(disk.dataPaths().length >= 1, "★★ 数据文件都是 .mp3（存的是压缩字节）");
+    }
+
+    // ---- (b) 「重启」：同一个盘 + 全新实例 → 直接命中，不再取址 ----
+    {
+      const disk = mkDiskFs();
+      const e1 = createEnv({ fs: disk });
+      e1.boot();
+      await flush();
+      e1.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e1, 1000);
+      await flush(24);
+      e1.flushTimers();
+      eq(e1.win.gaplessPlayer.diskStats().count, 2, "（前提）第一次会话把「当前 1000 + 下一首 2000」都落盘了");
+
+      const e2 = createEnv({ fs: disk });
+      e2.boot();
+      await flush();
+      e2.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e2, 1000);
+      await flush(16);
+      e2.flushTimers();
+      ok(countLog(e2, "[disk] ★ 命中") >= 1, "★★ 全新会话里预载直接命中磁盘");
+      ok(/来源=磁盘/.test(e2.logs()), "★★ 预载日志写明「来源=磁盘」");
+      // 只有「下下一首 3000」还会取址（它盘上没有）；当前 1000 / 下一首 2000 都不该取址
+      const resolved = e2.eapi.log.filter((o) => /"\[?(1000|2000)\]?"/.test(JSON.stringify(o.data)));
+      eq(resolved.length, 0, "★★ 当前 + 下一首都没取址（磁盘把取址 + 下载全省了）");
+    }
+
+    // ---- (c) 清内存：预热槽一起清 + 清完立刻重排（以前 N+2 会被永久卡死）----
+    {
+      const disk = mkDiskFs();
+      const e = createEnv({ fs: disk });
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(16);
+      e.flushTimers();
+      const pre0 = countLog(e, "[prefetch]");
+      ok(pre0 >= 1, "（前提）N+2 已经抓过一轮");
+      const n = e.win.gaplessPlayer.clearCache();
+      eq(typeof n, "number", "★★ clearCache 仍然返回条数");
+      e.flushTimers(); // 日志是攒着写的，断言前先落一次盘
+      ok(countLog(e, "[warm] 重排预热") >= 1, "★★ 清完立刻重排预热（不是等下一次切歌）");
+      await flush(16);
+      e.flushTimers();
+      ok(
+        countLog(e, "[prefetch]") > pre0,
+        "★★ N+2 的预热重新跑起来了（以前那个槽还记着「字节已备好」→ 再也不重抓）"
+      );
+    }
+
+    // ---- (d) 盘上那份坏了（被外部截断）→ 丢掉 + 改走网络 ----
+    {
+      const disk = mkDiskFs();
+      const e1 = createEnv({ fs: disk });
+      e1.boot();
+      await flush();
+      e1.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e1, 1000);
+      await flush(16);
+      e1.flushTimers();
+      const hit = disk.dataPaths().filter((p) => p.indexOf("2000") >= 0);
+      eq(hit.length, 1, "（前提）找到了 2000 的那一份数据文件");
+      disk.files.set(hit[0], new ArrayBuffer(16)); // 截断成 16 字节
+
+      const e2 = createEnv({ fs: disk });
+      e2.boot();
+      await flush();
+      e2.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e2, 1000);
+      await flush(16);
+      e2.flushTimers();
+      ok(countLog(e2, "这条读不出来") >= 1, "★★ 长度对不上 → 明确丢弃（不会拿半截去解码）");
+      ok(countLog(e2, "★★ 预载就绪") >= 1, "★★ 丢掉之后改走网络，预载照样成功");
+      ok(e2.eapi.log.length >= 1, "★★ 而且确实重新取了址");
+    }
+
+    // ---- (e) `window.__gpDiskCache = false` → 完全不碰盘 ----
+    {
+      const disk = mkDiskFs();
+      const e = createEnv({ fs: disk });
+      e.win.__gpDiskCache = false;
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(16);
+      e.flushTimers();
+      eq(disk.diskCalls().length, 0, "★★ 关掉之后一次磁盘调用都没有");
+      eq(e.win.gaplessPlayer.diskStats().enabled, false, "★★ diskStats 也说不可用");
+      ok(/__gpDiskCache=false/.test(e.win.gaplessPlayer.diskStats().reason), "★★ 而且说清了为什么不可用");
+      eq(countLog(e, "[disk] 关闭"), 1, "★★ 开机只留一行「关闭 + 原因」（不再是「磁盘=0 首」的无头案）");
+      eq(countLog(e, "[disk] 自检"), 0, "★★ 关着就不做自检（不白写盘）");
+    }
+
+    // ---- (f) 清磁盘 ----
+    {
+      const disk = mkDiskFs();
+      const e = createEnv({ fs: disk });
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(16);
+      e.flushTimers();
+      const n0 = e.win.gaplessPlayer.diskStats().count;
+      ok(n0 >= 1, "（前提）盘上有 " + n0 + " 首");
+      eq(e.win.gaplessPlayer.clearDiskCache(), n0, "★★ clearDiskCache 返回清掉的条数");
+      await flush(8);
+      e.flushTimers();
+      eq(e.win.gaplessPlayer.diskStats().count, 0, "★★ 索引清空了");
+      eq(disk.dataPaths().length, 0, "★★ 数据文件也删了");
+    }
+
+    // ---- (g) 下载闸门：预载永远排在 N+2 前面（三路并发 → 串行）----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(16);
+      ok(countLog(e, "[preload] ★★ 预载就绪（下一首）") >= 1, "（前提）下一首预载完成");
+      ok(/\[dl\] ⏳ 抓 N\+2 的字节 排队/.test(e.logs()), "★★ N+2 的抓取排在「预载下一首」后面");
+      ok(e.logs().indexOf("预载下一首 排队") < 0, "★★ 预载自己从不排在别人后面（它有截止时间）");
+      // 串行 = 「一份跑完下一份」→ 预载就绪必须早于 N+2 备好
+      const iReady = e.logs().indexOf("★★ 预载就绪（下一首）");
+      const iN2 = e.logs().indexOf("[prefetch] ★ 字节已备好（N+2）");
+      ok(iReady >= 0 && iN2 >= 0 && iReady < iN2, "★★ 顺序正确：先预载就绪，再抓 N+2");
+    }
+
+    // ---- (h) 看门狗：一份卡死的传输不能把整条队列堵死 ----
+    {
+      const e = createEnv();
+      e.eapi.url = "http://cdn.example/hang.flac"; // 取到的地址永不自己返回
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      // ⚠️ 这里不用 playTrack：它末尾会 flushTimers()，把看门狗的定时器提前消费掉
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      await flush();
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-x",
+        { songId: 1000, musicurl: "http://cdn.example/d1000.flac" },
+      ]);
+      await flush(8);
+      const n0 = e.fetchLog.filter((u) => /hang/.test(u)).length;
+      eq(n0, 1, "（前提）预载卡在唯一那个永不返回的请求上（闸门被它占着）");
+      e.advance(31000); // 把假时钟推过看门狗阈值
+      e.flushTimers();
+      await flush(8);
+      e.flushTimers();
+      ok(countLog(e, "让后面先走") >= 1, "★★ 30s 没动静 → 放弃这一份，把闸门还回去");
+      const n1 = e.fetchLog.filter((u) => /hang/.test(u)).length;
+      ok(n1 > n0, "★★ 闸门放开之后，排队的抓取才真的开跑（" + n0 + " → " + n1 + "）");
+    }
+
+    // ---- (i) 3.x：权威时长拿不到 → 靠「字节数 == 接口声明」照样落盘 ----
+    {
+      const disk = mkDiskFs();
+      const BODY = {
+        data: [{ id: 1000, url: "http://cdn.example/320.mp3", br: 320000, size: 1024 * 1024, type: "mp3", fee: 0, payed: 1 }],
+      };
+      const e = env3x(BODY, undefined, { fs: disk, noDetail: true });
+      e.eapi.mode = "fail"; // 3.x：LibEAPI 那条路必然失败 → 走 320k 免签名接口
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(24);
+      e.flushTimers();
+      ok(countLog(e, "拿不到权威时长") >= 1, "★★ 拿不到时长时明确记一行（以前是静默 0 → 静默不落盘）");
+      ok(
+        countLog(e, "[disk] 已落盘") >= 1,
+        "★★ 但照样落盘了：字节数 1.00MB == 接口声明的大小（不依赖 song/detail）"
+      );
+      eq(e.win.gaplessPlayer.diskStats().count >= 1, true, "★★ 索引里确实有了");
+    }
+
+    // ---- (j) 开机自检失败（写不进去）→ 说清原因、不碰盘、播放照旧 ----
+    {
+      const disk = mkDiskFs();
+      const badFs = Object.assign({}, disk, {
+        writeFile() {
+          return Promise.resolve(false); // 目录不可写 / 权限不足
+        },
+      });
+      const e = createEnv({ fs: badFs });
+      e.boot();
+      await flush(8);
+      e.flushTimers();
+      ok(countLog(e, "[disk] ★ 自检失败") >= 1, "★★ 写不进去 → 开机第一屏就说清楚");
+      eq(e.win.gaplessPlayer.diskStats().enabled, false, "★★ 之后不再碰盘");
+      ok(/自检失败/.test(e.win.gaplessPlayer.diskStats().reason), "★★ 原因也记着（" + e.win.gaplessPlayer.diskStats().reason + "）");
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(16);
+      e.flushTimers();
+      ok(countLog(e, "★★ 预载就绪") >= 1, "★★ 磁盘不可用完全不影响预载与播放");
+    }
+
+    // ---- (k) 快到结尾就别「补成缓冲」了（真机白下 6.83MB） ----
+    {
+      // ⚠️ streamEnv/streamPlay 定义在第 50 段的块作用域里，这里自己来一遍
+      const e = createEnv();
+      delete e.win.__gpStream;
+      e.boot();
+      await flush();
+      e.channel.call("audioplayer.load", null, [
+        idOf(1000) + "-x",
+        { musicurl: "http://cdn.example/s9.flac", songId: 1000 },
+      ]);
+      e.audio.last.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush();
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush();
+      e.flushTimers();
+
+      e.advance(9000);
+      e.audio.last.currentTime = 185; // 只剩 15s
+      const f0 = e.fetchLog.length;
+      e.tick();
+      await flush(8);
+      e.flushTimers();
+      eq(countLog(e, "[promote] 流式那首已听"), 0, "★★ 只剩 15s → 不补（补出来也用不上）");
+      eq(e.fetchLog.length, f0, "★★ 一个字节都没多下");
+      e.audio.last.currentTime = 100; // 还剩 100s → 该补
+      e.tick();
+      await flush(8);
+      e.flushTimers();
+      ok(countLog(e, "[promote] 流式那首已听") >= 1, "★★ 离结尾还远时照常补");
+    }
+  }
+
+  /* ---------- 105. 用户手选跳歌不算「押错」 ---------- */
+  section("105. ★★★ v1.8.6/v1.8.7「谁把这首换走的」：只有「A 播完 + 客户端自己推进」才算检验");
+  {
+    // ---- (a) A 播到结尾、客户端自己挑了别的 → 这才是「押错」 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000); // 按顺序假设预载「下一首」= 2000
+      await playToEnd(e, 1000); // A 自然播完
+      await playTrack(e, 3000); // 客户端自己挑了 3000 → 押错
+      e.flushTimers();
+      ok(countLog(e, "✗ 预测失败 1/3") >= 1, "★★ A 播完 + 客户端自己推进 → 真的是押错");
+      eq(countLog(e, "上一首没播完就切走"), 0, "★★ 不会被误判成「用户跳歌」");
+    }
+
+    // ---- (b) A 播到一半就被切走（用户跳歌）→ 不作数 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000); // 预载下一首 2000
+      // 起播 3 秒后在歌中途被切走（真机 14:27:54：A 播到 16.9s/142.8s 被切）
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush(2);
+      e.ctx.currentTime += 3;
+      await playTrack(e, 3000);
+      e.flushTimers();
+      ok(countLog(e, "上一首没播完就切走") >= 1, "★★ 记成「上一首没播完就切走（用户跳歌）」");
+      eq(countLog(e, "✗ 预测失败"), 0, "★★ 押错计数一点都没涨");
+      // 之后 A 播完时的真正押错才计第 1 次
+      e.advance(5000);
+      await playToEnd(e, 3000);
+      e.advance(10);
+      await playTrack(e, 5000);
+      e.flushTimers();
+      ok(countLog(e, "✗ 预测失败 1/3") >= 1, "★★ 后面 A 播完那次才是第 1 次（前面那次确实没入账）");
+    }
+
+    // ---- (c) 客户端先发 stop（用户点下一首）→ 即使 A 刚好播完，也不作数 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await playToEnd(e, 1000); // A 播完
+      e.channel.call("audioplayer.stop", null, [idOf(1000) + "-x"]); // …但用户点了切歌
+      await playTrack(e, 3000);
+      e.flushTimers();
+      ok(countLog(e, "上一首没播完就切走") >= 1, "★★ 有 stop → 也不作数（用户手选）");
+      eq(countLog(e, "✗ 预测失败"), 0, "★★ 押错计数没涨");
+    }
+
+    // ---- (d) 连点三次「下一首」也不会把「预载下一首」关掉 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      const n0 = countLog(e, "开始预载（下一首）");
+      for (const n of [3000, 5000, 1000]) {
+        e.channel.call("audioplayer.stop", null, [idOf(n) + "-x"]);
+        await playTrack(e, n);
+      }
+      e.flushTimers();
+      eq(countLog(e, "停止预载下一首"), 0, "★★ 连点三次也不会被误判成「随机播放」→ 不关预载");
+      ok(
+        countLog(e, "开始预载（下一首）") >= n0 + 3,
+        "★★ 每次跳歌之后照常预载「下一首」（无缝的前提条件）"
+      );
+    }
+
+    // ---- (e) 端到端：手选跳歌之后，内部账本里的「顺序可预测」历史还在 ----
+    //      真机 14:27:54 / 13:56:00 就缺这一步：一次手选把 hitStreak 清零 →
+    //      随机模式下再也不敢预约（`maybeScheduleSeamless` 的门槛）→ 硬切 312/364ms。
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const pred = () => e.win.gaplessPlayer.predict();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000); // 预载下一首 2000
+      await playToEnd(e, 1000);
+      await playTrack(e, 2000); // 押中 → hitStreak ≥ 1
+      await flush(8);
+      ok(pred().hitStreak >= 1, "（前提）拿到一次「押中」，hitStreak=" + pred().hitStreak);
+      // 用户在歌中途跳到 3000（真机 14:27:54 那一跳）
+      e.channel.call("audioplayer.stop", null, [idOf(2000) + "-x"]);
+      await playTrack(e, 3000);
+      await flush(8);
+      ok(pred().hitStreak >= 1, "★★ 手选跳歌之后 hitStreak 仍然在（" + pred().hitStreak + "）");
+      eq(pred().misses, 0, "★★ misses 也没涨");
+      eq(pred().nextOff, false, "★★ 没被误判成「随机播放」→ 下一首的自然播完照样敢预约");
+    }
+  }
+
+  /* ---------- 106. 响度平衡 ---------- */
+  section("106. ★★★ v1.9.0~1.9.3 响度平衡（相对参考 + 峰值保护 + 上下限 + 数据兜底）");
+  {
+    /** 200s 的简单素材（160 BPM 打点、有真实电平），给「需要解码缓冲」的用例用 */
+    function mk200() {
+      const sr = 8000;
+      const secs = 200;
+      const n = sr * secs;
+      const d = new Float32Array(n);
+      for (let t = 0; t < secs; t += 0.375) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.05 && at + i < n; i++) {
+          d[at + i] += Math.exp(-i / (sr * 0.012)) * 0.5;
+        }
+      }
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+    }
+
+    // ---- (a) 绝对模式（__gpLoudRef="none"）：按接口给的 gain 直接施加 ----
+    {
+      const e = createEnv();
+      e.eapi.gain = -6; // 这首该压 6 dB
+      e.eapi.peak = 0.5;
+      e.win.__gpLoudRef = "none";
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush(8);
+      e.flushTimers();
+      const api = e.win.gaplessPlayer;
+      ok(countLog(e, "[loud] 归一化") >= 1, "★★ 播放时把归一化应用上了，并且留了日志");
+      ok(/归一化 track=1000 ｜ -6\.0 dB/.test(e.logs()), "★★ 日志写明是 -6.0 dB");
+      const st = api.loudness();
+      eq(st.enabled, true, "（前提）响度平衡开着");
+      eq(st.mode, "absolute", "★★ __gpLoudRef=none → 绝对模式");
+      ok(st.tracks >= 1, "★★ 有数据的曲目数（" + st.tracks + "）");
+      ok(st.applied >= 1, "★★ 应用次数 ≥ 1");
+      const one = api.loudnessOf(1000);
+      ok(!!one && Math.abs(one.appliedDb - -6) < 0.01, "★★ loudnessOf(1000) 的实际施加值是 -6 dB");
+    }
+
+    // ---- (b) 开关关掉 → 一点都不动 ----
+    {
+      const e = createEnv();
+      e.eapi.gain = -6;
+      e.win.__gpLoudness = false;
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush(8);
+      e.flushTimers();
+      eq(countLog(e, "[loud] 归一化"), 0, "★★ 关掉之后不做任何归一化");
+      eq(e.win.gaplessPlayer.loudness().enabled, false, "★★ stats 也说关着");
+    }
+
+    // ---- (c) 峰值保护：要提 12 dB 但峰值 0.99 → 到 -1dBFS 已没余量 → 不提 ----
+    {
+      const e = createEnv();
+      e.eapi.gain = 12;
+      e.eapi.peak = 0.99;
+      e.win.__gpLoudRef = "none";
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(8);
+      const one = e.win.gaplessPlayer.loudnessOf(1000);
+      ok(!!one && one.appliedDb <= 0, "★★ 峰值 0.99 时不给提音量（实际 " + (one ? one.appliedDb.toFixed(2) : "?") + " dB）");
+    }
+
+    // ---- (d) 峰值小 → 提到上限（+6 dB）为止 ----
+    {
+      const e = createEnv();
+      e.eapi.gain = 12;
+      e.eapi.peak = 0.2;
+      e.win.__gpLoudRef = "none";
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(8);
+      const one = e.win.gaplessPlayer.loudnessOf(1000);
+      ok(!!one && Math.abs(one.appliedDb - 6) < 0.01, "★★ 峰值只有 0.2 → 提到上限 +6 dB（不无限提）");
+    }
+
+    // ---- (e) 压的下限：要压 30 dB 也只压 12 dB ----
+    {
+      const e = createEnv();
+      e.eapi.gain = -30;
+      e.eapi.peak = 0.5;
+      e.win.__gpLoudRef = "none";
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(8);
+      const one = e.win.gaplessPlayer.loudnessOf(1000);
+      ok(!!one && Math.abs(one.appliedDb - -12) < 0.01, "★★ 最多只压 12 dB（实际 " + (one ? one.appliedDb.toFixed(2) : "?") + "）");
+    }
+
+    // ---- (f) 接口没给 gain（0.0 / 没有 url 那种）→ 安静不动 ----
+    {
+      const e = createEnv();
+      e.eapi.gain = 0;
+      e.win.__gpLoudRef = "none";
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush(8);
+      e.flushTimers();
+      eq(countLog(e, "[loud] 归一化"), 0, "★★ gain=0 → 不做任何调整（也不刷日志）");
+    }
+
+    /**
+     * (g) ★★★ v1.9.3 的核心：**相对参考**。
+     *     上一版直接施加接口给的 gain，于是「只有少数歌拿到数据」时，
+     *     拿到 -12 的那首被压 12 dB、其它原样 → 响度差反而更大（真机日志就是这个形态）。
+     *     现在只施加「相对本库中位数」的差值：整体音量不变，歌与歌之间才被拉平。
+     */
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      // 用公开的诊断入口直接喂三个测量值（不走网络 / 不依赖播放编排，测的就是「参考 + 相对」这件事）
+      // ⚠️ 2000 的 peak 给小一点（0.2）：要提 +4 dB 就不能让峰值顶到 -1dBFS 的天花板
+      api.noteLoudness(2000, { gain: -4, peak: 0.2 });
+      api.noteLoudness(3000, { gain: -8, peak: 0.6 });
+      api.noteLoudness(5000, { gain: -14, peak: 0.6 });
+      const st = api.loudness();
+      eq(st.mode, "relative", "★★ 默认是「相对参考」模式");
+      eq(st.tracks, 3, "★★ 三首都有数据（中位数才有意义）");
+      // 中位数：三首 -4/-8/-14 → -8
+      const ref = st.referenceDb;
+      ok(Math.abs(ref - -8) < 0.01, "★★ 参考 = 中位数 -8 dB（实际 " + ref + "）");
+      const a = api.loudnessOf(2000); // -4 → 相对参考 +4
+      const b = api.loudnessOf(3000); // -8 → 正好在参考上 → 0
+      const c = api.loudnessOf(5000); // -14 → 相对参考 -6
+      ok(!!a && Math.abs(a.appliedDb - 4) < 0.01, "★★ 偏响的那首 +4 dB（实际 " + (a ? a.appliedDb.toFixed(2) : "?") + "）");
+      ok(!!b && Math.abs(b.appliedDb) < 0.01, "★★ 中位数那首 0 dB（整体音量不变）");
+      ok(!!c && Math.abs(c.appliedDb - -6) < 0.01, "★★ 偏轻的那首 -6 dB（实际 " + (c ? c.appliedDb.toFixed(2) : "?") + "）");
+      ok(!!a && !!c && Math.abs(a.rawDb - c.rawDb) > 9, "★★ 原始差 10 dB、施加后都回到同一响度（这才是「拉平」）");
+      // 混来源：只有 volumeDelta 的一首（单样本组）会被扶到参考上 —— 不猜、也不捣乱
+      api.noteLoudness(4000, { delta: -50045 }); // → -5.00 dB
+      const d = api.loudnessOf(4000);
+      eq(!!d && d.src, "delta", "（前提）4000 的数据来自 volumeDelta");
+      ok(!!d && Math.abs(d.appliedDb) < 0.01, "★★ 单样本的另一来源会被对齐到参考（不瞎猜 +3 dB）");
+      ok(Math.abs(api.loudness().referenceDb - -8) < 0.01, "★★ 混来源之后参考仍是 -8（对齐没把参考带歪）");
+      // 绝对模式：同样的三个值，直接原样施加（这就是上一版「完全用不了」的形态）
+      e.win.__gpLoudRef = "none";
+      eq(api.loudness().mode, "absolute", "★★ __gpLoudRef=none → 绝对模式");
+      const cAbs = api.loudnessOf(5000);
+      ok(!!cAbs && Math.abs(cAbs.appliedDb - -12) < 0.01, "★★ 绝对模式下 -14 就直接压到上限 -12（对照）");
+    }
+
+    // ---- (h) 没有 gain 的曲子会去 song/detail 补 volumeDelta（不然它永远不参与） ----
+    {
+      const e = createEnv({
+        onNative(name, cb, args) {
+          if (name !== "network.fetch" || typeof cb !== "function") return;
+          const a0 = args && args[0];
+          const first = Array.isArray(a0) ? a0[0] || {} : a0 || {};
+          const u = String(first.url || "");
+          if (u.indexOf("/api/song/detail") >= 0) {
+            // 真机形态：hMusic.volumeDelta = -50045（量纲 1e-4 dB → -5.00 dB）
+            cb({ blob: JSON.stringify({ songs: [{ id: 0, duration: 200000, hMusic: { volumeDelta: -50045 } }] }) });
+          }
+        },
+      });
+      e.boot();
+      await flush();
+      const api = e.win.gaplessPlayer;
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      await flush(8);
+      e.flushTimers();
+      const one = api.loudnessOf(1000);
+      ok(!!one && one.rawDb !== null, "★★ 没有 gain 的曲子会去 song/detail 补到 volumeDelta（raw=" + (one ? one.rawDb : "?") + "）");
+      ok(!!one && one.src === "delta", "★★ 数据来源标成 delta（而不是假装有 gain）");
+      ok(!!one && Math.abs(one.rawDb - -5) < 0.01, "★★ 量纲对：-50045 → -5.00 dB（实际 " + (one ? one.rawDb : "?") + "）");
+    }
+
+    // ---- (i) 接口全都没数据 → 直接从解码缓冲量 RMS（不依赖网络） ----
+    {
+      // 和 (a) 同一条链路（起播时把缓冲交给响度那一级），只是不给 gain，
+      // 而且素材换成**有信号**的（默认假缓冲是全静音 —— 静音没有响度可量）
+      const e = createEnv({ decode: () => mk200() });
+      e.eapi.gain = null;
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e, 1000);
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush(8);
+      e.flushTimers();
+      const api = e.win.gaplessPlayer;
+      const st = api.loudness();
+      ok(st.fromRms >= 1, "★★ 没有接口数据时现场量了缓冲（fromRms=" + st.fromRms + "）");
+      const ids = [1000, 2000, 3000, 5000].filter((id) => {
+        const o = api.loudnessOf(id);
+        return !!o && o.src === "rms";
+      });
+      ok(ids.length >= 1, "★★ 至少一首的来源是 rms（" + ids.join(",") + "）");
+      const one = ids.length ? api.loudnessOf(ids[0]) : null;
+      ok(!!one && one.rawDb < 0, "★★ RMS 是个合理的负 dBFS（" + (one ? one.rawDb : "?") + " dBFS）");
+    }
+  }
+  /* ---------- 107. 交叉时长按乐句（整拍）量化 ---------- */
+  section("107. ★★ v1.9.1 交叉时长量化到整拍（让「淡多久」在音乐上成立）");
+  {
+    const e = createEnv();
+    e.boot();
+    await flush();
+    const api = e.win.gaplessPlayer;
+    const g = (bpm, conf) => ({ bpm, beatSec: 60 / bpm, anchorSec: 0, conf: conf === undefined ? 0.9 : conf });
+
+    // ---- (a) 整拍本来就是 3s（120bpm 的 6 拍）→ 不动 ----
+    eq(api.quantizeXfade(3, g(120)), 3, "★★ 120bpm 下 3s 正好 6 拍 → 不动");
+
+    // ---- (b) 不是整拍的 → 折到最近整拍（偏差 ≤15% 才换） ----
+    eq(api.quantizeXfade(2.6, g(120)), 2.5, "★★ 120bpm 下 2.6s → 2.5s（5 拍）");
+    eq(api.quantizeXfade(3, g(128)), 2.81, "★★ 128bpm 下 3s → 2.81s（6 拍）");
+    eq(api.quantizeXfade(10, g(128)), 9.84, "★★ 128bpm 下 10s → 9.84s（21 拍）");
+
+    // ---- (c) 差太多就不换（那是改设定，不是对齐） ----
+    eq(api.quantizeXfade(2, g(75)), 2, "★ 75bpm 下 2s 折成 2.4s（20%）→ 不换");
+    eq(api.quantizeXfade(1, g(40)), 1, "★ 慢速曲目下偏差大 → 不换");
+
+    // ---- (d) 拍点不可信 / 没有网格 → 一律不动 ----
+    eq(api.quantizeXfade(2.6, g(120, 0.1)), 2.6, "★★ 置信 0.1 → 不量化");
+    eq(api.quantizeXfade(2.6, null), 2.6, "★★ 没有网格 → 不量化");
+    eq(api.quantizeXfade(0, g(120)), 0, "★★ 没开交叉 → 原样返回 0");
+
+    // ---- (e) 上限 12s：折出来超过就放弃 ----
+    eq(api.quantizeXfade(12.5, g(128)), 12.5, "★★ 折出来 >12s → 不换（保持用户设的）");
+
+    // ---- (f) 接到调度上：真要按量化后的时长去排 ----
+    {
+      // 合成一条 120 BPM 的脉冲轨（和 89 段那套同思路：节拍是已知真值）
+      const sr = 8000;
+      const secs = 200;
+      const n = sr * secs;
+      const data = new Float32Array(n);
+      for (let t = 0; t < secs; t += 0.5) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      const click = {
+        duration: secs,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => data,
+      };
+      const e2 = await seamlessEnv("playorder", { hooks: { decode: () => click } });
+      e2.win.__gpXfade = 2.6; // 120bpm 下 2.6s 不是整拍 → 应折成 2.5s（5 拍）
+      setLeft(e2, 2.8);
+      e2.tick();
+      await flush();
+      e2.flushTimers();
+      ok(
+        countLog(e2, "交叉按乐句量化 2.60→2.50s") >= 1,
+        "★★ 调度时确实用了量化后的 2.50s（" + ((e2.logs().match(/交叉按乐句量化[^\n]*/) || ["?"])[0]) + "）"
+      );
+      // ⚠️ 量化之后还有「起点吸拍」那一刀（把交叉起点挪到最近一拍），它会再动 ≤ 半拍
+      const mf = e2.logs().match(/交叉=(\d+\.\d\d)s/);
+      ok(
+        !!mf && Math.abs(Number(mf[1]) - 2.5) <= 0.06,
+        "★★ 预约日志里的交叉时长 ≈ 量化后的 2.50s（实际 " + (mf ? mf[1] : "?") + "s，吸拍会再挪 ≤半拍）"
+      );
+    }
+  }
+
+  /* ---------- 108. 头尾 BPM 的「互相印证 / 八度关系」 ---------- */
+  section("108. ★★ v1.9.2 头尾 BPM 收敛：一致就互证、整数倍算同一速度");
+  {
+    /** 造一条「前 20s 打 A 拍、后 20s 打 B 拍」的素材（中间留空） */
+    function mkTwoTempo(headBpm, tailBpm) {
+      const sr = 8000;
+      const secs = 180;
+      const n = sr * secs;
+      const d = new Float32Array(n);
+      function clicks(fromSec, toSec, bpm) {
+        const beat = 60 / bpm;
+        for (let t = fromSec; t < toSec; t += beat) {
+          const at = Math.round(t * sr);
+          for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+            d[at + i] += Math.exp(-i / (sr * 0.008)) * 0.9;
+          }
+        }
+      }
+      clicks(0.3, 20, headBpm);
+      clicks(secs - 22, secs - 0.5, tailBpm);
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+    }
+
+    // ---- (a) 头尾一致 → 置信互证（两个独立窗口测出同一个速度，本身就是证据） ----
+    {
+      const e1 = createEnv({ decode: () => mkTwoTempo(120, 120) });
+      e1.boot();
+      await flush();
+      e1.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e1, 1000);
+      await flush(8);
+      e1.flushTimers();
+      const g = e1.win.gaplessPlayer.beatGrid(1000);
+      ok(!!g.head && !!g.tail, "（前提）头/尾两个窗口都算出来了");
+      eq(!!g.tail && g.tail.tempoAgree, true, "★★ 头尾一致 → 标记 tempoAgree");
+      ok(
+        g.head && g.tail && g.tail.conf >= Math.max(g.head.conf, 0.1),
+        "★★ 而且置信被互证抬高（头 " + (g.head ? g.head.conf.toFixed(2) : "?") + " / 尾 " + (g.tail ? g.tail.conf.toFixed(2) : "?") + "）"
+      );
+    }
+
+    // ---- (b) 头 170 / 尾 85 = 同一速度的不同拍级 → 不该被判成「测错」 ----
+    //      ⚠️ 这段音频**测不出来** 85：检测器会把 <80 的折上去（80 → 160），
+    //      所以这条分支改用纯函数 `reconcileGrids` 直接喂人造网格来验（见 (d)）。
+    //      真机上「尾 85.0 vs 头 160.1」是同一个原因（半速误判），容差因此放到 8%。
+    {
+      const e2 = createEnv({ decode: () => mkTwoTempo(170, 85) });
+      e2.boot();
+      await flush();
+      e2.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e2, 1000);
+      await flush(8);
+      e2.flushTimers();
+      const g = e2.win.gaplessPlayer.beatGrid(1000);
+      ok(!!g.tail && Math.abs(g.tail.bpm - (g.head ? g.head.bpm : 0)) < 1, "★★ 尾巴的 BPM 取头窗（170）");
+      ok(!!g.tail && g.tail.conf >= 0.25, "★★ 置信仍可用（conf=" + (g.tail ? g.tail.conf.toFixed(2) : "?") + "）");
+    }
+
+    // ---- (d) 直接喂人造网格：三条分支（一致 / 整数倍 / 真不一致） ----
+    {
+      const e4 = createEnv();
+      e4.boot();
+      await flush();
+      const rg = e4.win.gaplessPlayer.reconcileGrids;
+      const gH = (bpm, conf) => ({ bpm, beatSec: 60 / bpm, anchorSec: 0.11, conf, dur: 200 });
+      const gT = (bpm, conf) => ({ bpm, beatSec: 60 / bpm, anchorSec: 0.23, conf, dur: 200 });
+
+      const t1 = gT(128, 0.4);
+      const r1 = rg(gH(128, 0.6), t1);
+      eq(r1.status, "agree", "★★ 一致 → agree");
+      ok(t1.conf > 0.6, "★★ 而且置信被互证抬高到 " + t1.conf.toFixed(2) + "（>头窗 0.60）");
+      eq(t1.tempoAgree, true, "★★ 打上 tempoAgree");
+
+      const t2 = gT(85, 0.5);
+      const r2 = rg(gH(160.1, 0.6), t2); // 真机那一对：85 vs 160.1
+      eq(r2.status, "octave", "★★ 85 vs 160.1（差 6%）→ 判定为整数倍拍级");
+      eq(r2.ratio, 2, "★★ 倍数是 2");
+      ok(Math.abs(t2.bpm - 160.1) < 0.01, "★★ BPM 取头窗");
+      eq(t2.tempoOctave, 2, "★★ 打上 tempoOctave");
+      ok(t2.conf >= 0.25, "★★ 置信仍可用（" + t2.conf.toFixed(2) + "）");
+
+      const t3 = gT(90, 0.5);
+      const r3 = rg(gH(120, 0.6), t3);
+      eq(r3.status, "mismatch", "★★ 120 vs 90 不是整数倍 → mismatch");
+      eq(!!t3.tempoOctave, false, "★★ 不误标整数倍");
+      ok(t3.conf >= 0.2 && t3.conf <= 0.7, "★★ 置信打折但活着（" + t3.conf.toFixed(2) + "）");
+
+      eq(rg(null, t1).status, "none", "★★ 缺网格 → none");
+    }
+
+    // ---- (c) 真不一致（120 vs 90）→ 按头窗外推，置信打折但活着 ----
+    {
+      const e3 = createEnv({ decode: () => mkTwoTempo(120, 90) });
+      e3.boot();
+      await flush();
+      e3.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      await playTrack(e3, 1000);
+      await flush(8);
+      e3.flushTimers();
+      const g = e3.win.gaplessPlayer.beatGrid(1000);
+      eq(!!g.tail && g.tail.tempoFromHead, true, "★★ 真不一致 → tempoFromHead");
+      eq(!!g.tail && !!g.tail.tempoOctave, false, "★★ 也不该被误判成整数倍关系");
+      ok(!!g.tail && g.tail.conf >= 0.2, "★★ 置信不低于 0.2（还能参与对齐）");
+    }
+  }
+
+  /* ---------- 109. A 提前收尾 ---------- */
+  section("109. ★★★ v1.9.2 A 提前收尾（乐句头/掉点处结束 A，而不是「放完才开始淡」）");
+  {
+    /** 造一条「结尾前掉能量」的 200s 素材（outro 掉点可被找到），中间带 120 BPM 打点 */
+    function mkOutroTrack() {
+      const sr = 8000;
+      const secs = 200;
+      const n = sr * secs;
+      const d = new Float32Array(n);
+      const beat = 60 / 120;
+      // 铺一条连续的低音（outro 能量检测是看 RMS 包络的）+ 120 BPM 打点
+      for (let o = 0; o < n; o++) {
+        const t = o / sr;
+        d[o] = Math.sin((2 * Math.PI * 180 * o) / sr) * (t < 192 ? 0.28 : 0.04);
+      }
+      for (let t = 0; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        const amp = t < 192 ? 0.9 : 0.08; // 192s 掉能量（落在「交叉起点前 5s」附近）
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          d[at + i] += Math.exp(-i / (sr * 0.008)) * amp;
+        }
+      }
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+    }
+
+    // ---- (a) 默认开：结束时刻被提前到掉点/乐句上，而且 A 的 source 被 stop 在那个时刻 ----
+    {
+      const track = mkOutroTrack();
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => track } });
+      const drop = e.win.gaplessPlayer.outroDrop(1000, track, 200);
+      ok(drop !== null, "（前提）能找到 outro 掉点（" + (drop === null ? "没找到" : Number(drop).toFixed(1) + "s") + "）");
+      e.win.__gpXfade = 3;
+      // ★ v1.9.2：提前收尾要求「调度窗口开得够早」—— 要少播 5s，就得在还剩 ~8s 时就开始考虑。
+      //   （窗口在 earlyOut 打开时会自动放宽到 xf + EARLY_OUT_MAX_SEC）
+      setLeft(e, 10);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      const mEnds = e.logs().match(/结束 at=\d+\.\d+/g);
+      const mEnd = mEnds && mEnds.length ? Number(mEnds[mEnds.length - 1].match(/(\d+\.\d+)/)[1]) : 0;
+      ok(mEnd > 0 && mEnd < 199.9, "★★ 结束时刻早于自然结尾（" + mEnd.toFixed(2) + "s < 200s）");
+      ok(/A 提前收尾（outro 掉点）/.test(e.logs()), "★★ 而且是按「outro 掉点」收的（不是随便一刀）");
+      // A 的 source 应该被 stop 排在了那个结束时刻（而不是自然结束）
+      const aNode = e.started[0] && e.started[0].node;
+      ok(
+        !!aNode && typeof aNode.__stopAt === "number" && Math.abs(aNode.__stopAt - mEnd) < 0.01,
+        "★★ A 的 source 被 stop 在排定的结束时刻（" +
+          (aNode && aNode.__stopAt !== undefined ? Number(aNode.__stopAt).toFixed(3) : "未排") + "s）"
+      );
+      // 而且少播的秒数有上限（EARLY_OUT_MAX_SEC = 8）
+      const mCut = e.logs().match(/少播 (\d+\.\d\d)s/);
+      ok(!!mCut && Number(mCut[1]) <= 8.01, "★★ 少播的秒数受上限约束（" + (mCut ? mCut[1] : "?") + "s ≤ 8s）");
+    }
+
+    // ---- (b) 关掉开关 → 结束时刻仍然是自然结尾，A 的 source 不被提前 stop ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkOutroTrack() } });
+      e.win.__gpXfade = 3;
+      e.win.__gpEarlyOut = false;
+      setLeft(e, 3.2);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      eq(countLog(e, "A 提前收尾"), 0, "★★ __gpEarlyOut=false → 不提前收尾");
+      const mEnds = e.logs().match(/结束 at=\d+\.\d+/g);
+      const mEnd = mEnds && mEnds.length ? Number(mEnds[mEnds.length - 1].match(/(\d+\.\d+)/)[1]) : 0;
+      ok(Math.abs(mEnd - 200.02) < 0.05, "★★ 结束时刻还是自然结尾（" + mEnd.toFixed(2) + "s）");
+      const aNode = e.started[0] && e.started[0].node;
+      eq(aNode && aNode.__stopAt === undefined, true, "★★ A 的 source 也没被提前 stop");
+    }
+  }
+
+  /* ---------- 110. 拍点/能量离线缓存 ---------- */
+  section("110. ★★★ v1.10.0 拍点/能量离线缓存（流式 A 也能按 BPM 对齐）");
+  {
+    const ANALYSIS_PATH = "C:\\betterncm\\gapless-cache\\analysis.json";
+
+    /** 假磁盘（挑磁盘字节缓存 / 离线分析真正用到的那几个方法） */
+    function mkDiskFs() {
+      const files = new Map();
+      const calls = [];
+      return {
+        calls,
+        files,
+        readFileText(p) {
+          calls.push(["readFileText", String(p)]);
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(String(files.get(String(p))));
+        },
+        writeFileText(p, txt) {
+          calls.push(["writeFileText", String(p)]);
+          files.set(String(p), String(txt));
+          return Promise.resolve(true);
+        },
+        readFile(p) {
+          calls.push(["readFile", String(p)]);
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(files.get(String(p)));
+        },
+        writeFile(p, blob) {
+          calls.push(["writeFile", String(p)]);
+          const ab = blob && blob.parts ? blob.parts[0] : null;
+          if (!ab) return Promise.resolve(false);
+          files.set(String(p), ab);
+          return Promise.resolve(true);
+        },
+        remove(p) {
+          calls.push(["remove", String(p)]);
+          files.delete(String(p));
+          return Promise.resolve(true);
+        },
+        mkdir() {
+          calls.push(["mkdir", "gapless-cache"]);
+          return Promise.resolve(true);
+        },
+        countOf(name) {
+          return calls.filter((c) => c[0] === name).length;
+        },
+      };
+    }
+
+    /** 合成节拍轨（同 89 段：节拍是已知真值，能断言检测结果） */
+    function mkClick(opts) {
+      const sr = opts.sr || 8000;
+      const bpm = opts.bpm;
+      const secs = opts.secs || 200;
+      const n = Math.round(secs * sr);
+      const data = new Float32Array(n);
+      const beat = 60 / bpm;
+      for (let t = 0; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      for (let i = 0; i < n; i++) data[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+      return {
+        duration: secs,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => data,
+      };
+    }
+
+    // ---- (a) 解码 / 调度后自动落盘（含能量曲线）----
+    const disk = mkDiskFs();
+    const e = await seamlessEnv("playorder", { hooks: { fs: disk, decode: () => mkClick({ bpm: 120 }) } });
+    e.win.__gpXfade = 3;
+    setLeft(e, 3.2);
+    e.tick();
+    await flush(16);
+    e.flushTimers();
+    await flush(16);
+    e.flushTimers();
+    await flush(16);
+
+    ok(disk.files.has(ANALYSIS_PATH), "★★ 解码后把拍点落盘成 analysis.json");
+    let o = null;
+    try {
+      o = JSON.parse(String(disk.files.get(ANALYSIS_PATH) || ""));
+    } catch (err) {
+      o = null;
+    }
+    ok(!!o && o.v === 1, "★★ 带版本号 v=1（算法改了能整批作废）");
+    const ids = o && o.items ? Object.keys(o.items) : [];
+    ok(ids.length >= 1, "★★ 至少存了一首（" + ids.length + " 首）");
+    const rec = (o && o.items && (o.items["2000"] || o.items["1000"])) || null;
+    ok(
+      !!rec && !!rec.head && rec.head.bpm > 0,
+      "★★ 头窗网格在（bpm=" + (rec && rec.head ? rec.head.bpm.toFixed(1) : "?") + "）"
+    );
+    ok(!!rec && !!rec.tail && rec.tail.bpm > 0, "★★ 尾窗网格在");
+    ok(!!rec && !!rec.tail && typeof rec.tail.endBeatSec === "number", "★★ 末拍位置也在（接缝要用）");
+    ok(
+      ids.some((k) => o.items[k] && o.items[k].energy),
+      "★★ 能量曲线也存了（流式 A 的 outro 掉点靠它）"
+    );
+    ok(
+      String(disk.files.get(ANALYSIS_PATH)).length < 20000,
+      "★★ 整份文件很小（" + String(disk.files.get(ANALYSIS_PATH)).length + " 字节，不是 MB）"
+    );
+
+    // ---- (b) 「重启」：不解码也能拿到网格 ----
+    const e2 = createEnv({ fs: disk });
+    e2.boot();
+    await flush(16);
+    e2.flushTimers();
+    const st2 = e2.win.gaplessPlayer.analysisStats();
+    ok(st2.enabled && st2.loaded, "★★ 重启后读回离线分析（" + st2.count + " 首）");
+    ok(st2.count >= 1, "★★ 索引里有条目");
+    ok(countLog(e2, "[analysis] 读回离线分析") >= 1, "★★ 日志写明了读回几首");
+    const gh = e2.win.gaplessPlayer.beatGrid(2000);
+    const gt = e2.win.gaplessPlayer.beatGrid(1000);
+    ok(
+      !!gh.head && gh.head.bpm > 0,
+      "★★ 不解码也能拿到 2000 的头窗网格（bpm=" + (gh.head ? gh.head.bpm.toFixed(1) : "?") + "）"
+    );
+    ok(!!gt.tail && gt.tail.bpm > 0, "★★ 不解码也能拿到 1000 的尾窗网格");
+    const plan2 = e2.win.gaplessPlayer.mixPlan(gt.tail || null, gh.head || null);
+    ok(plan2.tier !== "plain", "★★ 两边网格都在 → mixPlan 不再是 plain（" + plan2.tier + "）");
+    // ★ v1.15.0：清分析
+    const cleared = e2.win.gaplessPlayer.clearAnalysis();
+    eq(cleared, 2, "★★ 清分析返回清掉的条数");
+    eq(e2.win.gaplessPlayer.analysisStats().count, 0, "★★ 清完记录数为 0");
+
+    // ---- (c) 版本不符 → 整批作废 ----
+    if (o) {
+      const bad = JSON.parse(JSON.stringify(o));
+      bad.v = 999;
+      const disk3 = mkDiskFs();
+      disk3.files.set(ANALYSIS_PATH, JSON.stringify(bad));
+      const e3 = createEnv({ fs: disk3 });
+      e3.boot();
+      await flush(16);
+      e3.flushTimers();
+      eq(e3.win.gaplessPlayer.analysisStats().count, 0, "★★ 版本不符 → 整批作废（不复用旧网格）");
+      ok(countLog(e3, "版本不符") >= 1, "★★ 而且日志说清楚了");
+    }
+
+    // ---- (d) 时长对不上（试听片段 / 换音质）→ 该条作废重算 ----
+    if (o && o.items && o.items["1000"]) {
+      const bad2 = JSON.parse(JSON.stringify(o));
+      bad2.items["1000"].dur = 100;
+      if (bad2.items["1000"].head) bad2.items["1000"].head.dur = 100;
+      if (bad2.items["1000"].tail) bad2.items["1000"].tail.dur = 100;
+      const disk4 = mkDiskFs();
+      disk4.files.set(ANALYSIS_PATH, JSON.stringify(bad2));
+      const e4 = await seamlessEnv("playorder", { hooks: { fs: disk4, decode: () => mkClick({ bpm: 120 }) } });
+      await flush(16);
+      ok(countLog(e4, "缓存时长对不上") >= 1, "★★ 缓存时长对不上 → 丢掉重算（试听片段不会污染）");
+      const q = e4.win.gaplessPlayer.analysisOf(1000);
+      ok(!q || Math.abs(q.dur - 200) < 1, "★★ 重算后这条记录的时长被修正");
+    }
+
+    // ---- (e) 开关 ----
+    const e5 = createEnv({ fs: mkDiskFs() });
+    e5.win.__gpAnalysis = false;
+    e5.boot();
+    await flush(16);
+    eq(e5.win.gaplessPlayer.analysisStats().enabled, false, "★★ __gpAnalysis=false → 关闭");
+    eq(e5.win.gaplessPlayer.analysisStats().count, 0, "★★ 也一个条目都不读");
+
+    // ---- (f) 真·集成：**流式 A** + 落盘的网格 → automix 拿到 A 的 BPM ----
+    {
+      // 给「从没预载过的那首 3000」也塞一份分析结果（同一套 120bpm / 200s）
+      if (o && o.items && o.items["1000"]) {
+        const withExtra = JSON.parse(JSON.stringify(o));
+        withExtra.items["3000"] = JSON.parse(JSON.stringify(withExtra.items["1000"]));
+        disk.files.set(ANALYSIS_PATH, JSON.stringify(withExtra));
+      }
+      const e6 = createEnv({ fs: disk, decode: () => mkClick({ bpm: 120 }) });
+      delete e6.win.__gpStream; // 允许走 <audio>（A 没有 AudioBuffer）
+      e6.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode: "playorder" }));
+      e6.boot();
+      await flush(16);
+      e6.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      // 列表索引停在 1000（下一首 = 2000，会被预载成缓冲）；但**加载的是 3000**，
+      // 它从没被预载过 → 必然走流式。这正是真机日志里「来源=流式」的形态。
+      e6.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      e6.channel.call("audioplayer.load", null, [
+        idOf(3000) + "-x",
+        { songId: 3000, musicurl: "http://cdn.example/stream-a.flac" },
+      ]);
+      await flush(16);
+      const el = e6.audio.last;
+      if (el) {
+        el.duration = 200;
+        e6.audio.emit("loadedmetadata");
+        await flush(16);
+        e6.channel.call("audioplayer.play", () => {}, [idOf(3000) + "-x", "t|resume|T"]);
+        await flush(16);
+        e6.win.__gpXfade = 3;
+        el.currentTime = 196.8; // 还剩 3.2s
+        e6.tick();
+        await flush(16);
+        e6.flushTimers();
+      }
+      if (process.env.GP_DBG110) console.log(e6.logs().split("\n").slice(-50).join("\n"));
+      if (!el) {
+        ok(false, "（前提）A 应该走流式建 <audio>（实际没有）");
+      } else {
+        ok(/来源=流式/.test(e6.logs()), "（前提）A 确实在走流式（没有 AudioBuffer）");
+        ok(
+          countLog(e6, "[automix] A=120.0bpm") >= 1,
+          "★★★ 流式 A + 离线分析 → automix 拿到了 A 的 BPM（不再 A=无）"
+        );
+        eq(countLog(e6, "A=无"), 0, "★★ 而且一次 A=无 都没有");
+        ok(
+          countLog(e6, "outro 掉点") + countLog(e6, "拍点对齐") + countLog(e6, "A 提前收尾") >= 1,
+          "★★ 混音点也落到了音乐点上（能量曲线来自离线分析）"
+        );
+      }
+    }
+  }
+
+  /* ---------- 111. 补算（P2） ---------- */
+  section("111. ★★★ v1.11.0 补算：盘上有字节、没分析过的歌，空闲时补出记录");
+  {
+    const ANALYSIS_PATH = "C:\\betterncm\\gapless-cache\\analysis.json";
+    const INDEX_PATH = "C:\\betterncm\\gapless-cache\\index.json";
+
+    function mkDiskFs() {
+      const files = new Map();
+      const calls = [];
+      return {
+        calls,
+        files,
+        readFileText(p) {
+          calls.push(["readFileText", String(p)]);
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(String(files.get(String(p))));
+        },
+        writeFileText(p, txt) {
+          calls.push(["writeFileText", String(p)]);
+          files.set(String(p), String(txt));
+          return Promise.resolve(true);
+        },
+        readFile(p) {
+          calls.push(["readFile", String(p)]);
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(files.get(String(p)));
+        },
+        writeFile(p, blob) {
+          calls.push(["writeFile", String(p)]);
+          const ab = blob && blob.parts ? blob.parts[0] : null;
+          if (!ab) return Promise.resolve(false);
+          files.set(String(p), ab);
+          return Promise.resolve(true);
+        },
+        remove(p) {
+          calls.push(["remove", String(p)]);
+          files.delete(String(p));
+          return Promise.resolve(true);
+        },
+        mkdir() {
+          return Promise.resolve(true);
+        },
+        countOf(name) {
+          return calls.filter((c) => c[0] === name).length;
+        },
+      };
+    }
+
+    /** 节拍轨（同 89/110 段：节拍是已知真值） */
+    function mkClick(opts) {
+      const sr = 8000;
+      const secs = (opts && opts.secs) || 200;
+      const bpm = (opts && opts.bpm) || 120;
+      const n = Math.round(secs * sr);
+      const data = new Float32Array(n);
+      const beat = 60 / bpm;
+      for (let t = 0; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      for (let i = 0; i < n; i++) data[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+      return {
+        duration: secs,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => data,
+      };
+    }
+
+    /** 往假盘里塞 index.json + 每首的数据文件（ArrayBuffer） */
+    function seedDisk(disk, entries) {
+      const items = {};
+      for (const e of entries) {
+        const path = "C:\\betterncm\\gapless-cache\\" + e.id + ".mp3";
+        if (e.missing) {
+          // 只在索引里，盘上没有 → 走「读不出来 → diskDrop」分支
+          items[e.id] = { f: path, size: 1000, at: e.at };
+          continue;
+        }
+        const buf = new ArrayBuffer(1000);
+        disk.files.set(path, buf);
+        items[e.id] = { f: path, size: 1000, at: e.at };
+      }
+      disk.files.set(INDEX_PATH, JSON.stringify({ v: 1, items }));
+    }
+
+    function backfillEnv(disk, opts) {
+      opts = opts || {};
+      const e = createEnv({ fs: disk, decode: opts.decode || (() => mkClick({ bpm: 120 })) });
+      e.win.__gpBackfillDelay = 0;
+      e.win.__gpBackfillGap = 0;
+      e.win.__gpBackfillMax = 20;
+      e.boot();
+      return e;
+    }
+
+    async function drive(e, times) {
+      const api = e.win.gaplessPlayer;
+      const out = [];
+      for (let i = 0; i < times; i++) {
+        out.push(await api.backfill());
+        await flush(8);
+      }
+      return out;
+    }
+
+    // ---- (a) 覆盖率 + 顺序 + noTouch + 幂等 ----
+    {
+      const disk = mkDiskFs();
+      seedDisk(disk, [
+        { id: 1000, at: 1000 },
+        { id: 2000, at: 2000 },
+        { id: 3000, at: 3000 },
+      ]);
+      const e = backfillEnv(disk);
+      await flush(16);
+      eq(e.win.gaplessPlayer.analysisStats().pending, 3, "（前提）队列里有 3 首");
+      await drive(e, 3);
+      e.flushTimers();
+      await flush(16);
+
+      const st = e.win.gaplessPlayer.analysisStats();
+      eq(st.done, 3, "★★ 三首都补完了");
+      eq(st.pending, 0, "★★ 队列清空");
+      eq(st.count, 3, "★★ 分析记录也是 3 份");
+      eq(e.decoded.length, 3, "★★ 每首只解码一次");
+      const order = (e.logs().match(/\[backfill\] 开始 ｜ track=(\d+)/g) || []).map((s) => s.match(/track=(\d+)/)[1]);
+      eq(order, ["3000", "2000", "1000"], "★★ 顺序是最近用过的先补（at 新→旧）");
+      eq(countLog(e, "[disk] 维护读取"), 3, "★★ 补算读盘走「维护读取」");
+      eq(countLog(e, "[disk] ★ 命中"), 0, "★★ 而且不刷新 LRU（没有一次「命中」）");
+      eq(e.started.length, 0, "★★ 补算完全不碰播放（一个 source 都没建）");
+
+      // 幂等：再催一次不该再解码
+      const d0 = e.decoded.length;
+      await drive(e, 2);
+      eq(e.decoded.length, d0, "★★ 记录已完整 → 再跑也不解码（幂等）");
+      e.flushTimers();
+      await flush(8);
+      ok(countLog(e, "[backfill] 队列已空") >= 1, "★★ 队列空了会明说");
+    }
+
+    // ---- (b) 完整记录不入队；默认 15s 内不自动跑 ----
+    {
+      const disk = mkDiskFs();
+      seedDisk(disk, [
+        { id: 4000, at: 1000 },
+        { id: 5000, at: 2000 },
+      ]);
+      // 4000 已经有完整记录（三个字段齐 + 已经是当代 w:3/tried:3）→ 不该再被补
+      disk.files.set(
+        ANALYSIS_PATH,
+        JSON.stringify({
+          v: 1,
+          items: {
+            4000: {
+              dur: 200,
+              at: 1,
+              w: 3,
+              tried: 3,
+              head: { bpm: 120, beatSec: 0.5, anchorSec: 0, conf: 0.8, dur: 200 },
+              tail: { bpm: 120, beatSec: 0.5, anchorSec: 0, endBeatSec: 200, conf: 0.8, dur: 200 },
+              energy: "AQID",
+            },
+          },
+        })
+      );
+      const e = backfillEnv(disk);
+      await flush(16);
+      eq(e.win.gaplessPlayer.analysisStats().pending, 1, "★★ 完整记录不计入队列（只剩 5000）");
+
+      // 自动节奏：默认 15s 起步 → 这一拍 tick 不该动
+      e.win.__gpBackfillDelay = 15000;
+      e.tick();
+      await flush(16);
+      eq(e.win.gaplessPlayer.analysisStats().done, 0, "★★ 开机 15s 内不自动补算");
+
+      await drive(e, 2);
+      const logs = e.logs();
+      ok(!/\[backfill\] 开始 ｜ track=4000/.test(logs), "★★ 完整记录那首确实没被补");
+      eq(e.decoded.length, 1, "★★ 只补了缺记录的那首");
+    }
+
+    // ---- (c) 坏字节 → skip + 从磁盘索引删掉 + 不反复重试 ----
+    {
+      const disk = mkDiskFs();
+      seedDisk(disk, [
+        { id: 6000, at: 2000, missing: true },
+        { id: 7000, at: 1000 },
+      ]);
+      const e = backfillEnv(disk);
+      await flush(16);
+      await drive(e, 3);
+      e.flushTimers();
+      await flush(16);
+
+      const st = e.win.gaplessPlayer.analysisStats();
+      eq(st.skip, 1, "★★ 坏字节记进 skip 表");
+      eq(st.done, 1, "★★ 另一首正常补完");
+      eq(e.decoded.length, 1, "★★ 坏的那首没进解码");
+      ok(countLog(e, "[backfill] ★ 失败") >= 1, "★★ 失败有日志");
+      const idx = JSON.parse(String(disk.files.get(INDEX_PATH)));
+      eq(idx.items["6000"], undefined, "★★ 读不出来的条目已从磁盘索引删掉（diskDrop）");
+      eq(!!idx.items["7000"], true, "★★ 好的那首还在");
+    }
+  }
+
+  /* ---------- 112. 多窗融合（P3） ---------- */
+  section("112. ★★★ v1.12.0 多窗融合：头/中/尾三窗取中位数，治半速误判与半残前奏");
+  {
+    const ANALYSIS_PATH = "C:\\betterncm\\gapless-cache\\analysis.json";
+    const INDEX_PATH = "C:\\betterncm\\gapless-cache\\index.json";
+
+    function mkDiskFs() {
+      const files = new Map();
+      return {
+        files,
+        readFileText(p) {
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(String(files.get(String(p))));
+        },
+        writeFileText(p, txt) {
+          files.set(String(p), String(txt));
+          return Promise.resolve(true);
+        },
+        readFile(p) {
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(files.get(String(p)));
+        },
+        writeFile(p, blob) {
+          const ab = blob && blob.parts ? blob.parts[0] : null;
+          if (!ab) return Promise.resolve(false);
+          files.set(String(p), ab);
+          return Promise.resolve(true);
+        },
+        remove(p) {
+          files.delete(String(p));
+          return Promise.resolve(true);
+        },
+        mkdir() {
+          return Promise.resolve(true);
+        },
+      };
+    }
+
+    function seedDisk(disk, ids) {
+      const items = {};
+      for (const id of ids) {
+        const path = "C:\\betterncm\\gapless-cache\\" + id + ".mp3";
+        disk.files.set(path, new ArrayBuffer(1000));
+        items[id] = { f: path, size: 1000, at: 100 + id };
+      }
+      disk.files.set(INDEX_PATH, JSON.stringify({ v: 1, items }));
+    }
+
+    /** 分层合成轨：噪声底 + 若干段「四拍一响」 */
+    function mkLayered(opts) {
+      const sr = 8000;
+      const secs = opts.secs || 200;
+      const n = secs * sr;
+      const data = new Float32Array(n);
+      let seed = 7;
+      const rnd = () => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed / 0x7fffffff - 0.5;
+      };
+      for (let i = 0; i < n; i++) data[i] = rnd() * 0.02;
+      for (const seg of opts.segments) {
+        const beat = 60 / seg.bpm;
+        for (let t = seg.from; t < seg.to; t += beat) {
+          const at = Math.round(t * sr);
+          for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+            data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+          }
+        }
+      }
+      return {
+        duration: secs,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => data,
+      };
+    }
+
+    function envFor(trackId, ab) {
+      const disk = mkDiskFs();
+      seedDisk(disk, [trackId]);
+      const e = createEnv({ fs: disk, decode: () => ab });
+      e.win.__gpBackfillDelay = 0;
+      e.win.__gpBackfillGap = 0;
+      e.boot();
+      return e;
+    }
+
+    async function one(e) {
+      const r = await e.win.gaplessPlayer.backfill();
+      await flush(8);
+      return r;
+    }
+
+    // ---- (a) 头窗测歪（0~20s 是 90 BPM）→ 融合取 120，相位借中窗外推 ----
+    {
+      const ab = mkLayered({
+        segments: [
+          { from: 0, to: 20, bpm: 90 },
+          { from: 20, to: 200, bpm: 120 },
+        ],
+      });
+      const e = envFor(8100, ab);
+      await flush(16);
+      const single = e.win.gaplessPlayer.beat(ab, 0, 20);
+      await one(e);
+      const rec = e.win.gaplessPlayer.analysisOf(8100);
+      if (process.env.GP_DBG112) {
+        console.log("DBG112a single=", single && { bpm: single.bpm, conf: single.conf }, "rec=", rec && { w: rec.w, head: rec.head, tail: rec.tail });
+      }
+      ok(!!single && Math.abs(single.bpm - 90) < 5, "（前提）头窗单窗测成 90 BPM（" + (single ? single.bpm.toFixed(1) : "?") + "）");
+      ok(!!rec && rec.w === 3, "★★ 三窗参与 → w=3（融合版）");
+      ok(!!rec && rec.head && Math.abs(rec.head.bpm - 120) < 3, "★★ 头窗 BPM 被别人拉回 120");
+      const beatA = rec && rec.head ? 60 / rec.head.bpm : 0.5;
+      const offA = rec && rec.head ? ((rec.head.anchorSec % beatA) + beatA) % beatA : 9;
+      ok(
+        Math.min(offA, beatA - offA) < 0.03,
+        "★★ 头窗锚点落在融合网格上（相位借中窗外推，误差 " + (Math.min(offA, beatA - offA) * 1000).toFixed(0) + "ms）"
+      );
+      // ★ 关键：锚点必须来自「相位可信的中窗」，不能照抄 90 BPM 头窗的相位
+      const midG = e.win.gaplessPlayer.beat(ab, 90, 20);
+      let expA = midG ? midG.anchorSec + Math.round((0 - midG.anchorSec) / beatA) * beatA : NaN;
+      if (expA < 0) expA += beatA;
+      ok(
+        !!rec && rec.head && Math.abs(rec.head.anchorSec - expA) < 0.02,
+        "★★ 头窗锚点是中窗外推出来的，不是照抄测歪的头窗（" +
+          (rec && rec.head ? rec.head.anchorSec.toFixed(3) : "?") + " vs " + (isFinite(expA) ? expA.toFixed(3) : "?") + "）"
+      );
+      e.flushTimers();
+      await flush(8);
+      ok(/融合 3 窗/.test(e.logs()), "★★ 日志写明用了融合");
+    }
+
+    // ---- (b) 尾窗测歪（178s 起换成 160 BPM）→ 融合回 120，末拍按融合 BPM 重算 ----
+    {
+      const ab = mkLayered({
+        segments: [
+          { from: 0, to: 178, bpm: 120 },
+          { from: 178, to: 200, bpm: 160 },
+        ],
+      });
+      const e = envFor(8200, ab);
+      await flush(16);
+      const tailSingle = e.win.gaplessPlayer.beat(ab, 178, 20);
+      await one(e);
+      const rec = e.win.gaplessPlayer.analysisOf(8200);
+      if (process.env.GP_DBG112) {
+        console.log("DBG112b tailSingle=", tailSingle && { bpm: tailSingle.bpm, conf: tailSingle.conf }, "rec=", rec && { w: rec.w, tail: rec.tail });
+      }
+      ok(!!tailSingle && Math.abs(tailSingle.bpm - 160) < 6, "（前提）尾窗单窗测成 160 BPM（" + (tailSingle ? tailSingle.bpm.toFixed(1) : "?") + "）");
+      ok(!!rec && rec.w === 3, "★★ 融合版（w=3）");
+      ok(!!rec && rec.tail && Math.abs(rec.tail.bpm - 120) < 3, "★★ 尾窗 BPM 被拉回 120");
+      const beatB = rec && rec.tail ? 60 / rec.tail.bpm : 0.5;
+      const offB = rec && rec.tail ? ((rec.tail.endBeatSec % beatB) + beatB) % beatB : 9;
+      ok(
+        !!rec && rec.tail && Math.min(offB, beatB - offB) < 0.03,
+        "★★ 末拍落在融合网格上（按融合 BPM 重算）"
+      );
+    }
+
+    // ---- (c) 三窗互不一致 → 不硬融（w=1、tried=3），也不反复重试 ----
+    {
+      const ab = mkLayered({
+        segments: [
+          { from: 0, to: 20, bpm: 120 },
+          { from: 90, to: 110, bpm: 90 },
+          { from: 178, to: 200, bpm: 150 },
+        ],
+      });
+      const e = envFor(8300, ab);
+      await flush(16);
+      await one(e);
+      const rec = e.win.gaplessPlayer.analysisOf(8300);
+      ok(!!rec && rec.w === 1, "★★ 各窗不一致 → 不融合，w 保持 1");
+      ok(!!rec && rec.tried === 3, "★★ 但记下「这一代试过了」（tried=3）");
+      const d0 = e.decoded.length;
+      await one(e);
+      eq(e.decoded.length, d0, "★★ 不会因为融合失败而反复重试");
+    }
+
+    // ---- (d) 升级：1.11.0 的完整 w:1 记录，补算会自动升级成 w:3 ----
+    {
+      const ab = mkLayered({ segments: [{ from: 0, to: 200, bpm: 120 }] });
+      const disk = mkDiskFs();
+      seedDisk(disk, [9000]);
+      disk.files.set(
+        ANALYSIS_PATH,
+        JSON.stringify({
+          v: 1,
+          items: {
+            9000: {
+              dur: 200,
+              at: 1,
+              w: 1,
+              tried: 1,
+              head: { bpm: 120, beatSec: 0.5, anchorSec: 0, conf: 0.7, dur: 200 },
+              tail: { bpm: 120, beatSec: 0.5, anchorSec: 0, endBeatSec: 200, conf: 0.7, dur: 200 },
+              energy: "AQID",
+            },
+          },
+        })
+      );
+      const e = createEnv({ fs: disk, decode: () => ab });
+      e.win.__gpBackfillDelay = 0;
+      e.win.__gpBackfillGap = 0;
+      e.boot();
+      await flush(16);
+      await one(e);
+      const rec = e.win.gaplessPlayer.analysisOf(9000);
+      eq(e.decoded.length, 1, "★★ 旧代记录被重新解码一次");
+      ok(!!rec && rec.w === 3, "★★ 升级成融合版（w:1 → w:3）");
+      const d0 = e.decoded.length;
+      await one(e);
+      eq(e.decoded.length, d0, "★★ 升级完就不再重跑");
+    }
+  }
+
+  /* ---------- 113. 面板动态信息 ---------- */
+  section("113. ★★★ v1.13.0 状态行动态化：过渡显示「本次真实值」，并加插件总开关");
+  {
+    function mkClick200() {
+      const sr = 8000;
+      const secs = 200;
+      const n = secs * sr;
+      const data = new Float32Array(n);
+      const beat = 60 / 120;
+      for (let t = 0; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      for (let i = 0; i < n; i++) data[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => data };
+    }
+
+    // ---- (a) 排上一次真实过渡 → 状态行给出本次/档位/拍数/BPM ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkClick200() } });
+      e.win.__gpXfade = 3;
+      setLeft(e, 3.2);
+      e.tick();
+      await flush();
+      const st = e.win.gaplessPlayer.status();
+      if (process.env.GP_DBG113) console.log("DBG113 status=", st);
+      ok(/过渡=交叉 3\.0s（本次 3\.\d\ds/.test(st), "★★ 状态行显示本次真实交叉时长（" + st.slice(st.indexOf("过渡"), st.indexOf("｜ 拍点")) + "）");
+      ok(/本次 [\d.]+s · full/.test(st), "★★ 带档位（full）");
+      ok(/· \d+ 拍/.test(st), "★★ 带拍数");
+      ok(/· \d+→\d+/.test(st), "★★ 带 A→B 的 BPM");
+    }
+
+    // ---- (b) 开了交叉但还没过渡过 → 明说「尚未过渡」；关掉 → 干净无缝 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.win.__gpXfade = 3;
+      ok(/尚未过渡/.test(e.win.gaplessPlayer.status()), "★★ 还没过渡过 → 「尚未过渡」");
+      e.win.__gpXfade = 0;
+      ok(/过渡=干净无缝/.test(e.win.gaplessPlayer.status()), "★★ 关掉交叉 → 干净无缝（不提本次）");
+    }
+
+    // ---- (c) 插件停用 → 状态行 / 补算都明说 ----
+    {
+      const e = createEnv();
+      e.boot();
+      await flush();
+      e.win.__gpNativeAll = true;
+      ok(/引擎=原生播（插件已停用）/.test(e.win.gaplessPlayer.status()), "★★ 停用后状态行明说");
+    }
+  }
+
+  /* ---------- 114. 智能交叉 ---------- */
+  section("114. ★★★ v1.14.0 智能交叉：时长按小节、曲线按档位（显式设置仍优先）");
+  {
+    function mkTrack(bpm) {
+      const sr = 8000;
+      const secs = 200;
+      const n = secs * sr;
+      const data = new Float32Array(n);
+      const beat = 60 / bpm;
+      for (let t = 0; t < secs; t += beat) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          data[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      for (let i = 0; i < n; i++) data[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => data };
+    }
+    function mkSilent() {
+      const sr = 8000;
+      const n = 200 * sr;
+      return {
+        duration: 200,
+        sampleRate: sr,
+        numberOfChannels: 1,
+        length: n,
+        getChannelData: () => new Float32Array(n),
+      };
+    }
+
+    // ---- (a) 智能：full → 2 小节 = 4.0s，曲线 r_s-line ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkTrack(120) } });
+      e.win.gaplessPlayer.setXfade(true);
+      setLeft(e, 5);
+      e.tick();
+      await flush();
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m, "★★ 排上了一次过渡");
+      ok(
+        Math.abs(m.fadeSec - 4) < 0.06,
+        "★★ 智能时长 = 2 小节（120bpm → 4.00s，实际 " + (m ? m.fadeSec.toFixed(2) : "?") + "s）"
+      );
+      eq(m.tier, "full", "★★ 档位 full");
+      eq(m.curve, "r_s-line", "★★ 曲线按档位选了 r_s-line");
+      eq(m.smart, true, "★★ 记下了「这次是智能」");
+      ok(/过渡=智能交叉（按小节）/.test(e.win.gaplessPlayer.status()), "★★ 状态行标明「智能交叉（按小节）」且不再摆 3.0s");
+      ok(!/过渡=智能交叉 3\.0s/.test(e.win.gaplessPlayer.status()), "★★ 智能模式下状态行不再写兜底 3.0s");
+    }
+
+    // ---- (b) 显式时长 → 不智能：3s / equal ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkTrack(120) } });
+      e.win.gaplessPlayer.setXfade(3);
+      setLeft(e, 5);
+      e.tick();
+      await flush();
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(
+        !!m && Math.abs(m.fadeSec - 3) < 0.06,
+        "★★ 显式 3s 不被改成小节（实际 " + (m ? m.fadeSec.toFixed(2) : "?") + "s）"
+      );
+      eq(m.curve, "equal", "★★ 曲线回到 equal");
+      eq(m.smart, false, "★★ 这次不是智能");
+    }
+
+    // ---- (c) 智能 + 没拍点（静音）→ 退回兜底 3s / equal ----
+    {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => mkSilent() } });
+      e.win.__gpSkipBadMix = true; // ★ v1.20.0：跳过默认关，这里显式开
+      e.win.gaplessPlayer.setXfade(true);
+      setLeft(e, 5);
+      e.tick();
+      await flush();
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m, "★★ 没拍点也照样排上过渡");
+      if (m) {
+        eq(m.skip, true, "★★ 没拍点 → 跳过交叉（v1.17.0）");
+        eq(m.skipReason, "no-grid", "★★ 原因是 no-grid");
+        ok(m.fadeSec <= 0.03, "★★ 只留 20ms 极短淡（实际 " + m.fadeSec.toFixed(3) + "s）");
+        ok(/跳过 · 没有拍点/.test(e.win.gaplessPlayer.status()), "★★ 状态行写明「跳过 · 没有拍点」");
+      }
+    }
+  }
+
+  /* ---------- 115. 跳过交叉 + 体检 ---------- */
+  section("115. ★★★ v1.17.0 跳过交叉（低置信/节奏差）+ 置信度体检 audit()");
+  {
+    const ANALYSIS_PATH = "C:\\betterncm\\gapless-cache\\analysis.json";
+    const INDEX_PATH = "C:\\betterncm\\gapless-cache\\index.json";
+
+    function mkDiskFs() {
+      const files = new Map();
+      return {
+        files,
+        readFileText(p) {
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(String(files.get(String(p))));
+        },
+        writeFileText(p, txt) {
+          files.set(String(p), String(txt));
+          return Promise.resolve(true);
+        },
+        readFile(p) {
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(files.get(String(p)));
+        },
+        writeFile(p, blob) {
+          const ab = blob && blob.parts ? blob.parts[0] : null;
+          if (!ab) return Promise.resolve(false);
+          files.set(String(p), ab);
+          return Promise.resolve(true);
+        },
+        remove(p) {
+          files.delete(String(p));
+          return Promise.resolve(true);
+        },
+        mkdir() {
+          return Promise.resolve(true);
+        },
+      };
+    }
+
+    function seedDisk(disk, ids) {
+      const items = {};
+      for (const id of ids) {
+        const path = "C:\\betterncm\\gapless-cache\\" + id + ".mp3";
+        disk.files.set(path, new ArrayBuffer(1000));
+        items[id] = { f: path, size: 1000, at: 100 + id };
+      }
+      disk.files.set(INDEX_PATH, JSON.stringify({ v: 1, items }));
+    }
+
+    function recFor(bpm, conf) {
+      return {
+        dur: 200,
+        at: 1,
+        w: 3,
+        tried: 3,
+        head: { bpm: bpm, beatSec: 60 / bpm, anchorSec: 0, conf: conf, dur: 200 },
+        tail: { bpm: bpm, beatSec: 60 / bpm, anchorSec: 0, endBeatSec: 200, conf: conf, dur: 200 },
+        energy: "AQID",
+      };
+    }
+
+    /** A=3000（流式，网格来自 analysis.json）+ B=4000（缓冲，网格来自解码） */
+    async function mixEnv(aBpm, aConf, bBpm, opts) {
+      opts = opts || {};
+      const disk = mkDiskFs();
+      seedDisk(disk, [3000, 4000]);
+      disk.files.set(ANALYSIS_PATH, JSON.stringify({ v: 1, items: { 3000: recFor(aBpm, aConf) } }));
+      const e = createEnv({ fs: disk, decode: () => mkBeatTrack(bBpm, 200) });
+      delete e.win.__gpStream;
+      if (opts.skipOff) e.win.__gpSkipBadMix = false;
+      else e.win.__gpSkipBadMix = true; // ★ v1.20.0：跳过默认关，这些用例要它开
+      e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode: "playorder" }));
+      e.boot();
+      await flush(16);
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      e.channel.call("audioplayer.load", null, [
+        idOf(3000) + "-x",
+        { songId: 3000, musicurl: "http://cdn.example/a.flac" },
+      ]);
+      await flush(16);
+      const el = e.audio.last;
+      if (!el) return e;
+      el.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush(16);
+      e.channel.call("audioplayer.play", () => {}, [idOf(3000) + "-x", "t|resume|T"]);
+      await flush(16);
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeSmart = true;
+      el.currentTime = 196.8; // 还剩 3.2s
+      e.tick();
+      await flush(16);
+      e.flushTimers();
+      return e;
+    }
+
+    // ---- (a) 置信 0.05 → 跳过（low-conf） ----
+    {
+      const e = await mixEnv(120, 0.05, 120);
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && m.skip === true, "★★ 置信 0.05 → 跳过交叉");
+      eq(m.skipReason, "low-conf", "★★ 原因是 low-conf");
+      ok(m.fadeSec <= 0.03, "★★ 只留 20ms（实际 " + (m ? m.fadeSec.toFixed(3) : "?") + "s）");
+      ok(/跳过 · 置信低/.test(e.win.gaplessPlayer.status()), "★★ 状态行写明「跳过 · 置信低」");
+      ok(countLog(e, "跳过交叉（置信低）") >= 1, "★★ 日志写明原因");
+      ok(countLog(e, "交叉=跳过") >= 1, "★★ 调度日志也写明「交叉=跳过」");
+      const curves = (e.ctx.__gains || [])
+        .map((g) => g.gain.events.filter((x) => x.type === "curve"))
+        .filter((a) => a.length);
+      ok(
+        curves.length >= 2 && Math.abs(curves[0][0].dur - 0.02) < 0.005,
+        "★★ 增益上排的是 20ms 曲线（不是 3s）"
+      );
+    }
+
+    // ---- (b) 两边都可信但速度差 33% → 跳过（tempo-far） ----
+    {
+      const e = await mixEnv(120, 0.9, 160);
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && m.skip === true, "★★ 节奏差 → 跳过交叉");
+      eq(m.skipReason, "tempo-far", "★★ 原因是 tempo-far");
+      ok(/跳过 · 节奏差/.test(e.win.gaplessPlayer.status()), "★★ 状态行写明「跳过 · 节奏差」");
+    }
+
+    // ---- (c) 中间地带（conf 0.15、速度一致）→ 不跳过，普通 3s ----
+    {
+      const e = await mixEnv(120, 0.15, 120);
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && !m.skip, "★★ 置信 0.15（中间地带）→ 不跳过");
+      ok(m && Math.abs(m.fadeSec - 3) < 0.1, "★★ 保留普通 3s（实际 " + (m ? m.fadeSec.toFixed(2) : "?") + "s）");
+    }
+
+    // ---- (d) 控制台逃生：__gpSkipBadMix=false ----
+    {
+      const e = await mixEnv(120, 0.05, 120, { skipOff: true });
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && !m.skip, "★★ __gpSkipBadMix=false → 不再跳过");
+      ok(m && Math.abs(m.fadeSec - 3) < 0.1, "★★ 回到普通 3s");
+    }
+
+    // ---- (e) 中间地带但节奏差 → 也跳过（v1.20.0 收紧） ----
+    {
+      const e = await mixEnv(120, 0.15, 140);
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && m.skip === true, "★★ conf 0.15 + 偏差 16.7% → 跳过");
+      eq(m.skipReason, "tempo-far", "★★ 原因是 tempo-far");
+    }
+
+    // ---- (f) 体检：audit() 读记录；audit(true) 重算 ----
+    {
+      const e = await mixEnv(120, 0.05, 120);
+      const a = await e.win.gaplessPlayer.audit();
+      ok(a.count >= 1, "★★ 体检读到记录（" + a.count + " 首）");
+      ok(a.headSummary.n >= 1, "★★ 头窗置信有样本（" + a.headSummary.n + "）");
+      ok(a.tier.skip >= 1, "★★ 统计里有会被跳过的歌（" + a.tier.skip + "）");
+      ok(a.skipReasons["low-conf"] >= 1, "★★ 跳过原因计数：low-conf ≥1");
+      const b = await e.win.gaplessPlayer.audit(true);
+      ok(!!b.recompute, "★★ audit(true) 返回重算结果");
+      ok(b.recompute.n >= 2, "★★ 重算覆盖盘上歌（" + b.recompute.n + " 首）");
+      ok(b.recompute.ok >= 2, "★★ 至少两首解码分析成功（" + b.recompute.ok + "）");
+      ok(b.recompute.summary.head.n >= 2, "★★ 头窗置信有 ≥2 个样本");
+      ok(b.recompute.fused >= 1, "★★ 至少一首能融合（" + b.recompute.fused + "）");
+    }
+  }
+
+  /* ---------- 116. A 尾窗 2 ---------- */
+  section("116. ★★★ v1.18.0 A 尾窗 2：跟着混音点往前挪，两窗融合/择优");
+  {
+    function mkGapTail() {
+      const sr = 8000;
+      const secs = 200;
+      const n = secs * sr;
+      const d = new Float32Array(n);
+      const beat = 0.5;
+      for (let t = 0; t < 178; t += beat) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          d[at + i] = Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      // 178~200 全静音（没有鼓点、也没有铺底）→ 尾窗测不出，得靠尾窗 2
+      for (let i = 0; i < 178 * sr; i++) d[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+    }
+
+    async function envWith(ab) {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => ab } });
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeSmart = true;
+      setLeft(e, 5);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      return e;
+    }
+
+    // ---- (a) 尾窗整段没鼓点 → 自动用尾窗 2 ----
+    {
+      const e = await envWith(mkGapTail());
+      const p = e.win.gaplessPlayer.lastPlan();
+      const m = e.win.gaplessPlayer.lastMix();
+      if (process.env.GP_DBG116) console.log("DBG116a plan=", p, "mix=", m && { fade: m.fadeSec, tier: m.tier, skip: m.skip });
+      ok(!!p && p.tailWin === "tail2", "★★ 尾窗没拍点 → 自动改用尾窗 2（" + (p && p.tailWin) + "）");
+      ok(!!m && !m.skip, "★★ 而且没有跳过交叉");
+      ok(!!m && Math.abs(m.aBpm - 120) < 5, "★★ 用尾窗 2 测到的 BPM 仍是 120（" + (m ? m.aBpm.toFixed(1) : "?") + "）");
+      ok(
+        !!m && (Math.abs(m.fadeSec - 4) < 0.1 || Math.abs(m.fadeSec - 2) < 0.1),
+        "★★ 时长回到按小节（" + (m ? m.fadeSec.toFixed(2) : "?") + "s）"
+      );
+    }
+
+    // ---- (b) 两个尾窗一致 → 融合，置信抬高 ----
+    {
+      const e = await envWith(mkBeatTrack(120, 200));
+      const p = e.win.gaplessPlayer.lastPlan();
+      const m = e.win.gaplessPlayer.lastMix();
+      if (process.env.GP_DBG116) console.log("DBG116b plan=", p, "mix=", m && { fade: m.fadeSec, tier: m.tier, conf: m.conf });
+      ok(!!p && p.tailWin === "fused", "★★ 两窗一致 → 融合（" + (p && p.tailWin) + "）");
+      ok(!!p && p.conf >= 0.9, "★★ 融合后置信被抬高（" + (p ? p.conf.toFixed(2) : "?") + "）");
+      ok(!!m && (Math.abs(m.fadeSec - 4) < 0.1 || Math.abs(m.fadeSec - 2) < 0.1), "★★ 按小节（2/4s，实际 " + (m ? m.fadeSec.toFixed(2) : "?") + "）");
+    }
+
+    // ---- (c) plain 回退直接用设定秒数，不再折拍 ----
+    {
+      function mkBeatsVariant(kind, x) {
+        const sr = 8000;
+        const secs = 60;
+        const n = secs * sr;
+        const d = new Float32Array(n);
+        const bpm = 144;
+        const beat = 60 / bpm;
+        let seed = 987654321;
+        const rnd = () => {
+          seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+          return seed / 0x7fffffff;
+        };
+        const click = (at, amp) => {
+          const i0 = Math.round(at * sr);
+          for (let i = 0; i < sr * 0.03 && i0 + i < n; i++) {
+            if (i0 + i >= 0) d[i0 + i] += Math.exp(-i / (sr * 0.008)) * 0.9 * amp;
+          }
+        };
+        if (kind === "jitter") {
+          for (let t = 0; t < secs; t += beat) click(t + (rnd() * 2 - 1) * x, 1);
+        } else if (kind === "ramp") {
+          for (let t = 0; t < secs; t += beat) click(t, Math.min(1, t / (x * 1)));
+        } else if (kind === "twin") {
+          for (let t = 0; t < secs; t += beat) click(t, 1);
+          for (let t = 0; t < secs; t += 60 / 96) click(t, x);
+        } else if (kind === "drop") {
+          let k = 0;
+          for (let t = 0; t < secs; t += beat) {
+            if (k++ % Math.max(2, Math.round(x)) !== 0) click(t, 1);
+          }
+        }
+        return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+      }
+
+      // 造一个「BPM 对、但置信只有 0.1~0.2」的 B（这样不跳过、又不是 smart/full）
+      const probe = createEnv();
+      await probe.boot();
+      await flush(10);
+      let bBuf = null;
+      let bConf = 0;
+      const cands = [
+        ["jitter", 0.02],
+        ["jitter", 0.04],
+        ["jitter", 0.07],
+        ["jitter", 0.1],
+        ["twin", 0.3],
+        ["twin", 0.5],
+        ["twin", 0.7],
+        ["ramp", 8],
+        ["drop", 3],
+      ];
+      for (const c of cands) {
+        const cand = mkBeatsVariant(c[0], c[1]);
+        const g = probe.win.gaplessPlayer.beat(cand, 0, 20);
+        if (process.env.GP_DBG116) console.log("DBG116c cand", c[0], c[1], "->", g && { bpm: g.bpm, conf: g.conf });
+        if (g && g.conf >= 0.1 && g.conf < 0.2) {
+          bBuf = cand;
+          bConf = g.conf;
+          break;
+        }
+      }
+      ok(!!bBuf, "（前提）能造出置信 0.1~0.2 的 B（" + bConf.toFixed(2) + "）");
+
+      const ANALYSIS_PATH = "C:\\betterncm\\gapless-cache\\analysis.json";
+      const INDEX_PATH = "C:\\betterncm\\gapless-cache\\index.json";
+      const files = new Map();
+      const disk = {
+        readFileText(p) {
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(String(files.get(String(p))));
+        },
+        writeFileText(p, txt) {
+          files.set(String(p), String(txt));
+          return Promise.resolve(true);
+        },
+        readFile(p) {
+          if (!files.has(String(p))) return Promise.reject(new Error("no such file"));
+          return Promise.resolve(files.get(String(p)));
+        },
+        writeFile(p, blob) {
+          const ab = blob && blob.parts ? blob.parts[0] : null;
+          if (!ab) return Promise.resolve(false);
+          files.set(String(p), ab);
+          return Promise.resolve(true);
+        },
+        remove(p) {
+          files.delete(String(p));
+          return Promise.resolve(true);
+        },
+        mkdir() {
+          return Promise.resolve(true);
+        },
+      };
+      const items = {};
+      for (const id of [3000, 4000]) {
+        const path = "C:\\betterncm\\gapless-cache\\" + id + ".mp3";
+        files.set(path, new ArrayBuffer(1000));
+        items[id] = { f: path, size: 1000, at: 100 + id };
+      }
+      files.set(INDEX_PATH, JSON.stringify({ v: 1, items }));
+      files.set(
+        ANALYSIS_PATH,
+        JSON.stringify({
+          v: 1,
+          items: {
+            3000: {
+              dur: 200,
+              at: 1,
+              w: 3,
+              tried: 3,
+              head: { bpm: 144, beatSec: 60 / 144, anchorSec: 0, conf: 0.8, dur: 200 },
+              tail: { bpm: 144, beatSec: 60 / 144, anchorSec: 0, endBeatSec: 200, conf: 0.8, dur: 200 },
+              energy: "AQID",
+            },
+          },
+        })
+      );
+      const e = createEnv({ fs: disk, decode: () => bBuf });
+      delete e.win.__gpStream;
+      e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode: "playorder" }));
+      e.boot();
+      await flush(16);
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      e.channel.call("audioplayer.load", null, [idOf(3000) + "-x", { songId: 3000, musicurl: "http://cdn.example/a.flac" }]);
+      await flush(16);
+      const el = e.audio.last;
+      el.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush(16);
+      e.channel.call("audioplayer.play", () => {}, [idOf(3000) + "-x", "t|resume|T"]);
+      await flush(16);
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeSmart = true;
+      el.currentTime = 196.8;
+      e.tick();
+      await flush(16);
+      e.flushTimers();
+      const m = e.win.gaplessPlayer.lastMix();
+      if (process.env.GP_DBG116) console.log("DBG116c mix=", m && { fade: m.fadeSec, tier: m.tier, skip: m.skip }, "plan=", e.win.gaplessPlayer.lastPlan());
+      ok(!!m && !m.skip, "★★ conf 0.15 的 plain 不跳过");
+      ok(!!m && Math.abs(m.fadeSec - 3) < 0.06, "★★ plain 回退就是设定的 3.00s（不再折成 7 拍）");
+    }
+  }
+
+  /* ---------- 117. 连续母带 ---------- */
+  section("117. ★★★ v1.19.0 连续母带（无缝专辑）：断在音乐里 → 保持 0s 原样");
+  {
+    function mkPad(secs, o) {
+      o = o || {};
+      const sr = 8000;
+      const n = Math.round(secs * sr);
+      const d = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        const t = i / sr;
+        let amp = 0.3;
+        if (o.fadeOut && t > secs - o.fadeOut) amp *= Math.max(0, (secs - t) / o.fadeOut);
+        if (o.fadeIn && t < o.fadeIn) amp *= t / o.fadeIn;
+        if (o.silenceEnd && t > secs - o.silenceEnd) amp = 0;
+        d[i] = Math.sin((2 * Math.PI * 220 * t)) * amp;
+      }
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+    }
+
+    async function padEnv(ab, keep) {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => ab } });
+      e.win.__gpKeepContinuous = keep !== false;
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeSmart = true;
+      setLeft(e, 5);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      return e;
+    }
+
+    const curveCount = (e) =>
+      (e.ctx.__gains || []).reduce((n, g) => n + g.gain.events.filter((x) => x.type === "curve").length, 0);
+
+    // ---- (a) 两边都断在音乐里 → 0s 接缝，不交叉 ----
+    {
+      const e = await padEnv(mkPad(200));
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m, "★★ 有本次过渡记录");
+      ok(!!m && m.continuous === true, "★★ 判定为连续母带");
+      ok(!!m && m.fadeSec === 0, "★★ 时长 0（不做交叉）");
+      eq(curveCount(e), 0, "★★ 一条淡入淡出曲线都没排");
+      ok(countLog(e, "连续母带 → 保持原样") >= 1, "★★ 日志写明「保持原样」");
+      ok(countLog(e, "交接=连续母带（0s 接缝）") >= 1, "★★ 调度日志标明 0s 接缝");
+      ok(Math.abs(Number(lastOf(e.started).at) - 200.02) < 0.03, "★★ B 正好排在 A 的结束采样上");
+    }
+
+    // ---- (b) A 是淡出的 → 不判连续（该交叉就交叉/该跳过就跳过） ----
+    {
+      const e = await padEnv(mkPad(200, { fadeOut: 5 }));
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && !m.continuous, "★★ A 在淡出 → 不判连续母带");
+    }
+
+    // ---- (d) 流式 A 补成缓冲后也能判（用户说的「第一首」情形） ----
+    {
+      const e = createEnv({ decode: () => mkPad(200) });
+      delete e.win.__gpStream;
+      e.win.__gpKeepContinuous = true;
+      e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode: "playorder" }));
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(LIST6)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(1000)]);
+      streamLoad(e, idOf(1000) + "-x", "http://cdn.example/a.flac");
+      await flush();
+      e.audio.last.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush();
+      e.channel.call("audioplayer.play", () => {}, [idOf(1000) + "-x", "t|resume|T"]);
+      await flush();
+      e.flushTimers();
+      e.advance(9000); // 听够 8s → 触发补缓冲
+      e.tick();
+      await flush(16);
+      e.flushTimers();
+      ok(countLog(e, "已补成缓冲") >= 1, "（前提）流式 A 已补成缓冲");
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeSmart = true;
+      e.audio.last.currentTime = 196.8;
+      e.tick();
+      await flush(16);
+      e.flushTimers();
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && m.continuous === true, "★★ 流式 A 补成缓冲后也能判连续母带");
+      ok(!!m && m.fadeSec === 0, "★★ 0s 接缝");
+    }
+
+    async function albumStreamEnv(list, cur) {
+      const e = createEnv({ decode: () => mkPad(200) });
+      delete e.win.__gpStream;
+      e.win.__gpKeepContinuous = true;
+      e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ mode: "playorder" }));
+      e.boot();
+      await flush();
+      e.channel.call("player.addListElement", null, [JSON.stringify(list)]);
+      e.channel.call("player.setCurrentPlay", null, [idOf(cur)]);
+      streamLoad(e, idOf(cur) + "-x", "http://cdn.example/a.flac");
+      await flush();
+      e.audio.last.duration = 200;
+      e.audio.emit("loadedmetadata");
+      await flush();
+      e.channel.call("audioplayer.play", () => {}, [idOf(cur) + "-x", "t|resume|T"]);
+      await flush();
+      await flush();
+      e.flushTimers();
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeSmart = true;
+      e.audio.last.currentTime = 196.8;
+      e.tick();
+      await flush(16);
+      e.flushTimers();
+      return e;
+    }
+    {
+      const e = await albumStreamEnv(
+        [
+          { id: "1000", title: "t1", album: "Concept", artist: "X" },
+          { id: "2000", title: "t2", album: "Concept", artist: "X" },
+          { id: "3000", title: "t3", album: "Concept", artist: "X" },
+        ],
+        1000
+      );
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && m.continuous === true, "★★ 同专辑相邻 → 连续母带（流式 A 无缓冲）");
+      eq(m.album, true, "★★ 标明是元数据兜底");
+      eq(m.fadeSec, 0, "★★ 0s 接缝");
+      ok(countLog(e, "同专辑相邻（Concept") >= 1, "★★ 日志写明同专辑相邻");
+    }
+
+    // ---- (f) 相邻但不同专辑 → 不兜底 ----
+    {
+      const e = await albumStreamEnv(
+        [
+          { id: "1000", title: "t1", album: "Concept", artist: "X" },
+          { id: "3000", title: "t3", album: "Other", artist: "Y" },
+        ],
+        1000
+      );
+      const m = e.win.gaplessPlayer.lastMix();
+      ok(!!m && !m.continuous, "★★ 不同专辑 → 不判同专辑连续");
+      ok(!!m && m.album !== true, "★★ 也没有 album 标记");
+    }
+  }
+
+  /* ---------- 118. 初始音量脏值 ---------- */
+  section("118. ★★ v1.20.0 初始音量：客户端存下淡出中的 0.011 不能直接拿来用");
+  {
+    const e = createEnv();
+    e.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ volume: 0.0111, mode: "playorder" }));
+    e.boot();
+    await flush(16);
+    eq(e.win.gaplessPlayer.volume(), 0.8, "★★ 0.0111 被当成脏值 → 0.8");
+    const e2 = createEnv();
+    e2.localStorage.setItem("NM_SETTING_PLAYER", JSON.stringify({ volume: 0.6, mode: "playorder" }));
+    e2.boot();
+    await flush(16);
+    eq(e2.win.gaplessPlayer.volume(), 0.6, "★★ 0.6 正常沿用");
+  }
+
+  /* ---------- 119. B 头窗 2 ---------- */
+  section("119. ★★★ v1.20.0 B 头窗 2：长/怪前奏时从第 8 秒再开一窗，融合/择优");
+  {
+    function mkLongIntro() {
+      const sr = 8000;
+      const secs = 200;
+      const n = secs * sr;
+      const d = new Float32Array(n);
+      let seed = 1234567;
+      // 0~16s 白噪声（没有节拍）→ 头窗（0~20s）测不出
+      for (let i = 0; i < 20 * sr; i++) {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        d[i] = ((seed / 0x7fffffff) * 2 - 1) * 0.3;
+      }
+      for (let t = 20; t < secs; t += 0.5) {
+        const at = Math.round(t * sr);
+        for (let i = 0; i < sr * 0.03 && at + i < n; i++) {
+          d[at + i] += Math.exp(-i / (sr * 0.008)) * 0.9;
+        }
+      }
+      for (let i = 0; i < n; i++) d[i] += Math.sin((2 * Math.PI * 90 * i) / sr) * 0.02;
+      return { duration: secs, sampleRate: sr, numberOfChannels: 1, length: n, getChannelData: () => d };
+    }
+
+    async function headEnv(ab) {
+      const e = await seamlessEnv("playorder", { hooks: { decode: () => ab } });
+      e.win.__gpXfade = 3;
+      e.win.__gpXfadeSmart = true;
+      setLeft(e, 5);
+      e.tick();
+      await flush();
+      e.flushTimers();
+      return e;
+    }
+
+    // ---- (a) 头窗测不出 → 自动用头窗 2 ----
+    {
+      const e = await headEnv(mkLongIntro());
+      const p = e.win.gaplessPlayer.lastPlan();
+      const m = e.win.gaplessPlayer.lastMix();
+      if (process.env.GP_DBG119) console.log("DBG119a plan=", p, "mix=", m && { fade: m.fadeSec, tier: m.tier, skip: m.skip });
+      ok(!!p && p.headWin === "head2", "★★ 长前奏 → 自动改用头窗 2（" + (p && p.headWin) + "）");
+      ok(!!m && !m.skip, "★★ 没有跳过交叉");
+      ok(!!m && Math.abs(m.bBpm - 120) < 5, "★★ 用头窗 2 测到的 B BPM 仍是 120（" + (m ? m.bBpm.toFixed(1) : "?") + "）");
+      ok(!!m && (Math.abs(m.fadeSec - 4) < 0.1 || Math.abs(m.fadeSec - 2) < 0.1), "★★ 按小节（2/4s，实际 " + (m ? m.fadeSec.toFixed(2) : "?") + "）");
+    }
+
+    // ---- (b) 两个头窗一致 → 融合 ----
+    {
+      const e = await headEnv(mkBeatTrack(120, 200));
+      const p = e.win.gaplessPlayer.lastPlan();
+      const m = e.win.gaplessPlayer.lastMix();
+      if (process.env.GP_DBG119) console.log("DBG119b plan=", p, "mix=", m && { fade: m.fadeSec, tier: m.tier });
+      ok(!!p && p.headWin === "fused", "★★ 两窗一致 → 融合（" + (p && p.headWin) + "）");
+      ok(!!p && p.conf >= 0.9, "★★ 融合后置信被抬高（" + (p ? p.conf.toFixed(2) : "?") + "）");
+      ok(!!m && Math.abs(m.fadeSec - 4) < 0.1, "★★ full → 4.00s");
     }
   }
 
