@@ -25,6 +25,9 @@
 .PARAMETER NoRestart
   安装完不自动启动网易云。
 
+.PARAMETER KeepOpen
+  装完停住，等按回车再关窗口（提权重开时会自动带上）。
+
 .PARAMETER DryRun
   只打印将要做什么，不下载、不写文件、不弹管理员。
 
@@ -38,6 +41,7 @@ param(
   [switch]$ForceBetterNcm,
   [switch]$UseOfficialInstaller,
   [switch]$NoRestart,
+  [switch]$KeepOpen,
   [switch]$DryRun
 )
 
@@ -216,12 +220,13 @@ if ($DryRun) {
   if ($ForceBetterNcm) { $argList += "-ForceBetterNcm" }
   if ($UseOfficialInstaller) { $argList += "-UseOfficialInstaller" }
   if ($NoRestart) { $argList += "-NoRestart" }
+  $argList += "-KeepOpen"   # 新窗口里装完停住，免得一闪而过
   try {
     Start-Process -FilePath "powershell.exe" -ArgumentList $argList -Verb RunAs
   } catch {
     Fail "提权失败（你点了“否”？）。请右键以管理员身份运行。"
   }
-  exit 0
+  exit 42   # 告诉 .cmd：已提权重开，本窗口直接退出
 }
 
 # 1) 找网易云
@@ -392,3 +397,8 @@ Write-Log ""
 Write-Log "===== 安装完成 =====" "Cyan"
 Write-Log "网易云设置 → BetterNCM → 插件列表里应能看到 GaplessPlayer。" "Gray"
 Write-Log "日志：$LOG" "DarkGray"
+
+if ($KeepOpen -and -not $DryRun) {
+  Write-Host ""
+  Read-Host "按回车关闭窗口" | Out-Null
+}
